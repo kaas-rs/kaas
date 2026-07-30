@@ -110,8 +110,8 @@ metadata:
 provisioner: nfs.csi.k8s.io
 mountOptions:
   - nfsvers=4.1
-  - nconnect=8        # parallel TCP connections; faster fsync
   - acregmax=1        # sub-second mtime freshness on assignment.json polling
+  - acdirmax=1        # same, for directory listings the sweeps depend on
   - hard              # block on server unavailability instead of returning EIO
 parameters:
   server: nfs.example.com
@@ -119,9 +119,54 @@ parameters:
 ```
 
 The `acregmax=1` setting matters most: the broker polls assignment.json's
-mtime as the fast-failover signal, and the default NFS attribute cache
-(60s) would delay every controller failover. `nconnect` raises throughput
-under concurrent fsyncs from multiple brokers.
+mtime as the fast-failover signal, inotify never fires for a write made by
+another NFS client, and the default attribute cache (`acregmin=3` /
+`acregmax=60`) can serve a stale mtime for up to a minute — delaying every
+controller failover by that much.
+
+**`mountOptions` are frozen into each PV at provision time.** Editing the
+StorageClass changes only *newly provisioned* volumes; existing PVs keep the
+options they were created with (`kubectl get pv <name> -o jsonpath='{.spec.mountOptions}'`
+to check). Retrofitting a live deployment means recreating the volumes, which
+on a `subDir`-templating provisioner with `reclaimPolicy: Delete` is a
+data-destroying operation — plan it, don't fold it into a config edit.
+
+#### On `nconnect`
+
+`nconnect=N` opens N TCP connections to the server instead of one, so more
+RPCs can be in flight concurrently. It does **not** reduce the latency of any
+individual fsync — a common misreading, and the reason it is not in the
+example above.
+
+It only helps when the transport is actually the constraint, which is rarer
+than it looks: kaas's produce path is usually bound by how long the *filer*
+takes to make a write durable, not by how many requests the client can carry.
+Check before reaching for it:
+
+```bash
+# on a broker pod — the xprt: line for the data mount
+awk '/^device .* mounted on \/data /{f=1} f&&/^\txprt:/{print; exit}' /proc/self/mountstats
+# xprt: tcp <port> <bind> <connects> <connect_time> <idle> <sends> <recvs>
+#            <bad_xids> <req_u> <bklog_u> <max_slots> <sending_u> <pending_u>
+```
+
+`bklog_u` — the 10th field after `tcp` — is the cumulative count of RPCs that
+waited for a free transport slot. **If it is 0, `nconnect` will buy nothing**:
+the connection was never full. (`max_slots`, the next field, is the peak slot
+count actually reached.) Then compare the average RTT of `WRITE` against a
+metadata op like `GETATTR` in the per-op section of the same output — divide
+the `rtt` column by the `ops` column. The gap between them is what the server
+spends making writes durable, and no mount option shortens it.
+
+Note that mounts to the same server share one transport by default, so every
+`device` stanza for that server reports identical `xprt:` counters — reading
+one is enough.
+
+A worked example, measured on a spinning-disk NAS: `GETATTR` averaged 2.3 ms
+against a 2.7 ms ICMP round trip, while a 44 KB `WRITE` averaged 19.3 ms — so
+~17 ms, roughly 88% of the cost, was the filer committing to stable storage,
+with `bklog_u` at 0 throughout. On that substrate `nconnect` is not the lever;
+faster storage is.
 
 ## External access
 
