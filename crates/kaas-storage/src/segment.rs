@@ -580,6 +580,31 @@ impl ActiveSegment {
             .record(started.elapsed().as_secs_f64(), &[]);
         out
     }
+
+    /// A second handle onto the active log, for syncing off the
+    /// partition mutex (gh #232). Taken under the lock; synced outside
+    /// it via [`sync_cloned_log`].
+    pub fn clone_log_handle(&self) -> io::Result<Box<dyn FileWrite>> {
+        self.log
+            .as_deref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "log handle closed"))?
+            .try_clone_writer()
+    }
+}
+
+/// fsync a handle obtained from [`ActiveSegment::clone_log_handle`].
+///
+/// Separate from [`ActiveSegment::sync_log`] because the caller no
+/// longer holds the segment — that is the whole point — but the fsync
+/// latency still belongs on the same metric, since it is the same
+/// operation against the same file.
+pub fn sync_cloned_log(log: &mut dyn FileWrite) -> io::Result<()> {
+    let started = std::time::Instant::now();
+    let out = log.sync_all();
+    kaas_observability::metrics::global()
+        .fsync_latency
+        .record(started.elapsed().as_secs_f64(), &[]);
+    out
 }
 
 /// Deferred close-out work produced by [`ActiveSegment::roll_fast`].
