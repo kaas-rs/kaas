@@ -40,24 +40,6 @@ pub trait FileWrite: Write + Seek + Send + 'static {
     fn sync_all(&mut self) -> io::Result<()> {
         self.flush()
     }
-
-    /// A second handle onto the same file, for fsyncing off the
-    /// partition mutex (gh #232).
-    ///
-    /// The committer needs to call `sync_all` without holding the lock
-    /// that appenders contend on, so it takes a clone under the lock —
-    /// a cheap `dup(2)` — and syncs that outside. The clone shares the
-    /// underlying file description, so it stays valid even if the
-    /// original handle is dropped (which `close_handles` does during a
-    /// concurrent relinquish), and syncing it is equivalent to syncing
-    /// the original.
-    ///
-    /// Deliberately **required**, with no default. An impl that cannot
-    /// dup a handle would otherwise reach the committer's sticky
-    /// `flush_err` path and wedge the partition permanently — a runtime
-    /// failure for what is purely a throughput optimisation. Requiring
-    /// the method turns that into a compile error instead.
-    fn try_clone_writer(&self) -> io::Result<Box<dyn FileWrite>>;
 }
 
 /// All disk I/O the storage engine performs.
@@ -139,10 +121,6 @@ impl FileWrite for RealFile {
 
     fn sync_all(&mut self) -> io::Result<()> {
         self.0.sync_all()
-    }
-
-    fn try_clone_writer(&self) -> io::Result<Box<dyn FileWrite>> {
-        Ok(Box::new(RealFile(self.0.try_clone()?)))
     }
 }
 
