@@ -1005,6 +1005,32 @@ fn persist_state_locked(fs: &dyn Fs, guard: &mut PartitionInner) -> Result<(), S
 // Committer task
 // ---------------------------------------------------------------------------
 
+/// The flush seq one committer cycle is entitled to publish (gh #232).
+///
+/// Exists to make a durability invariant structural rather than a
+/// comment. The seq must be sampled **before** the fsync: every byte
+/// belonging to a seq ≤ it was written under the lock before that seq
+/// was bumped, so the sync necessarily covers it. Re-reading
+/// `requested_flush_seq` *after* the sync returns — which reads more
+/// naturally, and is where a tidying refactor drifts — would ack
+/// appends that landed mid-sync and may not be on disk.
+///
+/// `issue` is the only constructor and it needs a locked guard, so a
+/// ticket cannot be minted once the guard has been dropped and the sync
+/// has run.
+#[derive(Clone, Copy, Debug)]
+struct FlushTicket(u64);
+
+impl FlushTicket {
+    fn issue(guard: &PartitionInner) -> Self {
+        Self(guard.requested_flush_seq)
+    }
+
+    fn seq(self) -> u64 {
+        self.0
+    }
+}
+
 fn spawn_committer(
     inner: Arc<Mutex<PartitionInner>>,
     cond: Arc<Notify>,
@@ -1024,79 +1050,67 @@ fn spawn_committer(
 
             let inner_clone = inner.clone();
             let fs_c = fs.clone();
-            let fsync_handle = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-                // gh #232 — snapshot under the lock, sync outside it.
-                //
-                // Everything taken here is cheap: the seq this cycle will be
-                // entitled to publish, a dup'd FD to sync, and the byte
-                // position that sync is guaranteed to cover. The fsync itself
-                // — tens of milliseconds on an NFS substrate — runs after the
-                // guard is dropped, so appenders keep filling the active
-                // segment while the round trip is in flight and the next
-                // cycle carries what accumulated instead of starting empty.
-                //
-                // Publishing `seq` captured *before* the sync is the
-                // load-bearing detail. Every byte belonging to a seq <= this
-                // one was written under the lock before the seq was bumped,
-                // so the sync necessarily covers them. Re-reading the seq
-                // afterwards would claim durability for appends that landed
-                // during the sync and may not be on disk.
-                let (seq, cloned, checkpoint) = {
-                    let mut guard = inner_clone.lock();
-                    let seq = guard.requested_flush_seq;
-                    // `.ok()` deliberately: an `Fs` whose handles can't be
-                    // duped falls back to the old under-the-lock sync below.
-                    // A throughput optimisation must never be able to wedge a
-                    // partition, and a failed clone would otherwise land in
-                    // the sticky `flush_err` path.
-                    let log = guard.active.clone_log_handle().ok();
-                    let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
-                    let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
-                        >= CHECKPOINT_INTERVAL_BYTES
-                    {
-                        // Advance optimistically: a failed sync or write just
-                        // defers the next attempt one interval, and recovery
-                        // falls back to a full scan regardless.
-                        guard.last_checkpoint_byte = durable;
-                        Some((
-                            RecoveryCheckpoint {
-                                segment_base: guard.active.meta.base_offset,
-                                byte_pos: durable,
-                                high_watermark: guard.high_water,
-                            },
-                            guard.dir.clone(),
-                        ))
-                    } else {
-                        None
-                    };
-                    (seq, log, cp)
-                };
-
-                match cloned {
-                    Some(mut log) => crate::segment::sync_cloned_log(log.as_mut())?,
-                    // Fallback for a non-clonable handle: correctness is
-                    // identical, we just pay the stall this issue removed.
-                    None => {
+            let fsync_handle =
+                tokio::task::spawn_blocking(move || -> std::io::Result<FlushTicket> {
+                    // gh #232 — snapshot under the lock, sync outside it.
+                    //
+                    // Everything taken here is cheap: the seq this cycle will be
+                    // entitled to publish, a dup'd FD to sync, and the byte
+                    // position that sync is guaranteed to cover. The fsync itself
+                    // — tens of milliseconds on an NFS substrate — runs after the
+                    // guard is dropped, so appenders keep filling the active
+                    // segment while the round trip is in flight and the next
+                    // cycle carries what accumulated instead of starting empty.
+                    //
+                    // Publishing `seq` captured *before* the sync is the
+                    // load-bearing detail. Every byte belonging to a seq <= this
+                    // one was written under the lock before the seq was bumped,
+                    // so the sync necessarily covers them. Re-reading the seq
+                    // afterwards would claim durability for appends that landed
+                    // during the sync and may not be on disk.
+                    let (ticket, mut log, checkpoint) = {
                         let mut guard = inner_clone.lock();
-                        guard.active.sync_log()?;
-                    }
-                }
+                        let ticket = FlushTicket::issue(&guard);
+                        let log = guard.active.clone_log_handle()?;
+                        let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
+                        let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
+                            >= CHECKPOINT_INTERVAL_BYTES
+                        {
+                            // Advance optimistically: a failed sync or write just
+                            // defers the next attempt one interval, and recovery
+                            // falls back to a full scan regardless.
+                            guard.last_checkpoint_byte = durable;
+                            Some((
+                                RecoveryCheckpoint {
+                                    segment_base: guard.active.meta.base_offset,
+                                    byte_pos: durable,
+                                    high_watermark: guard.high_water,
+                                },
+                                guard.dir.clone(),
+                            ))
+                        } else {
+                            None
+                        };
+                        (ticket, log, cp)
+                    };
 
-                // Only after a successful sync: the checkpoint promises that
-                // `byte_pos` is durable, and `byte_pos` was sampled before
-                // the sync, so the sync covers at least that far.
-                if let Some((cp, dir)) = checkpoint {
-                    let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
-                }
-                Ok(seq)
-            });
+                    crate::segment::sync_cloned_log(log.as_mut())?;
+
+                    // Only after a successful sync: the checkpoint promises that
+                    // `byte_pos` is durable, and `byte_pos` was sampled before
+                    // the sync, so the sync covers at least that far.
+                    if let Some((cp, dir)) = checkpoint {
+                        let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
+                    }
+                    Ok(ticket)
+                });
 
             let outcome = tokio::time::timeout(fsync_max_latency, fsync_handle).await;
             match outcome {
-                Ok(Ok(Ok(satisfied_seq))) => {
+                Ok(Ok(Ok(ticket))) => {
                     let mut guard = inner.lock();
-                    if satisfied_seq > guard.completed_flush_seq {
-                        guard.completed_flush_seq = satisfied_seq;
+                    if ticket.seq() > guard.completed_flush_seq {
+                        guard.completed_flush_seq = ticket.seq();
                     }
                     drop(guard);
                     cond.notify_waiters();
@@ -1211,72 +1225,6 @@ mod tests {
                 inner: self.inner.create(p)?,
                 delay: self.delay,
             }))
-        }
-        fn fsync(&self, f: &mut dyn crate::fs::FileWrite) -> std::io::Result<()> {
-            self.inner.fsync(f)
-        }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-            self.inner.rename(from, to)
-        }
-        fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
-            self.inner.remove(p)
-        }
-        fn mkdir_all(&self, p: &std::path::Path) -> std::io::Result<()> {
-            self.inner.mkdir_all(p)
-        }
-        fn readdir(&self, p: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
-            self.inner.readdir(p)
-        }
-        fn stat(&self, p: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
-            self.inner.stat(p)
-        }
-    }
-
-    /// [`RealFs`] whose write handles refuse to be cloned — stands in
-    /// for a future `Fs` (io_uring, fault injection) that can't dup
-    /// (gh #232).
-    struct NoCloneFs {
-        inner: RealFs,
-    }
-
-    struct NoCloneFile(Box<dyn crate::fs::FileWrite>);
-
-    impl std::io::Write for NoCloneFile {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.write(buf)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.0.flush()
-        }
-    }
-    impl std::io::Seek for NoCloneFile {
-        fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
-            self.0.seek(p)
-        }
-    }
-    impl crate::fs::FileWrite for NoCloneFile {
-        fn write_at(&mut self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-            self.0.write_at(buf, offset)
-        }
-        fn sync_all(&mut self) -> std::io::Result<()> {
-            self.0.sync_all()
-        }
-        // try_clone_writer intentionally left as the Unsupported default.
-    }
-
-    impl Fs for NoCloneFs {
-        fn open_read(&self, p: &std::path::Path) -> std::io::Result<Box<dyn crate::fs::FileRead>> {
-            self.inner.open_read(p)
-        }
-        fn open_write(
-            &self,
-            p: &std::path::Path,
-            append: bool,
-        ) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
-            Ok(Box::new(NoCloneFile(self.inner.open_write(p, append)?)))
-        }
-        fn create(&self, p: &std::path::Path) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
-            Ok(Box::new(NoCloneFile(self.inner.create(p)?)))
         }
         fn fsync(&self, f: &mut dyn crate::fs::FileWrite) -> std::io::Result<()> {
             self.inner.fsync(f)
@@ -2250,37 +2198,6 @@ mod tests {
                  flight — the committer is holding the partition mutex across the \
                  sync (gh #232)"
             );
-        });
-    }
-
-    /// gh #232 — an `Fs` whose handles cannot be duped must still flush
-    /// correctly. It loses the optimisation and pays the old
-    /// under-the-lock stall, but it must never wedge the partition on
-    /// the sticky `flush_err` path.
-    #[test]
-    fn a_non_clonable_handle_falls_back_instead_of_stalling() {
-        let tmp = tempfile::tempdir().unwrap();
-        rt().block_on(async {
-            let fs: Arc<dyn Fs> = Arc::new(NoCloneFs {
-                inner: RealFs::new(),
-            });
-            let p = Partition::open(
-                fs,
-                "t".into(),
-                0,
-                tmp.path().to_path_buf(),
-                PartitionConfig::default(),
-            )
-            .await
-            .unwrap();
-
-            // acks=-1 parks on the flush; if the fallback did not run this
-            // returns Err(Stalled) instead of completing.
-            p.append(0, -1, build_batch(1, 1_000))
-                .await
-                .expect("flush must succeed via the under-the-lock fallback");
-            assert_eq!(p.high_watermark(), 1);
-            p.close().await.unwrap();
         });
     }
 

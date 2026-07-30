@@ -52,14 +52,12 @@ pub trait FileWrite: Write + Seek + Send + 'static {
     /// concurrent relinquish), and syncing it is equivalent to syncing
     /// the original.
     ///
-    /// Default is `Unsupported`; implementors that can't dup a handle
-    /// keep the old under-the-lock behaviour via the caller's fallback.
-    fn try_clone_writer(&self) -> io::Result<Box<dyn FileWrite>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "handle cannot be cloned",
-        ))
-    }
+    /// Deliberately **required**, with no default. An impl that cannot
+    /// dup a handle would otherwise reach the committer's sticky
+    /// `flush_err` path and wedge the partition permanently — a runtime
+    /// failure for what is purely a throughput optimisation. Requiring
+    /// the method turns that into a compile error instead.
+    fn try_clone_writer(&self) -> io::Result<Box<dyn FileWrite>>;
 }
 
 /// All disk I/O the storage engine performs.
