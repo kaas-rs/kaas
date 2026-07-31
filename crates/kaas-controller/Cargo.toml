@@ -33,7 +33,8 @@ twox-hash    = { workspace = true }
 
 # kube-backed LeaseElection — optional behind the `kube-election`
 # feature so a dev-mode build (LocalElection-only) doesn't link
-# kube. Default-on now that `home@0.5.11` is pinned for rustc 1.85.
+# kube. Default-on; the `home@0.5.11` pin that rustc 1.85 required
+# was dropped with the 1.97 toolchain bump.
 k8s-openapi    = { workspace = true, optional = true }
 kube           = { workspace = true, optional = true }
 

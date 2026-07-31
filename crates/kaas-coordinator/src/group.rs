@@ -974,7 +974,7 @@ mod tests {
                 ..SyncRequest::default()
             })
             .await;
-        let out = g.leave(&[j.member_id.clone()]);
+        let out = g.leave(std::slice::from_ref(&j.member_id));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1, error_codes::NONE);
         assert_eq!(g.state(), GroupState::Empty);

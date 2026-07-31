@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Layout
 
-kaas is a Rust workspace: `Cargo.toml` at the root, `rust-toolchain.toml` (pin = 1.85), 12 lib crates under `crates/kaas-*`, 2 bins under `bins/{kaas,kaas-operator}`, and an `xtask` runner. `protoc` is vendored via `tonic-build` in `kaas-broker`. `proto/`, `deploy/`, and `scripts/` live at the root (tonic-build consumes `proto/heartbeat.proto`; the Helm chart and shell integration suite target the broker's wire surface). System-level architecture lives in the documentation book's Part I (`docs/src/architecture/`; build with `cargo xtask docs`, preview with `cargo xtask docs --serve` — `docs/ARCHITECTURE.md` is a pointer stub). The release line is `v0.2.x-preview` (see [`docs/RELEASING.md`](./docs/RELEASING.md)); how the book is built, gated, and published is [`docs/README.md`](./docs/README.md).
+kaas is a Rust workspace: `Cargo.toml` at the root, `rust-toolchain.toml` (pin = 1.97), 12 lib crates under `crates/kaas-*`, 2 bins under `bins/{kaas,kaas-operator}`, and an `xtask` runner. `protoc` is vendored via `tonic-build` in `kaas-broker`. `proto/`, `deploy/`, and `scripts/` live at the root (tonic-build consumes `proto/heartbeat.proto`; the Helm chart and shell integration suite target the broker's wire surface). System-level architecture lives in the documentation book's Part I (`docs/src/architecture/`; build with `cargo xtask docs`, preview with `cargo xtask docs --serve` — `docs/ARCHITECTURE.md` is a pointer stub). The release line is `v0.2.x-preview` (see [`docs/RELEASING.md`](./docs/RELEASING.md)); how the book is built, gated, and published is [`docs/README.md`](./docs/README.md).
 
 ## Parity target & non-goals
 
@@ -31,7 +31,7 @@ cargo xtask check-docs-drift                             # CI gate: gen-api-matr
 cargo xtask docs                                         # mdbook build docs (--serve for live preview)
 ```
 
-`rust-toolchain.toml` pins Rust 1.85 (transitive `getrandom` needs edition 2024); `rustup` auto-installs it on first invocation. `protoc` is vendored via `protoc-bin-vendored` inside `kaas-broker/build.rs` — no `apt install protobuf-compiler` needed. Generated proto code is silenced from the workspace clippy gate via a module-scope `#![allow(...)]`.
+`rust-toolchain.toml` pins Rust 1.97 (the floor is 1.85 — transitive `getrandom` needs edition 2024 — but the pin tracks current stable); `rustup` auto-installs it on first invocation. The toolchain file lists `rust-analyzer` as a component so editors use a version matching the pin rather than their own bundled build. Note `.cargo/config.toml` sets `rustflags = ["-D", "warnings"]` repo-wide, so a toolchain bump turns any new rustc lint into a hard build failure, not just a CI-gate failure. `protoc` is vendored via `protoc-bin-vendored` inside `kaas-broker/build.rs` — no `apt install protobuf-compiler` needed. Generated proto code is silenced from the workspace clippy gate via a module-scope `#![allow(...)]`.
 
 ### CI
 

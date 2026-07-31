@@ -35,9 +35,9 @@ kaas-operator-api = { workspace = true, optional = true }
 
 [features]
 default = ["kube-watchers"]
-# Pull in the kube-rs runtime + typed API impls. The workspace
-# pins `home@0.5.11` (compatible with rustc 1.85; later versions
-# require 1.88) so the feature can land in the default set.
+# Pull in the kube-rs runtime + typed API impls. Default-on: the
+# `home@0.5.11` pin this used to need (rustc 1.85 couldn't build
+# later versions) went away with the 1.97 toolchain bump.
 kube-watchers = ["dep:futures", "dep:k8s-openapi", "dep:kube", "dep:kaas-operator-api"]
 
 [dev-dependencies]

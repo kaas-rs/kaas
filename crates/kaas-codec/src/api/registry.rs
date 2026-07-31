@@ -7,7 +7,11 @@
 
 use crate::headers::HeaderVersion;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `PartialEq`/`Eq`: the two `fn` pointer fields below make derived
+// equality meaningless (function addresses aren't unique across codegen
+// units), and rustc denies the comparison since 1.86. Nothing compares
+// `ApiSpec` values — lookups go by `key`.
+#[derive(Debug, Clone, Copy)]
 pub struct ApiSpec {
     pub key: i16,
     pub min_version: i16,

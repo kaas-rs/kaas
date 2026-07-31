@@ -22,7 +22,7 @@ members = [
 edition      = "2021"
 license      = "Apache-2.0"
 repository   = "https://github.com/Woestebanaan/kaas"
-rust-version = "1.85"
+rust-version = "1.97"
 
 [workspace.dependencies]
 # async + I/O

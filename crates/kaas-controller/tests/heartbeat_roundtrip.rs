@@ -94,10 +94,7 @@ async fn client_receives_assignment_changed_pushed_by_server() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let observed = captured.lock().clone();
-        if observed
-            .iter()
-            .any(|t| *t == CmdType::AssignmentChanged as i32)
-        {
+        if observed.contains(&(CmdType::AssignmentChanged as i32)) {
             break;
         }
         if std::time::Instant::now() > deadline {

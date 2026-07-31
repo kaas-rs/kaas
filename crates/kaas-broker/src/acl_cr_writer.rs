@@ -300,7 +300,7 @@ mod kube_impl {
                 if !same_acl_shape(e, &b, &pattern, &acl_type) {
                     continue;
                 }
-                if e.operations.iter().any(|op| *op == b.operation) {
+                if e.operations.contains(&b.operation) {
                     return Ok(());
                 }
                 e.operations.push(b.operation.clone());

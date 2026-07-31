@@ -483,7 +483,7 @@ impl ActiveSegment {
         let log = self
             .log
             .as_deref_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "log handle closed"))?;
+            .ok_or_else(|| io::Error::other("log handle closed"))?;
         log.write_at(raw, self.log_size)?;
 
         // Sparse index entry when threshold exceeded.
@@ -491,7 +491,7 @@ impl ActiveSegment {
             let index = self
                 .index
                 .as_deref_mut()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "index handle closed"))?;
+                .ok_or_else(|| io::Error::other("index handle closed"))?;
             let rel_offset_i64 = base_offset - self.meta.base_offset;
             let rel_offset = i32::try_from(rel_offset_i64).map_err(|_| {
                 io::Error::new(
@@ -573,7 +573,7 @@ impl ActiveSegment {
         let log = self
             .log
             .as_deref_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "log handle closed"))?;
+            .ok_or_else(|| io::Error::other("log handle closed"))?;
         let out = log.sync_all();
         kaas_observability::metrics::global()
             .fsync_latency
