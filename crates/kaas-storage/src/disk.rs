@@ -390,13 +390,15 @@ impl StorageEngine for DiskStorageEngine {
         &self,
         topic: &str,
         partition: i32,
-        _epoch: u32,
+        epoch: u32,
     ) -> Result<i64, StorageError> {
-        // Open opens at the manifest's epoch; explicit epoch-bump
-        // semantics land alongside the cluster-runtime wire-up in
-        // Phase 5. For now take_over == ensure_open + report HWM.
+        // `open` recovers at whatever epoch the manifest carries;
+        // `Partition::take_over` raises it to the assignment's and rolls
+        // to a fresh epoch-stamped segment, which is what fences the
+        // previous leader (gh #227). Idempotent at or below the current
+        // epoch, so the gh #215 reconcile can re-drive it freely.
         let p = self.ensure_open(topic, partition).await?;
-        Ok(p.high_watermark())
+        p.take_over(epoch).await
     }
 
     async fn move_partition_to_log_dir(

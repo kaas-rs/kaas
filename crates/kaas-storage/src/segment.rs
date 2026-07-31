@@ -117,6 +117,15 @@ fn i64_low_u32(v: i64) -> u32 {
 /// Scan `dir` for segment files and return their metadata sorted by
 /// `base_offset`. Skips `.log.sealed` markers and any file with an
 /// unparseable stem. Used by partition open.
+///
+/// At most one segment is returned per `base_offset`: two files can
+/// share one only when a leader epoch bump rolled over an *empty*
+/// active segment (gh #227), which produces a new epoch-stamped file at
+/// the same base offset as the one it supersedes. The higher epoch
+/// wins. The superseded file is by construction empty at the moment of
+/// the roll — a segment holding bytes rolls to a strictly higher base —
+/// so anything in it was written by a leader that had already been
+/// fenced, which is exactly what must not be adopted.
 pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
     let entries = match fs.readdir(dir) {
         Ok(e) => e,
@@ -147,7 +156,15 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
             index_path: dir.join(format!("{stem}{INDEX_EXT}")),
         });
     }
-    out.sort_by_key(|m| m.base_offset);
+    // Ascending by base_offset, highest epoch first within a base, so
+    // `dedup_by` — which retains the first of each run — keeps the
+    // newest leader's file.
+    out.sort_by(|a, b| {
+        a.base_offset
+            .cmp(&b.base_offset)
+            .then_with(|| b.epoch.cmp(&a.epoch))
+    });
+    out.dedup_by(|a, b| a.base_offset == b.base_offset);
     Ok(out)
 }
 
@@ -811,6 +828,28 @@ mod tests {
         let segs = list_segments(&fs, tmp.path()).unwrap();
         let bases: Vec<i64> = segs.iter().map(|s| s.base_offset).collect();
         assert_eq!(bases, vec![0, 50, 100, 200]);
+    }
+
+    /// gh #227: an epoch bump over an empty active segment creates the
+    /// replacement at the same base offset and removes the old file
+    /// best-effort. When that removal loses — a fenced leader still
+    /// holding the FD — both files remain, and partition open must not
+    /// pick between them by readdir order.
+    #[test]
+    fn list_segments_keeps_the_highest_epoch_at_a_shared_base_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        for epoch in &[3, 1, 2] {
+            let _ = ActiveSegment::create(&fs, tmp.path(), 40, *epoch).unwrap();
+        }
+        let _ = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        let segs = list_segments(&fs, tmp.path()).unwrap();
+        assert_eq!(
+            segs.iter()
+                .map(|s| (s.base_offset, s.epoch))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (40, 3)]
+        );
     }
 
     #[test]

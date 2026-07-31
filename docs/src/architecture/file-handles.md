@@ -37,12 +37,33 @@ When `assignment.json` moves a partition (the
   reconciling the manifest's possibly-stale high watermark against
   what's actually on disk. Recovery runs at takeover time precisely
   *because* the manifest is allowed to lag (see
-  [Storage engine hot path](./storage-hot-path.md)).
+  [Storage engine hot path](./storage-hot-path.md)). It then raises the
+  partition's epoch to the one the assignment carries, **rolls to a
+  fresh segment file stamped with that epoch**, and persists the
+  manifest before accepting a single write.
 - **Old leader**: relinquish persists the manifest and producer
-  snapshot one last time, then closes the handles. The epoch-prefixed
-  segment filenames guarantee that even a *missed* relinquish (crashed
-  pod) can't corrupt the new leader's log — a stale writer's segments
-  simply belong to a dead epoch.
+  snapshot one last time, then closes the handles — unless the manifest
+  on disk already carries a higher epoch, in which case it has been
+  superseded and writes nothing but still releases its descriptors.
+
+That roll is what makes the epoch-prefixed filenames load-bearing
+rather than decorative. A departing leader does not find out it lost
+the partition until its own copy of `assignment.json` catches up, so
+there is a window where it still believes it leads and keeps accepting
+produce requests. Because the new leader appends to a *different* file,
+the two can't interleave writes into one — the deposed leader's records
+land in a segment belonging to a dead epoch and are discarded, instead
+of being spliced byte-wise into the live log. Its in-flight produce
+requests start failing as soon as the epoch bump lands, since the
+append path rejects any write carrying an epoch below the partition's
+current one.
+
+This is the shape Apache Kafka gets from replication and a leader
+epoch cache: a follower that becomes leader starts a new epoch, and
+records written by the old leader past the divergence point are
+truncated away. kaas has no followers to truncate against, so it
+separates the writers at the filesystem instead — same guarantee,
+different mechanism.
 
 ## Manifest + producer snapshot
 
