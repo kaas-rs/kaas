@@ -115,6 +115,46 @@ pub fn write(fs: &dyn Fs, dir: &Path, m: &Manifest) -> Result<(), ManifestError>
     Ok(())
 }
 
+/// Write `m` unless the manifest on disk already carries a **higher**
+/// epoch, and report the epoch in effect afterwards (gh #235).
+///
+/// The epoch field is the durable seed for the append fence, so no
+/// writer may ever lower it. Every caller reads the manifest, does some
+/// work, and writes it back, which makes the read→write gap a window
+/// where a concurrent leadership change can be overwritten. The gap in
+/// `Partition::open` is the dangerous one: it spans a segment scan, so
+/// on a slow substrate it is open for hundreds of milliseconds or more,
+/// and losing that race replays the previous leader's epoch over the new
+/// leader's.
+///
+/// Re-reading immediately before the write cannot close the window —
+/// NFS offers no compare-and-swap — but it shrinks it from "a full
+/// recovery" to "one read plus one rename", and it converts the common
+/// case from silent corruption of the fence into a no-op. The caller is
+/// expected to adopt the returned epoch so its in-memory view never
+/// sits below the durable one.
+pub fn write_unless_superseded(
+    fs: &dyn Fs,
+    dir: &Path,
+    m: &Manifest,
+) -> Result<i64, ManifestError> {
+    if let Ok(ReadResult::Present(on_disk)) = read(fs, dir) {
+        if on_disk.epoch > m.epoch {
+            return Ok(on_disk.epoch);
+        }
+        // Already exactly what we were going to write. Skipping keeps a
+        // partition open from touching the manifest at all in the steady
+        // state, which removes the window rather than just narrowing it —
+        // and saves a write per open on a substrate where writes are the
+        // expensive operation.
+        if on_disk == *m {
+            return Ok(m.epoch);
+        }
+    }
+    write(fs, dir, m)?;
+    Ok(m.epoch)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("io: {0}")]
@@ -130,6 +170,83 @@ mod tests {
     use super::*;
     use crate::fs::RealFs;
     use std::io::Write;
+
+    /// gh #235: the epoch is the durable seed for the append fence, so
+    /// no writer may lower it — every writer reads, works, then writes
+    /// back, and a takeover landing in that gap must win.
+    #[test]
+    fn write_unless_superseded_refuses_to_lower_the_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let winner = Manifest {
+            epoch: 9,
+            high_watermark: 400,
+            log_start_offset: 0,
+        };
+        write(&fs, tmp.path(), &winner).unwrap();
+
+        let stale = Manifest {
+            epoch: 3,
+            high_watermark: 120,
+            log_start_offset: 0,
+        };
+        assert_eq!(
+            write_unless_superseded(&fs, tmp.path(), &stale).unwrap(),
+            9,
+            "must report the epoch actually in effect"
+        );
+        let ReadResult::Present(on_disk) = read(&fs, tmp.path()).unwrap() else {
+            unreachable!("written above")
+        };
+        assert_eq!(on_disk, winner, "stale write clobbered the newer epoch");
+    }
+
+    #[test]
+    fn write_unless_superseded_advances_and_matches_at_the_same_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let base = Manifest {
+            epoch: 4,
+            high_watermark: 10,
+            log_start_offset: 0,
+        };
+        write(&fs, tmp.path(), &base).unwrap();
+
+        // Higher epoch wins.
+        let next = Manifest {
+            epoch: 5,
+            high_watermark: 20,
+            log_start_offset: 0,
+        };
+        assert_eq!(write_unless_superseded(&fs, tmp.path(), &next).unwrap(), 5);
+        // Same epoch, moved high watermark — still written.
+        let moved = Manifest {
+            epoch: 5,
+            high_watermark: 33,
+            log_start_offset: 0,
+        };
+        assert_eq!(write_unless_superseded(&fs, tmp.path(), &moved).unwrap(), 5);
+        let ReadResult::Present(on_disk) = read(&fs, tmp.path()).unwrap() else {
+            unreachable!("written above")
+        };
+        assert_eq!(on_disk, moved);
+    }
+
+    #[test]
+    fn write_unless_superseded_creates_a_missing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let m = Manifest {
+            epoch: 0,
+            high_watermark: 0,
+            log_start_offset: 0,
+        };
+        assert_eq!(write_unless_superseded(&fs, tmp.path(), &m).unwrap(), 0);
+        let ReadResult::Present(on_disk) = read(&fs, tmp.path()).unwrap() else {
+            unreachable!("just created")
+        };
+        assert_eq!(on_disk, m);
+    }
 
     #[test]
     fn json_matches_v01_camelcase_layout() {

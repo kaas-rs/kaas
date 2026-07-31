@@ -307,8 +307,19 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         .map(|entries| entries.into_iter().collect::<HashMap<i64, ProducerEntry>>())
         .unwrap_or_default();
 
-    // Persist the manifest so the next open is fast.
-    manifest::write(
+    // Persist the manifest so the next open is fast — but never below
+    // the epoch on disk (gh #235). `epoch` was read at the top of this
+    // function, and everything since (the segment listing, the handle
+    // opens, the high-watermark scan) has run in between. Another broker
+    // completing a takeover in that window has already written a higher
+    // epoch, and replaying ours over it silently unarms the fence: the
+    // new leader keeps its raised epoch in memory, so the takeover
+    // reconcile sees a converged partition and never re-drives it.
+    //
+    // Adopt whatever epoch ends up in effect. Coming up *below* the
+    // durable epoch would leave this partition accepting appends the
+    // fence is supposed to reject.
+    let epoch = manifest::write_unless_superseded(
         fs,
         dir,
         &Manifest {
@@ -1182,7 +1193,11 @@ fn persist_state_locked(fs: &dyn Fs, guard: &mut PartitionInner) -> Result<bool,
         crate::producer_snapshot::ProducerSnapshotError::Io(e) => StorageError::Io(e),
         crate::producer_snapshot::ProducerSnapshotError::Json(e) => StorageError::Json(e),
     })?;
-    manifest::write(
+    // Re-checked at the write itself, not just at the top of this
+    // function: the producer-snapshot write sits in between, and on a
+    // slow substrate that is enough of a gap for a takeover to land
+    // (gh #235).
+    let effective = manifest::write_unless_superseded(
         fs,
         &guard.dir,
         &Manifest {
@@ -1196,7 +1211,7 @@ fn persist_state_locked(fs: &dyn Fs, guard: &mut PartitionInner) -> Result<bool,
         manifest::ManifestError::Json(e) => StorageError::Json(e),
         other => StorageError::Io(std::io::Error::other(other.to_string())),
     })?;
-    Ok(true)
+    Ok(effective == guard.epoch)
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,6 +1338,57 @@ mod tests {
     struct VanishingFs {
         inner: RealFs,
         fail_creates: std::sync::atomic::AtomicU32,
+    }
+
+    /// [`RealFs`] that drops a higher-epoch manifest on disk the first
+    /// time the recovery scan opens a `.log` — standing in for another
+    /// broker completing a takeover inside `Partition::open`'s
+    /// read-scan-write window (gh #235).
+    struct RacingTakeoverFs {
+        inner: RealFs,
+        lands: Manifest,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl Fs for RacingTakeoverFs {
+        fn open_read(&self, p: &std::path::Path) -> std::io::Result<Box<dyn crate::fs::FileRead>> {
+            if p.extension().is_some_and(|e| e == "log")
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(dir) = p.parent() {
+                    let _ = manifest::write(&self.inner, dir, &self.lands);
+                }
+            }
+            self.inner.open_read(p)
+        }
+        fn open_write(
+            &self,
+            p: &std::path::Path,
+            append: bool,
+        ) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
+            self.inner.open_write(p, append)
+        }
+        fn create(&self, p: &std::path::Path) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
+            self.inner.create(p)
+        }
+        fn fsync(&self, f: &mut dyn crate::fs::FileWrite) -> std::io::Result<()> {
+            self.inner.fsync(f)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+            self.inner.remove(p)
+        }
+        fn mkdir_all(&self, p: &std::path::Path) -> std::io::Result<()> {
+            self.inner.mkdir_all(p)
+        }
+        fn readdir(&self, p: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+            self.inner.readdir(p)
+        }
+        fn stat(&self, p: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+            self.inner.stat(p)
+        }
     }
 
     /// [`RealFs`] that fails only the `tmp + fsync + rename` writer, by
@@ -2113,6 +2179,74 @@ mod tests {
             p.take_over(5).await.unwrap();
             assert_eq!(p.epoch(), 5);
             p.close().await.unwrap();
+        });
+    }
+
+    /// gh #235: `Partition::open` reads the manifest, then runs a whole
+    /// recovery (segment listing, handle opens, high-watermark scan)
+    /// before writing it back. A takeover completing in that window has
+    /// already raised the epoch on disk, and replaying the stale one
+    /// over it unarms the fence silently — the new leader keeps its
+    /// raised epoch in memory, so the takeover reconcile sees a
+    /// converged partition and never re-drives it. This is the shape
+    /// that left partitions one epoch behind on the cluster.
+    #[test]
+    fn open_does_not_replay_a_stale_epoch_over_a_concurrent_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            // Establish a partition at epoch 3 with four records.
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(4, 1_000)).await.unwrap();
+            p.take_over(3).await.unwrap();
+            p.close().await.unwrap();
+
+            // Re-open while a peer's takeover lands epoch 9 mid-scan.
+            let racing: Arc<dyn Fs> = Arc::new(RacingTakeoverFs {
+                inner: RealFs::new(),
+                lands: Manifest {
+                    epoch: 9,
+                    high_watermark: 4,
+                    log_start_offset: 0,
+                },
+                fired: std::sync::atomic::AtomicBool::new(false),
+            });
+            let reopened = Partition::open(
+                racing.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            let ReadResult::Present(on_disk) = manifest::read(racing.as_ref(), tmp.path()).unwrap()
+            else {
+                unreachable!("manifest was written above")
+            };
+            assert_eq!(on_disk.epoch, 9, "open replayed a stale epoch over disk");
+            assert_eq!(
+                reopened.epoch(),
+                9,
+                "open must adopt the durable epoch, not serve below it"
+            );
+            // Adopting it means the fence is armed, not merely recorded.
+            let err = reopened
+                .append(8, -1, build_batch(1, 1_000))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StorageError::EpochMismatch));
+            assert_eq!(reopened.high_watermark(), 4);
+            reopened.close().await.unwrap();
         });
     }
 
