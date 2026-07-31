@@ -69,9 +69,28 @@ sleep 2
 # `rollout restart` so the rollout completes in one cycle (faster
 # signal); the StatefulSet recreates it under the same name.
 TARGET_POD="${TARGET_POD:-${STS}-0}"
+# Remember which incarnation we are replacing. `delete --wait=false`
+# returns immediately and the grace period keeps the old pod Running and
+# Ready for a further ~10s, so waiting on `condition=ready` alone matches
+# the *outgoing* pod and returns instantly — the test would then judge a
+# restart that had not started yet.
+OLD_UID="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+
 echo ">> bouncing pod $NAMESPACE/$TARGET_POD"
 kubectl -n "$NAMESPACE" delete pod "$TARGET_POD" --wait=false --grace-period=10 \
   || { echo "FAIL: could not delete pod" >&2; kill "$PERF_PID" 2>/dev/null; exit 1; }
+
+echo ">> waiting for $TARGET_POD to be replaced"
+for _ in $(seq 1 150); do
+  NEW_UID="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  if [ -n "$NEW_UID" ] && [ "$NEW_UID" != "$OLD_UID" ]; then break; fi
+  sleep 1
+done
+if [ -z "${NEW_UID:-}" ] || [ "${NEW_UID:-}" = "$OLD_UID" ]; then
+  echo "FAIL: pod was never replaced" >&2
+  kill "$PERF_PID" 2>/dev/null
+  exit 1
+fi
 
 # Wait for the StatefulSet to bring the pod back Ready before we
 # pass judgement on the producer. controller-runtime's lease-renewal
@@ -80,6 +99,13 @@ kubectl -n "$NAMESPACE" delete pod "$TARGET_POD" --wait=false --grace-period=10 
 echo ">> waiting for $TARGET_POD to be Ready again"
 kubectl -n "$NAMESPACE" wait --for=condition=ready --timeout=120s "pod/$TARGET_POD" \
   || { echo "FAIL: pod did not return Ready in time" >&2; kill "$PERF_PID" 2>/dev/null; exit 1; }
+
+# Bouncing a broker moves its partitions and its consumer-group
+# coordinators onto the survivors, and that reshuffle outlives the
+# restarted pod's own readiness. Settle here rather than at the end of
+# the script so every exit path below — including the failure ones —
+# hands the next script in the suite a healthy cluster.
+wait_cluster_ready
 
 echo ">> waiting for producer to finish"
 # Bounded wait — the perf test is sized for ~30s on a healthy cluster
