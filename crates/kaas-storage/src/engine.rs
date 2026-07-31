@@ -279,6 +279,22 @@ pub trait StorageEngine: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Leader epoch this engine currently holds `(topic, partition)` at,
+    /// or `None` if the partition isn't open here.
+    ///
+    /// Lets the takeover reconcile tell "open at the assignment's epoch"
+    /// apart from "open, but at a stale one" (gh #227). Those look
+    /// identical through [`Self::open_partition_keys`], and conflating
+    /// them strands a partition whose `take_over` failed *after* the
+    /// open: it counts as open, so the reconcile skips it, and nothing
+    /// re-drives it until the next assignment change.
+    ///
+    /// Default returns `None` — an engine that never takes anything over
+    /// holds no epoch to report.
+    fn partition_epoch(&self, _topic: &str, _partition: i32) -> Option<i64> {
+        None
+    }
+
     /// SIGTERM-time drain: close every open partition so the next
     /// leader doesn't hit NFS silly-rename pain on takeover
     /// (gh #61 + gh #139). Default impl is a no-op — `MemoryStorage`

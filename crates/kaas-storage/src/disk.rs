@@ -246,6 +246,12 @@ impl StorageEngine for DiskStorageEngine {
         out
     }
 
+    fn partition_epoch(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.partitions
+            .get(&(topic.to_owned(), partition))
+            .map(|e| e.value().epoch())
+    }
+
     fn high_watermark(&self, topic: &str, partition: i32) -> Result<i64, StorageError> {
         Ok(self
             .partitions

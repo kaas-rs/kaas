@@ -117,7 +117,8 @@ impl TakeoverDriver {
     }
 
     /// gh #215: re-drive `take_over` for every partition the current
-    /// assignment gives this broker but the engine has NOT opened.
+    /// assignment gives this broker that the engine has not opened —
+    /// **or has open at an epoch below the assignment's** (gh #227).
     ///
     /// [`on_change`] only fires `take_over` when a partition's epoch
     /// changes, so a transient failure — the gh #203 ENOENT race, a
@@ -126,12 +127,21 @@ impl TakeoverDriver {
     /// readiness (gh #208) that leaves the broker NotReady and stalls
     /// the rollout.
     ///
+    /// The epoch half of the check exists because `take_over` no longer
+    /// fails only while opening. Since gh #227 it also rolls a segment
+    /// and persists the manifest *after* the open, so a failure there
+    /// leaves a partition that is open — and therefore counted as
+    /// converged — while still sitting at the previous leader's epoch,
+    /// with the append fence unarmed. "Open" and "open at the right
+    /// epoch" are different questions, and only the second one means
+    /// takeover actually finished.
+    ///
     /// This is the NFS-substrate rule-2 backstop (see
     /// `docs/src/architecture/nfs-substrate.md`): `take_over` is
-    /// idempotent — a no-op on an already-open partition — so
-    /// re-driving it on a timer converges the engine's open set to the
-    /// assignment without ever double-opening. Returns the number of
-    /// partitions re-driven this pass.
+    /// idempotent — a no-op at or below the partition's current epoch —
+    /// so re-driving it on a timer converges the engine to the
+    /// assignment without ever double-opening or re-rolling. Returns the
+    /// number of partitions re-driven this pass.
     ///
     /// [`on_change`]: Self::on_change
     pub fn reconcile(&self, next: &Assignment) -> usize {
@@ -140,8 +150,18 @@ impl TakeoverDriver {
             self.engine.open_partition_keys().into_iter().collect();
         let mut redriven = 0;
         for oref in owned.values() {
-            if open.contains(&(oref.topic.clone(), oref.partition)) {
-                continue;
+            let key = (oref.topic.clone(), oref.partition);
+            if open.contains(&key) {
+                // Open at or above the assignment's epoch — converged.
+                // An engine that reports no epoch (the memory/dev
+                // engines) keeps the old open-set-only semantics.
+                let stale = self
+                    .engine
+                    .partition_epoch(&oref.topic, oref.partition)
+                    .is_some_and(|have| have < i64::from(oref.epoch));
+                if !stale {
+                    continue;
+                }
             }
             let engine = self.engine.clone();
             let topic = oref.topic.clone();
@@ -242,6 +262,56 @@ mod tests {
 
         // Second pass: everything is open now → nothing re-driven.
         assert_eq!(driver.reconcile(&a), 0);
+    }
+
+    /// gh #227: a partition can be *open* and still not have finished
+    /// taking over — `take_over` rolls a segment and persists the
+    /// manifest after the open, and a failure there leaves the partition
+    /// serving at the previous leader's epoch with the append fence
+    /// unarmed. The open-set check alone calls that converged and
+    /// strands it until the next assignment change, so reconcile has to
+    /// compare epochs too.
+    // Multi-thread: `Partition::take_over` does its roll + persist on
+    // `spawn_blocking`, which a current-thread runtime won't drive from
+    // `yield_now` alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_redrives_a_partition_open_at_a_stale_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(kaas_storage::DiskStorageEngine::new(
+            Arc::new(kaas_storage::RealFs::new()),
+            tmp.path().to_path_buf(),
+            kaas_storage::PartitionConfig::default(),
+        ));
+        let driver = TakeoverDriver::new(engine.clone(), "kaas-0");
+
+        // Open t/0 at epoch 5 — the assignment below also says 5.
+        engine.take_over("t", 0, 5).await.unwrap();
+        let at_5 = assignment("kaas-0", &[("t", 0)]);
+        assert_eq!(
+            driver.reconcile(&at_5),
+            0,
+            "open at the assignment's epoch is converged"
+        );
+
+        // The controller moves it to a higher epoch. The partition is
+        // still open, so the open-set check alone would skip it.
+        let mut at_9 = assignment("kaas-0", &[("t", 0)]);
+        at_9.partitions[0].epoch = 9;
+        assert_eq!(
+            driver.reconcile(&at_9),
+            1,
+            "open at a stale epoch must be re-driven"
+        );
+
+        for _ in 0..200 {
+            if engine.partition_epoch("t", 0) == Some(9) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(engine.partition_epoch("t", 0), Some(9));
+        // Converged now — and re-driving is idempotent, not a re-roll.
+        assert_eq!(driver.reconcile(&at_9), 0);
     }
 
     /// A partition assigned to a DIFFERENT broker is never re-driven.
