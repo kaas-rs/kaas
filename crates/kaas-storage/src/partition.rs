@@ -557,8 +557,20 @@ impl Partition {
                 // the fence rejecting writes to a log the previous
                 // leader still owns.
                 roll_for_epoch_locked(fs.as_ref(), &mut guard, new_epoch)?;
+                // The epoch is only real once it is durable. `persist`
+                // writes `guard.epoch`, so it has to be raised first —
+                // but if the write doesn't land, put it back. The
+                // takeover reconcile decides whether to re-drive by
+                // comparing this epoch against the assignment's, so
+                // leaving it raised over a manifest that still says
+                // otherwise reports a takeover that never finished as
+                // complete, and nothing retries it (gh #227).
+                let prev_epoch = guard.epoch;
                 guard.epoch = new_epoch;
-                persist_state_locked(fs.as_ref(), &mut guard)?;
+                if let Err(e) = persist_state_locked(fs.as_ref(), &mut guard) {
+                    guard.epoch = prev_epoch;
+                    return Err(e);
+                }
                 Ok(snapshot_of(&guard))
             })
             .await
@@ -1046,6 +1058,14 @@ impl Partition {
 // Epoch-bump roll — called under the inner lock.
 // ---------------------------------------------------------------------------
 
+/// Would a roll to `(new_base, new_epoch)` land on exactly the file
+/// `outgoing` already occupies? True only when a previous roll at this
+/// epoch already happened — i.e. this is a re-drive after a `take_over`
+/// that failed somewhere past the roll.
+fn new_active_path_matches(outgoing: &SegmentMeta, new_base: i64, new_epoch: i64) -> bool {
+    outgoing.base_offset == new_base && outgoing.epoch == new_epoch
+}
+
 /// gh #227: swap the active segment for a fresh one stamped with
 /// `new_epoch`, so a leader that has just been fenced can never share a
 /// log file with this one. Called from [`Partition::take_over`] *before*
@@ -1091,6 +1111,12 @@ fn roll_for_epoch_locked(
     let new_active =
         ActiveSegment::create(fs, &dir, new_base, new_epoch).map_err(StorageError::Io)?;
 
+    // A re-drive after a failed take_over rolls at the same epoch over
+    // the empty segment the previous attempt created, so `create` above
+    // just truncated the very file we are about to call "outgoing".
+    // Removing it would delete the active segment out from under its own
+    // open handles.
+    let replaced_in_place = new_active_path_matches(&guard.active.meta, new_base, new_epoch);
     let mut outgoing = std::mem::replace(&mut guard.active, new_active);
     let outgoing_meta = SegmentMeta {
         size: outgoing_size,
@@ -1098,7 +1124,9 @@ fn roll_for_epoch_locked(
     };
     outgoing.close_handles();
 
-    if outgoing_size == 0 {
+    if replaced_in_place {
+        // Nothing to retain and nothing to remove.
+    } else if outgoing_size == 0 {
         let _ = fs.remove(&outgoing_meta.log_path);
         let _ = fs.remove(&outgoing_meta.index_path);
     } else {
@@ -1295,6 +1323,57 @@ mod tests {
     struct VanishingFs {
         inner: RealFs,
         fail_creates: std::sync::atomic::AtomicU32,
+    }
+
+    /// [`RealFs`] that fails only the `tmp + fsync + rename` writer, by
+    /// rejecting `create` of a `.tmp` path while armed. Segment creation
+    /// is untouched, so it reproduces the production shape exactly: the
+    /// takeover roll lands, the manifest persist does not.
+    struct PersistFailingFs {
+        inner: RealFs,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl Fs for PersistFailingFs {
+        fn open_read(&self, p: &std::path::Path) -> std::io::Result<Box<dyn crate::fs::FileRead>> {
+            self.inner.open_read(p)
+        }
+        fn open_write(
+            &self,
+            p: &std::path::Path,
+            append: bool,
+        ) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
+            self.inner.open_write(p, append)
+        }
+        fn create(&self, p: &std::path::Path) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst)
+                && p.extension().is_some_and(|e| e == "tmp")
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file or directory",
+                ));
+            }
+            self.inner.create(p)
+        }
+        fn fsync(&self, f: &mut dyn crate::fs::FileWrite) -> std::io::Result<()> {
+            self.inner.fsync(f)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+            self.inner.remove(p)
+        }
+        fn mkdir_all(&self, p: &std::path::Path) -> std::io::Result<()> {
+            self.inner.mkdir_all(p)
+        }
+        fn readdir(&self, p: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+            self.inner.readdir(p)
+        }
+        fn stat(&self, p: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+            self.inner.stat(p)
+        }
     }
 
     impl Fs for VanishingFs {
@@ -2035,6 +2114,80 @@ mod tests {
             assert_eq!(p.epoch(), 5);
             p.close().await.unwrap();
         });
+    }
+
+    /// gh #227: the reported epoch must reflect *durable* state. Seen in
+    /// production — the roll landed and stamped a new segment, the
+    /// manifest persist hit ENOENT, and the partition then reported the
+    /// new epoch from memory while the manifest still said otherwise.
+    /// The takeover reconcile compares that reported epoch against the
+    /// assignment to decide whether to re-drive, so a raised-but-unsaved
+    /// epoch says "converged" and the partition is stranded for good.
+    #[test]
+    fn a_failed_persist_does_not_leave_the_epoch_raised() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let armed = Arc::new(PersistFailingFs {
+                inner: RealFs::new(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            });
+            let fs: Arc<dyn Fs> = armed.clone();
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(4, 1_000)).await.unwrap();
+
+            armed.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+            let err = p.take_over(6).await.unwrap_err();
+            assert!(matches!(err, StorageError::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+            assert_eq!(
+                p.epoch(),
+                0,
+                "epoch must not advance past what was persisted"
+            );
+
+            // The re-drive the reconcile will now issue has to succeed —
+            // it rolls again at the same epoch, over the segment the
+            // failed attempt already created.
+            armed.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(p.take_over(6).await.unwrap(), 4);
+            assert_eq!(p.epoch(), 6);
+
+            // And the active segment still exists — the re-roll must not
+            // have deleted the file it just created.
+            let active = p.inner.lock().active.meta.clone();
+            assert_eq!(active.epoch, 6);
+            assert!(
+                armed.stat(&active.log_path).is_ok(),
+                "re-drive removed its own active segment"
+            );
+            // Records written before the takeover survive it.
+            assert_eq!(p.high_watermark(), 4);
+            p.close().await.unwrap();
+
+            let reopened = Partition::open(
+                fs_arc(&armed),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.epoch(), 6);
+            assert_eq!(reopened.high_watermark(), 4);
+            reopened.close().await.unwrap();
+        });
+    }
+
+    fn fs_arc(f: &Arc<PersistFailingFs>) -> Arc<dyn Fs> {
+        f.clone()
     }
 
     /// A broker only learns it lost a partition when its assignment
