@@ -65,9 +65,10 @@ deploys and no `CNAME` file is needed.
 over: it force-pushes `docs/book/html` to this repo's **`book-dist`**
 branch (an orphan, one commit deep — a build artifact, not history), then
 fires a `book-updated` repository dispatch so the landing repo redeploys.
-That dispatch needs a PAT in the `LANDING_DISPATCH_TOKEN` secret; without
-it the step is skipped with a warning and the site picks the book up on its
-next build — stale, not broken.
+That dispatch needs a PAT in the `LANDING_DISPATCH_TOKEN` secret (the
+default `GITHUB_TOKEN` cannot reach another repo); without it the step is
+skipped with a warning and the landing repo's daily cron picks the book up
+instead — up to a day stale, never broken.
 
 Editing `docs/src/` is therefore all you need to do: the publish is
 automatic. What *isn't* automatic is the shape of the render. The landing
