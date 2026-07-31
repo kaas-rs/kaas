@@ -9,6 +9,6 @@ keywords:
   - kafka
   - streaming
   - messaging
-home: https://github.com/woestebanaan/kaas
+home: https://github.com/kaas-rs/kaas
 sources:
-  - https://github.com/woestebanaan/kaas
+  - https://github.com/kaas-rs/kaas

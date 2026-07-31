@@ -10,7 +10,7 @@ the smoke test live in the chart's own `deploy/helm/kaas/README.md`; this
 chapter covers the concepts that need more than a values table.
 
 ```bash
-helm install my-kaas oci://ghcr.io/woestebanaan/charts/kaas \
+helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
   --version 0.2.4-preview \
   --namespace kafka --create-namespace \
   --set storage.className=<your-rwx-class> \

@@ -6,7 +6,7 @@ shared ReadWriteMany PersistentVolumeClaim.
 ## Images
 
 The chart derives the broker and operator image repositories from the resolved
-tag: `ghcr.io/woestebanaan/kaas` + `kaas-operator`, with a `-preview`
+tag: `ghcr.io/kaas-rs/kaas` + `kaas-operator`, with a `-preview`
 suffix appended automatically when the tag is a pre-release (contains a `-`),
 matching the release workflow's image-naming rule — so the chart default
 points at images that actually exist for preview tags, with no override
@@ -18,7 +18,7 @@ needed.
 mirrors:
 
 ```bash
-helm install my-kaas oci://ghcr.io/woestebanaan/charts/kaas \
+helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
   --set image.repository=registry.example.com/mirrors/kaas-preview \
   --set operator.image.repository=registry.example.com/mirrors/kaas-operator-preview \
   ...
@@ -41,7 +41,7 @@ first install. The chart is always pushed under the name `kaas` (from
 repository override is needed:
 
 ```bash
-helm install my-kaas oci://ghcr.io/woestebanaan/charts/kaas \
+helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
   --version 0.2.0-preview \
   --namespace kafka --create-namespace \
   --set storage.className=ceph-filesystem \
@@ -51,7 +51,7 @@ helm install my-kaas oci://ghcr.io/woestebanaan/charts/kaas \
 See available versions:
 
 ```bash
-helm show all oci://ghcr.io/woestebanaan/charts/kaas --version 0.2.0-preview
+helm show all oci://ghcr.io/kaas-rs/charts/kaas --version 0.2.0-preview
 ```
 
 ### CRDs on upgrade
@@ -62,12 +62,12 @@ CRDs, apply them explicitly before `helm upgrade`:
 
 ```bash
 # Pull the new chart version locally, then apply the CRDs it ships:
-helm pull oci://ghcr.io/woestebanaan/charts/kaas --version 0.2.0-preview --untar
+helm pull oci://ghcr.io/kaas-rs/charts/kaas --version 0.2.0-preview --untar
 kubectl apply -f kaas/crds/
 
 # Or apply them straight from the repo at a specific ref:
 REF=v0.2.0-preview
-BASE=https://raw.githubusercontent.com/Woestebanaan/kaas/${REF}/deploy/crds
+BASE=https://raw.githubusercontent.com/kaas-rs/kaas/${REF}/deploy/crds
 for f in kaas.rs_kafkaclusters.yaml \
          kaas.rs_kafkatopics.yaml \
          kaas.rs_kafkausers.yaml \

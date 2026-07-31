@@ -94,7 +94,7 @@ image names.
 {{- $repo := .Values.image.repository -}}
 {{- if not $repo -}}
   {{- $pre := contains "-" $tag | ternary "-preview" "" -}}
-  {{- $repo = printf "ghcr.io/woestebanaan/kaas%s" $pre -}}
+  {{- $repo = printf "ghcr.io/kaas-rs/kaas%s" $pre -}}
 {{- end -}}
 {{ $repo }}:{{ $tag }}
 {{- end -}}
@@ -281,7 +281,7 @@ is empty (broker treats unset env as "no superUsers").
 {{- $repo := .Values.operator.image.repository -}}
 {{- if not $repo -}}
   {{- $pre := contains "-" $tag | ternary "-preview" "" -}}
-  {{- $repo = printf "ghcr.io/woestebanaan/kaas-operator%s" $pre -}}
+  {{- $repo = printf "ghcr.io/kaas-rs/kaas-operator%s" $pre -}}
 {{- end -}}
 {{ $repo }}:{{ $tag }}
 {{- end -}}

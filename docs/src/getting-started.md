@@ -12,7 +12,7 @@ broker — a `ReadWriteMany` StorageClass with NFSv4-class semantics (what
 cluster can run on a plain `ReadWriteOnce` local-path class.
 
 ```bash
-helm install my-kaas oci://ghcr.io/woestebanaan/charts/kaas \
+helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
   --version 0.2.18-preview \
   --namespace kafka --create-namespace \
   --set storage.className=<your-rwx-class> \

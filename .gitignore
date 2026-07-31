@@ -13,3 +13,4 @@ docs/book/
 *.swp
 .claude
 .kilo
+docs/perf-results/

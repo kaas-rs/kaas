@@ -70,9 +70,9 @@ tag and the Helm chart version (so `v0.1.3-preview` → `0.1.3-preview`).
 
 Pre-release tags (`v*-*`) publish to:
 
-- `ghcr.io/woestebanaan/kaas-preview:<version>`
-- `ghcr.io/woestebanaan/kaas-operator-preview:<version>`
-- `oci://ghcr.io/woestebanaan/charts/kaas:<version>`
+- `ghcr.io/kaas-rs/kaas-preview:<version>`
+- `ghcr.io/kaas-rs/kaas-operator-preview:<version>`
+- `oci://ghcr.io/kaas-rs/charts/kaas:<version>`
 
 Stable tags (no pre-release suffix) publish to the un-suffixed names
 (`kaas`, `kaas-operator`). No stable tag has been cut yet.
@@ -97,10 +97,10 @@ Images are built `linux/amd64` only.
 4. After the run completes, verify the artifacts exist:
    ```bash
    # chart
-   helm pull oci://ghcr.io/woestebanaan/charts/kaas --version 0.1.4-preview
+   helm pull oci://ghcr.io/kaas-rs/charts/kaas --version 0.1.4-preview
    # images (any registry-aware tool works)
    docker buildx imagetools inspect \
-     ghcr.io/woestebanaan/kaas-preview:0.1.4-preview
+     ghcr.io/kaas-rs/kaas-preview:0.1.4-preview
    ```
 
 The `Chart.yaml` `version`/`appVersion` fields are overridden by the CI
