@@ -1,12 +1,13 @@
 name: Docs Publish
 
-# This repo owns the book, not the site. https://kaas.rs/ is served from
-# kaas-rs/kaas-landing-page, which holds the landing page and mounts the
-# book under /book/. So this workflow builds the book and hands the render
-# over on the `book-dist` branch, then pokes the landing repo to redeploy.
+# Builds the book and deploys it to this repo's own GitHub Pages site at
+# https://kaas-rs.github.io/kaas/.
 #
-# The book's *source* — docs/src, the mdbook pins below, and the
-# `cargo xtask check-docs-drift` gates in ci.yml — stays here.
+# The landing page at https://kaas.rs/ is a separate site in
+# kaas-rs/kaas-landing-page and links here by absolute URL — the two
+# deploy independently, so there is no handoff, branch, or token between
+# them. Only the two entry points it links to are a shared contract; the
+# `docs` job in ci.yml guards those.
 
 on:
   push:
@@ -14,11 +15,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # force-pushes the render to book-dist
+  contents: read
+  pages: write
+  id-token: write
 
-# One publish at a time; a superseded push just skips to the newest.
+# One deploy at a time; a superseded push just skips to the newest.
 concurrency:
-  group: book-dist
+  group: pages
   cancel-in-progress: true
 
 jobs:
@@ -31,8 +34,6 @@ jobs:
       MDBOOK_VERSION: v0.4.52
       MDBOOK_MERMAID_VERSION: v0.16.2
       MDBOOK_LINKCHECK_VERSION: v0.7.7
-      LANDING_REPO: kaas-rs/kaas-landing-page
-      LANDING_DISPATCH_TOKEN: ${{ secrets.LANDING_DISPATCH_TOKEN }}
     steps:
       - name: Install curl + unzip (minimal runner image)
         run: |
@@ -61,48 +62,18 @@ jobs:
       - name: mdbook build
         run: mdbook build docs
 
-      # book-dist carries only the render, one orphan commit deep — it is a
-      # build artifact, so it is force-pushed rather than accumulated.
-      - name: Publish the render to book-dist
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          test -f docs/book/html/index.html
-          cd docs/book/html
-          git init -q
-          git checkout -q -b book-dist
-          git add -A
-          git -c user.name='github-actions[bot]' \
-              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -q -m "book: render of ${GITHUB_SHA}"
-          git push -q -f \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" book-dist
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/book/html
 
-      # The default GITHUB_TOKEN cannot dispatch to another repo, so this
-      # needs a PAT. Absent it, the book still lands on book-dist and the
-      # site picks it up on the landing repo's next build — a stale site,
-      # not a red one. See that repo's README for the token setup.
-      # curl, not `gh` — the ARC runner image is bare and has no gh CLI
-      # (same reason the first step installs curl itself).
-      - name: Trigger the site rebuild
-        if: env.LANDING_DISPATCH_TOKEN != ''
-        env:
-          DISPATCH_TOKEN: ${{ secrets.LANDING_DISPATCH_TOKEN }}
-        run: |
-          code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${LANDING_REPO}/dispatches" \
-            -d "{\"event_type\":\"book-updated\",\"client_payload\":{\"sha\":\"${GITHUB_SHA}\"}}")
-          if [ "$code" != "204" ]; then
-            echo "dispatch to ${LANDING_REPO} failed (HTTP ${code}):"
-            cat /tmp/dispatch.out
-            exit 1
-          fi
-          echo "dispatched book-updated to ${LANDING_REPO}"
-
-      - name: Note a skipped dispatch
-        if: env.LANDING_DISPATCH_TOKEN == ''
-        run: |
-          echo "::warning::LANDING_DISPATCH_TOKEN unset — book-dist updated, but ${LANDING_REPO} was not told to redeploy."
+  deploy:
+    needs: build
+    runs-on: arc-runner-set
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

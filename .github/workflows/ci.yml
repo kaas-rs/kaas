@@ -172,13 +172,13 @@ jobs:
       - name: mdbook build (html + linkcheck backends)
         run: mdbook build docs
 
-      # The site root lives in kaas-rs/kaas-landing-page and mounts this
-      # render under /book/. These two pages are what its cards link to, so
-      # renaming one is a cross-repo break — catch it here rather than in
-      # that repo's deploy. It re-checks every link against this output.
-      - name: Check the book render publishes the landing page's entry points
+      # The landing page at kaas.rs (kaas-rs/kaas-landing-page) deep-links to
+      # these two pages by absolute URL. Nothing else couples the two sites,
+      # and nothing over there can catch a rename here — an absolute link
+      # just starts 404ing — so this is the only guard on that contract.
+      - name: Check the entry points kaas.rs links to still exist
         run: |
           for page in index.html getting-started.html; do
             test -f "docs/book/html/${page}" \
-              || { echo "kaas-landing-page links to book/${page}, which the render no longer has"; exit 1; }
+              || { echo "kaas.rs links to ${page}, which the book no longer builds"; exit 1; }
           done

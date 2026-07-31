@@ -1,10 +1,11 @@
 # docs/
 
 The kaas documentation book and its supporting files. The book is published
-at **<https://kaas.rs/book/>**, rebuilt from `main` on every push. The site
-root at <https://kaas.rs/> is a separate landing page living in
-[kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page) —
-see [Publishing](#publishing).
+at **<https://kaas-rs.github.io/kaas/>**, rebuilt from `main` on every push.
+The project landing page at <https://kaas.rs/> is an entirely separate site
+living in
+[kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page);
+it links here, but the two share no build — see [Publishing](#publishing).
 
 ## Layout
 
@@ -54,29 +55,24 @@ the compatibility claims from rotting. Three checks:
 
 ## Publishing
 
-**This repo owns the book; it does not own the site.** `kaas.rs` is served
-from GitHub Pages on
-[kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page),
-which holds the landing page at the root and mounts this book under
-`book/`. Pages and the custom domain are configured there, so nothing here
-deploys and no `CNAME` file is needed.
+`.github/workflows/docs-publish.yml` builds the book and deploys it to this
+repo's own GitHub Pages site, <https://kaas-rs.github.io/kaas/>. Editing
+`docs/src/` is all you need to do; the publish is automatic.
 
-`.github/workflows/docs-publish.yml` builds the book and hands the render
-over: it force-pushes `docs/book/html` to this repo's **`book-dist`**
-branch (an orphan, one commit deep — a build artifact, not history), then
-fires a `book-updated` repository dispatch so the landing repo redeploys.
-That dispatch needs a PAT in the `LANDING_DISPATCH_TOKEN` secret (the
-default `GITHUB_TOKEN` cannot reach another repo); without it the step is
-skipped with a warning and the landing repo's daily cron picks the book up
-instead — up to a day stale, never broken.
+**The landing page is a separate site, not a separate half of this one.**
+<https://kaas.rs/> is served from Pages on
+[kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page)
+and links here by absolute URL. The two deploy independently — no shared
+branch, no artifact handoff, no cross-repo token. That is deliberate:
+GitHub Pages binds a domain to exactly one repo, so serving both halves
+under `kaas.rs` would require a credentialed cross-repo handoff, and the
+machinery to keep one URL shape cost more than the URL was worth.
 
-Editing `docs/src/` is therefore all you need to do: the publish is
-automatic. What *isn't* automatic is the shape of the render. The landing
-page's cards link to `book/` and `book/getting-started.html`, and the CI
-`docs` job asserts both survive the build, so renaming a top-level entry
-point fails here rather than in the other repo's deploy. The landing repo
-re-checks every one of its `book/…` links against the pulled render before
-it publishes.
+The one thing that *does* span the two repos is which pages the landing
+page deep-links to: `index.html` and `getting-started.html`. Nothing on the
+landing side can notice a rename here — an absolute link just starts
+404ing — so the CI `docs` job asserts both survive the build. If you rename
+a top-level entry point, update the landing page in the same breath.
 
 ## Writing conventions
 
