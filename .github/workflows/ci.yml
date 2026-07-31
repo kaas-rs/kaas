@@ -172,16 +172,13 @@ jobs:
       - name: mdbook build (html + linkcheck backends)
         run: mdbook build docs
 
-      # Mirror the docs-publish assembly so a missing/renamed landing page
-      # (or a landing link to a book page that doesn't exist) fails CI, not
-      # the deploy.
-      - name: Assemble site (landing page + book)
+      # The site root lives in kaas-rs/kaas-landing-page and mounts this
+      # render under /book/. These two pages are what its cards link to, so
+      # renaming one is a cross-repo break — catch it here rather than in
+      # that repo's deploy. It re-checks every link against this output.
+      - name: Check the book render publishes the landing page's entry points
         run: |
-          rm -rf _site
-          mkdir _site
-          cp -r docs/landing/. _site/
-          test -f _site/index.html
-          cp -r docs/book/html _site/book
-          for target in $(grep -o 'href="book/[^"]*"' _site/index.html | sed 's/href="book\/\?//;s/"$//'); do
-            test -e "_site/book/${target:-index.html}" || { echo "landing page links to missing book/${target}"; exit 1; }
+          for page in index.html getting-started.html; do
+            test -f "docs/book/html/${page}" \
+              || { echo "kaas-landing-page links to book/${page}, which the render no longer has"; exit 1; }
           done

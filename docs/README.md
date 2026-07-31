@@ -1,8 +1,10 @@
 # docs/
 
 The kaas documentation book and its supporting files. The book is published
-at **<https://kaas.rs/book/>** (landing page at <https://kaas.rs/>), rebuilt
-from `main` on every push.
+at **<https://kaas.rs/book/>**, rebuilt from `main` on every push. The site
+root at <https://kaas.rs/> is a separate landing page living in
+[kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page) —
+see [Publishing](#publishing).
 
 ## Layout
 
@@ -10,7 +12,6 @@ from `main` on every push.
 |---|---|
 | `src/` | the book's chapters — Parts I–IV, plus `SUMMARY.md` (the table of contents) |
 | `book.toml` | mdbook config: `rust` default theme, search, fold nav, mermaid + linkcheck backends |
-| `landing/index.html` | the custom landing page that owns the site root |
 | `mermaid.min.js`, `mermaid-init.js` | committed by `mdbook-mermaid install`; required by the build |
 | `perf-results/` | recorded benchmark reports, cited by Part IV's performance chapter |
 | `ARCHITECTURE.md` | pointer stub — the architecture content lives in Part I |
@@ -53,12 +54,28 @@ the compatibility claims from rotting. Three checks:
 
 ## Publishing
 
-`.github/workflows/docs-publish.yml` builds the book, assembles `_site/`
-(landing page at the root + book under `book/`), and deploys to GitHub
-Pages. The custom domain `kaas.rs` is configured in the repo's Pages
-settings — it persists across deploys, so no `CNAME` file is needed in the
-artifact. The CI `docs` job mirrors the assembly and verifies the landing
-page's `book/…` links resolve, so link breakage fails before deploy.
+**This repo owns the book; it does not own the site.** `kaas.rs` is served
+from GitHub Pages on
+[kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page),
+which holds the landing page at the root and mounts this book under
+`book/`. Pages and the custom domain are configured there, so nothing here
+deploys and no `CNAME` file is needed.
+
+`.github/workflows/docs-publish.yml` builds the book and hands the render
+over: it force-pushes `docs/book/html` to this repo's **`book-dist`**
+branch (an orphan, one commit deep — a build artifact, not history), then
+fires a `book-updated` repository dispatch so the landing repo redeploys.
+That dispatch needs a PAT in the `LANDING_DISPATCH_TOKEN` secret; without
+it the step is skipped with a warning and the site picks the book up on its
+next build — stale, not broken.
+
+Editing `docs/src/` is therefore all you need to do: the publish is
+automatic. What *isn't* automatic is the shape of the render. The landing
+page's cards link to `book/` and `book/getting-started.html`, and the CI
+`docs` job asserts both survive the build, so renaming a top-level entry
+point fails here rather than in the other repo's deploy. The landing repo
+re-checks every one of its `book/…` links against the pulled render before
+it publishes.
 
 ## Writing conventions
 
