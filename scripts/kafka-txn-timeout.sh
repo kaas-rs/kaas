@@ -44,7 +44,6 @@ if ! command -v kubectl >/dev/null 2>&1; then
   exit 0
 fi
 
-NAMESPACE="${NAMESPACE:-kaas}"
 pod=$(kubectl -n "$NAMESPACE" get pods -l app=kaas -o name 2>/dev/null | head -1)
 if [ -z "$pod" ]; then
   echo "   no kaas pod found in namespace $NAMESPACE, scenario 2 skipped"

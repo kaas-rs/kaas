@@ -26,8 +26,6 @@
 
 need kubectl
 
-NAMESPACE="${NAMESPACE:-kaas}"
-STS="${STS:-kaas}"
 RECORDS="${RECORDS:-50000}"
 
 # Sanity: we need at least one StatefulSet pod in the target ns.
@@ -60,6 +58,15 @@ echo ">> launching $RECORDS-record idempotent producer in background"
 ) &
 PERF_PID=$!
 
+# Every failure past this point has to reap the background producer, or
+# the script exits leaving a 50k-record perf run hammering the cluster
+# the next script is about to use.
+fail() {
+  echo "FAIL: $*" >&2
+  kill "$PERF_PID" 2>/dev/null
+  exit 1
+}
+
 # Let some batches land so the broker has dedupe-window state worth
 # preserving; without this the test would degenerate to "open the
 # partition fresh" which is the easy case.
@@ -78,7 +85,7 @@ OLD_UID="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" -o jsonpath='{.metadata
 
 echo ">> bouncing pod $NAMESPACE/$TARGET_POD"
 kubectl -n "$NAMESPACE" delete pod "$TARGET_POD" --wait=false --grace-period=10 \
-  || { echo "FAIL: could not delete pod" >&2; kill "$PERF_PID" 2>/dev/null; exit 1; }
+  || fail "could not delete pod"
 
 echo ">> waiting for $TARGET_POD to be replaced"
 for _ in $(seq 1 150); do
@@ -87,9 +94,7 @@ for _ in $(seq 1 150); do
   sleep 1
 done
 if [ -z "${NEW_UID:-}" ] || [ "${NEW_UID:-}" = "$OLD_UID" ]; then
-  echo "FAIL: pod was never replaced" >&2
-  kill "$PERF_PID" 2>/dev/null
-  exit 1
+  fail "pod was never replaced"
 fi
 
 # Wait for the StatefulSet to bring the pod back Ready before we
@@ -98,7 +103,7 @@ fi
 # both are settled, the producer might legitimately retry.
 echo ">> waiting for $TARGET_POD to be Ready again"
 kubectl -n "$NAMESPACE" wait --for=condition=ready --timeout=120s "pod/$TARGET_POD" \
-  || { echo "FAIL: pod did not return Ready in time" >&2; kill "$PERF_PID" 2>/dev/null; exit 1; }
+  || fail "pod did not return Ready in time"
 
 # Bouncing a broker moves its partitions and its consumer-group
 # coordinators onto the survivors, and that reshuffle outlives the
@@ -115,10 +120,8 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 if ! [ -f "$TMP/perf.exit" ]; then
-  echo "FAIL: producer did not finish within timeout" >&2
-  kill "$PERF_PID" 2>/dev/null
-  cat "$TMP/perf.err" >&2 | tail -30
-  exit 1
+  tail -30 "$TMP/perf.err" >&2
+  fail "producer did not finish within timeout"
 fi
 
 PERF_EXIT=$(cat "$TMP/perf.exit")

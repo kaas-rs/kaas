@@ -36,7 +36,6 @@ EXTRA=()
 
 need kubectl
 
-NAMESPACE="${NAMESPACE:-kaas}"
 # Per-run unique user so concurrent invocations don't collide and a
 # crashed previous run can't leave the next one staring at a stale CR.
 USER_NAME="acl-test-$$-$(date +%s)"

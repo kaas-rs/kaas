@@ -150,18 +150,17 @@ impl TakeoverDriver {
             self.engine.open_partition_keys().into_iter().collect();
         let mut redriven = 0;
         for oref in owned.values() {
-            let key = (oref.topic.clone(), oref.partition);
-            if open.contains(&key) {
-                // Open at or above the assignment's epoch — converged.
-                // An engine that reports no epoch (the memory/dev
-                // engines) keeps the old open-set-only semantics.
-                let stale = self
+            // Converged means open *and* at or above the assignment's
+            // epoch. The epoch is only queried for partitions already
+            // open; an engine that reports none (the memory/dev engines)
+            // keeps the old open-set-only semantics.
+            let converged = open.contains(&(oref.topic.clone(), oref.partition))
+                && !self
                     .engine
                     .partition_epoch(&oref.topic, oref.partition)
                     .is_some_and(|have| have < i64::from(oref.epoch));
-                if !stale {
-                    continue;
-                }
+            if converged {
+                continue;
             }
             let engine = self.engine.clone();
             let topic = oref.topic.clone();

@@ -6,15 +6,20 @@
 # Provides:
 #   $BOOTSTRAP     bootstrap server (override with env var, default in-cluster Service DNS)
 #   $KAFKA_BIN     path to Apache Kafka shell tools (defaults to /opt/kafka/bin)
+#   $NAMESPACE     Kubernetes namespace holding the cluster (defaults to kaas)
+#   $STS           broker StatefulSet name (defaults to kaas)
 #   $TOPIC         per-run unique test topic name
 #   $TMP           per-run scratch dir, auto-cleaned on exit
 #   skip "<reason>"   print reason and exit 77 (autoconf "skipped" exit code)
 #   need <bin>     skip if a required tool is not on PATH
+#   wait_cluster_ready [timeout]  block until the brokers are serving again
 
 set -euo pipefail
 
 BOOTSTRAP="${BOOTSTRAP:-kaas.kaas.svc.cluster.local:9092}"
 KAFKA_BIN="${KAFKA_BIN:-/opt/kafka/bin}"
+NAMESPACE="${NAMESPACE:-kaas}"
+STS="${STS:-kaas}"
 TOPIC="${TOPIC:-kaas-test-$$-$(date +%s)}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -55,38 +60,35 @@ need() {
 # No-op when kubectl is unavailable or the StatefulSet is absent, so
 # scripts that source this outside a cluster are unaffected.
 wait_cluster_ready() {
-  local timeout="${1:-180}"
-  local ns="${NAMESPACE:-kaas}"
-  local sts="${STS:-kaas}"
-  local i want have
+  local deadline=$(( SECONDS + ${1:-180} ))
+  local ns="$NAMESPACE"
+  local sts="$STS"
+  local want have
 
   command -v kubectl >/dev/null 2>&1 || return 0
-  kubectl -n "$ns" get sts "$sts" >/dev/null 2>&1 || return 0
+  want="$(kubectl -n "$ns" get sts "$sts" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  [ -n "$want" ] || return 0
 
   echo ">> waiting for the cluster to settle"
-  for ((i = 0; i < timeout; i++)); do
-    want="$(kubectl -n "$ns" get sts "$sts" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  # Deadline rather than an iteration count: each `kubectl` is a process
+  # spawn plus an API round trip, so counting iterations would make the
+  # timeout argument mean something much longer than seconds.
+  while [ "$SECONDS" -lt "$deadline" ]; do
     have="$(kubectl -n "$ns" get sts "$sts" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
-    if [ -n "$want" ] && [ "${have:-0}" = "$want" ]; then
-      break
-    fi
+    [ "${have:-0}" = "$want" ] && break
     sleep 1
   done
-  if [ "${have:-0}" != "${want:-}" ]; then
-    echo ">> WARN: only ${have:-0}/${want:-?} brokers Ready after ${timeout}s" >&2
-  fi
+  [ "${have:-0}" = "$want" ] ||
+    echo ">> WARN: only ${have:-0}/$want brokers Ready before the deadline" >&2
 
   # Coordinator probe. Bounded and advisory — a persistent failure is
   # the next script's problem to report, not this helper's to mask.
-  for ((i = 0; i < 30; i++)); do
-    if "$KAFKA_BIN/kafka-consumer-groups.sh" \
-        --bootstrap-server "$BOOTSTRAP" --list >/dev/null 2>&1; then
-      return 0
-    fi
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    "$KAFKA_BIN/kafka-consumer-groups.sh" \
+      --bootstrap-server "$BOOTSTRAP" --list >/dev/null 2>&1 && return 0
     sleep 2
   done
   echo ">> WARN: consumer-group admin calls still failing after the settle wait" >&2
-  return 0
 }
 
 if [ ! -x "$KAFKA_BIN/kafka-topics.sh" ]; then

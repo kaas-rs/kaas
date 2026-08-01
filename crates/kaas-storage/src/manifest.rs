@@ -105,9 +105,16 @@ fn read_legacy_epoch(fs: &dyn Fs, dir: &Path) -> Result<Option<Manifest>, Manife
     }
 }
 
-/// Atomically write the manifest. Best-effort drops the legacy
-/// `.leader-epoch` file once the new manifest is authoritative.
-pub fn write(fs: &dyn Fs, dir: &Path, m: &Manifest) -> Result<(), ManifestError> {
+/// Atomically overwrite the manifest, unconditionally. Best-effort
+/// drops the legacy `.leader-epoch` file once the new manifest is
+/// authoritative.
+///
+/// **Crate-private on purpose (gh #235).** The epoch field is the
+/// durable seed for the append fence and no writer may lower it, so
+/// production writes go through [`write_unless_superseded`]. Keeping
+/// this door shut makes that a compile error rather than a convention
+/// the next refactor can quietly walk around.
+pub(crate) fn write_unchecked(fs: &dyn Fs, dir: &Path, m: &Manifest) -> Result<(), ManifestError> {
     atomic_write_json(fs, dir, MANIFEST_FILENAME, m)?;
     // Drop the legacy file. Failure isn't fatal — the migration path
     // in `read` prefers manifest.json over the legacy file anyway.
@@ -151,7 +158,7 @@ pub fn write_unless_superseded(
             return Ok(m.epoch);
         }
     }
-    write(fs, dir, m)?;
+    write_unchecked(fs, dir, m)?;
     Ok(m.epoch)
 }
 
@@ -183,7 +190,7 @@ mod tests {
             high_watermark: 400,
             log_start_offset: 0,
         };
-        write(&fs, tmp.path(), &winner).unwrap();
+        write_unchecked(&fs, tmp.path(), &winner).unwrap();
 
         let stale = Manifest {
             epoch: 3,
@@ -210,7 +217,7 @@ mod tests {
             high_watermark: 10,
             log_start_offset: 0,
         };
-        write(&fs, tmp.path(), &base).unwrap();
+        write_unchecked(&fs, tmp.path(), &base).unwrap();
 
         // Higher epoch wins.
         let next = Manifest {
@@ -272,7 +279,7 @@ mod tests {
             high_watermark: 42,
             log_start_offset: 10,
         };
-        write(&fs, tmp.path(), &m).unwrap();
+        write_unchecked(&fs, tmp.path(), &m).unwrap();
         let got = match read(&fs, tmp.path()).unwrap() {
             ReadResult::Present(got) => got,
             other => unreachable!("expected Present, got {:?}", other),
@@ -317,7 +324,7 @@ mod tests {
             let mut f = fs.create(&legacy_path).unwrap();
             f.write_all(&3i64.to_be_bytes()).unwrap();
         }
-        write(
+        write_unchecked(
             &fs,
             tmp.path(),
             &Manifest {

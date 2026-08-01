@@ -156,15 +156,10 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
             index_path: dir.join(format!("{stem}{INDEX_EXT}")),
         });
     }
-    // Ascending by base_offset, highest epoch first within a base, so
-    // `dedup_by` — which retains the first of each run — keeps the
+    // Highest epoch first within a base offset, so the dedup keeps the
     // newest leader's file.
-    out.sort_by(|a, b| {
-        a.base_offset
-            .cmp(&b.base_offset)
-            .then_with(|| b.epoch.cmp(&a.epoch))
-    });
-    out.dedup_by(|a, b| a.base_offset == b.base_offset);
+    out.sort_by_key(|m| (m.base_offset, std::cmp::Reverse(m.epoch)));
+    out.dedup_by_key(|m| m.base_offset);
     Ok(out)
 }
 
