@@ -34,31 +34,48 @@ fi
 echo "   InitProducerId advertised, reaper precondition met"
 
 echo ">> Scenario 2: cluster txn_state/ directory present on shared PVC"
-# Only meaningful in-cluster. The data dir is /data on the StatefulSet
-# pods; we exec into pod 0 if kubectl is on PATH and a kaas pod
-# exists. Otherwise skip — this scenario is purely a deployment-time
-# smoke test, not a wire-protocol assertion.
+# Only meaningful in-cluster: exec into a broker pod if kubectl is on
+# PATH and one exists. Otherwise skip — this scenario is purely a
+# deployment-time smoke test, not a wire-protocol assertion.
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "   kubectl not present, scenario 2 skipped (run inside the cluster to exercise)"
   echo ">> PASS (wire surface OK; deployment-time slot-dir check skipped)"
   exit 0
 fi
 
-pod=$(kubectl -n "$NAMESPACE" get pods -l app=kaas -o name 2>/dev/null | head -1)
+# Select on the chart's labels, and pin the component: the operator
+# carries the same `name` label, and it does not mount the cluster-state
+# volume this scenario inspects.
+pod=$(kubectl -n "$NAMESPACE" get pods \
+  -l app.kubernetes.io/name=kaas,app.kubernetes.io/component=broker \
+  -o name 2>/dev/null | head -1)
 if [ -z "$pod" ]; then
-  echo "   no kaas pod found in namespace $NAMESPACE, scenario 2 skipped"
+  echo "   no kaas broker pod found in namespace $NAMESPACE, scenario 2 skipped"
   echo ">> PASS (wire surface OK; deployment-time slot-dir check skipped)"
   exit 0
 fi
 
-if kubectl -n "$NAMESPACE" exec "$pod" -- test -d /data/__cluster/txn_state 2>/dev/null; then
-  slot_count=$(kubectl -n "$NAMESPACE" exec "$pod" -- \
-    sh -c 'ls /data/__cluster/txn_state 2>/dev/null | wc -l' | tr -d '[:space:]')
-  echo "   /data/__cluster/txn_state exists on $pod (slot files: $slot_count)"
+# Ask the broker where its cluster state lives rather than assuming.
+# gh #221 phase 1 moved it off the data volume onto its own PVC, so
+# `KAAS_CLUSTER_DIR` is `/cluster` on a chart deploy and only falls back
+# to `<data dir>/__cluster` on the classic single-volume layout. A
+# hardcoded path here doesn't fail loudly — it lands in the "not yet
+# populated" branch below and reports a healthy cluster as first-boot.
+cluster_dir=$(kubectl -n "$NAMESPACE" get "$pod" -o jsonpath='{.spec.containers[?(@.name=="broker")].env[?(@.name=="KAAS_CLUSTER_DIR")].value}' 2>/dev/null)
+if [ -z "$cluster_dir" ]; then
+  data_dir=$(kubectl -n "$NAMESPACE" get "$pod" -o jsonpath='{.spec.containers[?(@.name=="broker")].env[?(@.name=="KAAS_DATA_DIR")].value}' 2>/dev/null)
+  cluster_dir="${data_dir:-/data}/__cluster"
+fi
+echo "   cluster-state dir: $cluster_dir"
+
+if kubectl -n "$NAMESPACE" exec "$pod" -c broker -- test -d "$cluster_dir/txn_state" 2>/dev/null; then
+  slot_count=$(kubectl -n "$NAMESPACE" exec "$pod" -c broker -- \
+    sh -c "ls '$cluster_dir/txn_state' 2>/dev/null | wc -l" | tr -d '[:space:]')
+  echo "   $cluster_dir/txn_state exists on $pod (slot files: $slot_count)"
 else
   # First-boot case: the dir is created lazily on the first
   # GetOrAllocate. Empty cluster = empty dir = OK, not a FAIL.
-  echo "   /data/__cluster/txn_state not yet populated (first-boot / no txn producer yet) — OK"
+  echo "   $cluster_dir/txn_state not yet populated (first-boot / no txn producer yet) — OK"
 fi
 
 echo ">> PASS (gh #28 reaper preconditions satisfied)"
