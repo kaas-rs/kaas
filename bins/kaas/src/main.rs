@@ -301,6 +301,7 @@ async fn main() -> Result<()> {
         // the spot (gh #74) rather than on the next periodic tick.
         let topics_apply = topics.clone();
         let topics_delete = topics.clone();
+        let topics_synced = topics.clone();
         // gh #224: per-topic in-flight guard for the migrate-annotation
         // driver so relist echoes don't stack concurrent drivers.
         let migrations_in_flight: Arc<parking_lot::Mutex<std::collections::HashSet<String>>> =
@@ -460,6 +461,11 @@ async fn main() -> Result<()> {
                     });
                     notify_delete.notify(kaas_controller::AssignmentReason::TopicDeleted);
                 },
+                // gh #241: the first completed list makes the
+                // registry's absences meaningful — before it, an
+                // unknown topic means "we haven't looked yet" and the
+                // engine must adopt whatever is on disk.
+                move || topics_synced.mark_synced(),
                 watch_cancel,
             )
             .await

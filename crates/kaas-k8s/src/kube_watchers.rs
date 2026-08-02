@@ -289,6 +289,10 @@ struct TopicWatchState {
     known: std::collections::HashSet<String>,
     /// `Some` between `Event::Init` and `Event::InitDone`.
     relist: Option<std::collections::HashSet<String>>,
+    /// gh #241: set once a full list has completed. Latching — the
+    /// caller is told once and never un-told, because a later
+    /// disconnect doesn't un-know the topics already delivered.
+    synced: bool,
 }
 
 /// One Apply/InitApply event, projected to what the broker needs. A
@@ -312,25 +316,29 @@ pub struct TopicApply<'a> {
 
 /// Stream `KafkaTopic` CR events into the broker's topic-registry
 /// callback. Called with an `on_apply` closure that receives a
-/// [`TopicApply`] on Apply/InitApply and an `on_delete` closure
+/// [`TopicApply`] on Apply/InitApply, an `on_delete` closure
 /// that receives `name` on Delete — and, on relist, for any topic
-/// that vanished while the watch was down.
+/// that vanished while the watch was down — and an `on_synced` closure
+/// fired once, when the first full list completes (gh #241: only then
+/// does a topic's *absence* from the registry mean anything).
 ///
 /// Runs until `cancel` fires. A stream that ends is restarted with
 /// exponential backoff rather than terminating the watch: before
 /// gh #202 this returned `Ok(())` on stream end and the caller never
 /// restarted it, so topic tracking stopped silently and the registry
 /// served deleted topics indefinitely.
-pub async fn run_topic_watch<A, D>(
+pub async fn run_topic_watch<A, D, S>(
     client: Client,
     namespace: String,
     on_apply: A,
     on_delete: D,
+    on_synced: S,
     cancel: CancellationToken,
 ) -> Result<(), KubeWatchError>
 where
     A: Fn(TopicApply<'_>) + Send + Sync + 'static,
     D: Fn(&str) + Send + Sync + 'static,
+    S: Fn() + Send + Sync + 'static,
 {
     let api: Api<kaas_operator_api::KafkaTopic> = Api::namespaced(client, &namespace);
     let mut state = TopicWatchState::default();
@@ -357,7 +365,15 @@ where
                             // connection is healthy — don't carry a
                             // long backoff into the next restart.
                             backoff = TOPIC_WATCH_BACKOFF_MIN;
+                            let was_synced = state.synced;
                             handle_topic_event(&on_apply, &on_delete, e, &mut state);
+                            // gh #241: fire once, on the first completed
+                            // list. From here on, a topic missing from
+                            // the registry means "not delivered yet",
+                            // not "unknown".
+                            if state.synced && !was_synced {
+                                on_synced();
+                            }
                         }
                         Some(Err(err)) => {
                             warn!(%err, "topic watch: error from stream");
@@ -475,6 +491,10 @@ fn handle_topic_event<A, D>(
                 on_delete(stale);
             }
             state.known = relist;
+            // gh #241: only now is the registry's *absence* of a topic
+            // meaningful — before the first completed list it means "we
+            // haven't looked", after it means "not ours (yet)".
+            state.synced = true;
         }
     }
 }
@@ -724,6 +744,44 @@ mod tests {
                 ("t3".to_owned(), None),
             ]
         );
+    }
+
+    /// gh #241: `synced` latches on the first completed list and never
+    /// clears. Until it does, a topic missing from the registry means
+    /// "we haven't looked", which is what lets a broker with an
+    /// unreachable API server keep serving what's on disk.
+    #[test]
+    fn synced_latches_on_the_first_completed_list() {
+        let mut state = TopicWatchState::default();
+        let on_apply = |_: TopicApply<'_>| {};
+        let on_delete = |_: &str| {};
+
+        // A plain Apply, with no list around it, proves nothing.
+        handle_topic_event(
+            &on_apply,
+            &on_delete,
+            Event::Apply(topic("t1", 1)),
+            &mut state,
+        );
+        assert!(!state.synced, "an Apply alone is not a completed list");
+
+        // An InitDone with no Init is a cut-short relist — also not a
+        // completed list (same guard that keeps it from retracting).
+        handle_topic_event(&on_apply, &on_delete, Event::InitDone, &mut state);
+        assert!(!state.synced, "InitDone without Init must not latch");
+
+        for e in [
+            Event::Init,
+            Event::InitApply(topic("t1", 1)),
+            Event::InitDone,
+        ] {
+            handle_topic_event(&on_apply, &on_delete, e, &mut state);
+        }
+        assert!(state.synced);
+
+        // A later stream restart must not un-sync it.
+        handle_topic_event(&on_apply, &on_delete, Event::Init, &mut state);
+        assert!(state.synced, "a fresh relist must not clear synced");
     }
 
     #[test]

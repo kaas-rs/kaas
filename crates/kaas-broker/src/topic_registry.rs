@@ -65,6 +65,12 @@ pub struct TopicRegistry {
     /// in would flip kaas from advertising nil topic IDs to real ones
     /// — that is gh #105's call to make, not this gate's.
     topic_ids: RwLock<HashMap<String, String>>,
+    /// gh #241: has the `KafkaTopic` watch completed at least one full
+    /// list? Until it has, this registry knows nothing and must not be
+    /// used to withhold a partition — that is the difference between
+    /// "the API server is unreachable, serve what's on disk" and "the
+    /// watch is live and simply hasn't reached this topic yet".
+    synced: std::sync::atomic::AtomicBool,
 }
 
 impl Default for TopicRegistry {
@@ -79,6 +85,7 @@ impl TopicRegistry {
             inner: RwLock::new(HashMap::new()),
             volume_assignments: RwLock::new(HashMap::new()),
             topic_ids: RwLock::new(HashMap::new()),
+            synced: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -106,6 +113,7 @@ impl TopicRegistry {
             inner: RwLock::new(map),
             volume_assignments: RwLock::new(HashMap::new()),
             topic_ids: RwLock::new(HashMap::new()),
+            synced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -179,10 +187,34 @@ impl TopicRegistry {
             .insert(topic.to_owned(), id.unwrap_or_default().to_owned());
     }
 
+    /// Record that the `KafkaTopic` watch has completed a full list, so
+    /// the registry's *absences* start carrying meaning (gh #241).
+    /// Latching, never cleared: a later disconnect doesn't un-know the
+    /// topics we already hold.
+    pub fn mark_synced(&self) {
+        self.synced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The incarnation this broker believes `topic` is at (gh #241).
+    ///
+    /// The absent-key case is the subtle one. Before the watch has ever
+    /// listed, absence means "we know nothing" → `Unknown` → the engine
+    /// adopts whatever is on disk, which is what lets a broker serve
+    /// existing topics with the API server unreachable. *After* a
+    /// successful list, absence means "the watch is live and this topic
+    /// hasn't reached us yet" → `Pending` → the engine waits rather than
+    /// opening a directory the operator may be about to reclaim.
+    ///
+    /// That distinction is the whole gate in practice: a broker learns
+    /// it leads a partition from `assignment.json` (1 s poll), which
+    /// routinely beats its own CR watch, so a freshly (re)created topic
+    /// is *always* momentarily absent here.
     pub fn incarnation(&self, topic: &str) -> kaas_storage::TopicIncarnation {
+        let synced = self.synced.load(std::sync::atomic::Ordering::Relaxed);
         match self.topic_ids.read().get(topic) {
-            None => kaas_storage::TopicIncarnation::Unknown,
+            None if !synced => kaas_storage::TopicIncarnation::Unknown,
+            None => kaas_storage::TopicIncarnation::Pending,
             Some(id) if id.is_empty() => kaas_storage::TopicIncarnation::Pending,
             Some(id) => kaas_storage::TopicIncarnation::Known(id.clone()),
         }
@@ -258,15 +290,39 @@ mod tests {
         r.set_topic_id("t", None);
         assert_eq!(r.incarnation("t"), kaas_storage::TopicIncarnation::Pending);
 
+        // Once the watch has listed, an *absent* topic flips from
+        // Unknown to Pending: the watch is live, so absence means "not
+        // delivered yet", and a broker learns it leads a partition from
+        // assignment.json before its own watch catches up.
+        r.mark_synced();
+        assert_eq!(
+            r.incarnation("never-seen"),
+            kaas_storage::TopicIncarnation::Pending
+        );
+
         r.set_topic_id("t", Some("uuid-1"));
         assert_eq!(
             r.incarnation("t"),
             kaas_storage::TopicIncarnation::Known("uuid-1".into())
         );
 
-        // A delete drops the knowledge entirely, back to Unknown.
+        // A delete drops the id. Post-sync that reads as Pending, not
+        // Unknown — and refusing to open a deleted topic's directory is
+        // exactly right; the assignment drops it in the same beat.
         r.remove("t");
-        assert_eq!(r.incarnation("t"), kaas_storage::TopicIncarnation::Unknown);
+        assert_eq!(r.incarnation("t"), kaas_storage::TopicIncarnation::Pending);
+    }
+
+    /// Before the first list, absence must stay Unknown — this is the
+    /// arm that keeps a broker serving on-disk topics when the API
+    /// server is unreachable.
+    #[test]
+    fn unsynced_registry_reports_everything_unknown() {
+        let r = TopicRegistry::new();
+        assert_eq!(
+            r.incarnation("anything"),
+            kaas_storage::TopicIncarnation::Unknown
+        );
     }
 
     #[test]
