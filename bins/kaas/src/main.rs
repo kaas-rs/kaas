@@ -306,6 +306,7 @@ async fn main() -> Result<()> {
         let migrations_in_flight: Arc<parking_lot::Mutex<std::collections::HashSet<String>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let broker_migrate = broker.clone();
+        let broker_delete = broker.clone();
         let engine_delete = engine.clone();
         let notify_apply = topic_notify.clone();
         let notify_delete = topic_notify.clone();
@@ -406,11 +407,43 @@ async fn main() -> Result<()> {
                     // assignment recompute + watch (~1 s), so the drop
                     // lands first with a wide margin.
                     let engine = engine_delete.clone();
+                    let broker_purge = broker_delete.clone();
                     let topic = name.to_string();
                     tokio::spawn(async move {
                         let dropped = engine.abandon_topic(&topic).await;
                         if dropped > 0 {
                             info!(topic, dropped, "topic deleted; dropped open partitions");
+                        }
+                        // gh #240: a deleted topic's committed group
+                        // offsets must go with it, the way Apache
+                        // tombstones them out of `__consumer_offsets`.
+                        // Left behind, a delete→recreate under the same
+                        // name (Streams' `application-reset` every run)
+                        // hands the new incarnation the dead one's
+                        // offsets; if the new log is shorter, the group
+                        // resumes past its end and idles forever with no
+                        // error on either side. The Manager is absent in
+                        // dev mode and for the brief window before the
+                        // cluster runtime installs it — no coordinated
+                        // groups exist then either.
+                        if let Some(mgr) = broker_purge.coord_manager() {
+                            let (purged, failed) = mgr.purge_topic_offsets(&topic);
+                            if purged > 0 {
+                                info!(
+                                    topic,
+                                    purged, "topic deleted; purged committed group offsets"
+                                );
+                            }
+                            if !failed.is_empty() {
+                                // Best-effort: the stale entries only
+                                // bite a group that resumes on a
+                                // recreated topic of the same name.
+                                warn!(
+                                    topic,
+                                    groups = failed.join(","),
+                                    "topic deleted; could not purge offsets for some groups"
+                                );
+                            }
                         }
                     });
                     notify_delete.notify(kaas_controller::AssignmentReason::TopicDeleted);

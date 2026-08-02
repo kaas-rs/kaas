@@ -9,11 +9,14 @@
 //! adoption shim for the pre-fix layout was dropped under the pre-v1
 //! no-backcompat policy: upgrading across gh #223 is a fresh deploy.
 //!
-//! Wire-readable JSON shape pinned across releases: a v0.1-written
-//! file decodes here unchanged, and vice-versa. Two on-disk schemas survive: the gh #21 v2 envelope
-//! `{"offsets":{...}, "metadata":{...}}` and the legacy v1 plain
-//! `map[string]int64`. Read paths accept both; new writes always
-//! emit v2.
+//! One on-disk schema: the gh #21 v2 envelope
+//! `{"offsets":{...}, "metadata":{...}}`. The legacy v1 plain
+//! `map[string]int64` fallback was dropped under the pre-v1
+//! no-backcompat policy, so **every writer must go through
+//! `write_group`** — serde ignores unknown fields, which means a
+//! stray v1-shaped write decodes back as an empty group instead of
+//! failing, silently losing every offset in it (that was
+//! `delete_partitions` until gh #240).
 //!
 //! Three layers of state:
 //!
@@ -54,8 +57,22 @@ pub fn offset_key(topic: &str, partition: i32) -> String {
     format!("{topic}/{partition}")
 }
 
-/// gh #21 v2 envelope. Older v1 files store a plain
-/// `HashMap<String, i64>`; the decoder falls back on parse failure.
+/// Does the offset key `"<topic>/<partition>"` belong to `topic`?
+/// Split from the RIGHT — a topic name may itself contain `/` (the
+/// SIGTERM drain parses partition keys the same way), the partition
+/// suffix never does. The digit check keeps a topic literally named
+/// `foo/bar` from matching a purge of `foo`.
+fn key_has_topic(key: &str, topic: &str) -> bool {
+    match key.rsplit_once('/') {
+        Some((t, p)) => t == topic && p.parse::<i32>().is_ok(),
+        None => false,
+    }
+}
+
+/// gh #21 v2 envelope — the only shape written or read. Note the
+/// serde default: an unrecognised payload (e.g. the old v1 plain map)
+/// decodes as an empty envelope rather than erroring, which is why
+/// nothing may write any other shape.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct OffsetFileV2 {
     #[serde(default)]
@@ -195,10 +212,21 @@ impl OffsetStore {
             (off, meta)
         };
 
-        let payload = OffsetFileV2 {
-            offsets: merged_offsets,
-            metadata: merged_meta,
-        };
+        self.write_group(group_id, merged_offsets, merged_meta)
+    }
+
+    /// The single on-disk write path. Every writer goes through here so
+    /// the file is always the v2 envelope: `decode_offsets_file` accepts
+    /// v2 *only*, and serde ignores unknown fields, so a plain-map write
+    /// decodes back as an EMPTY group rather than failing loudly —
+    /// silent offset loss on the next coordinator load.
+    fn write_group(
+        &self,
+        group_id: &str,
+        offsets: HashMap<String, i64>,
+        metadata: HashMap<String, String>,
+    ) -> io::Result<()> {
+        let payload = OffsetFileV2 { offsets, metadata };
         let name = format!("{group_id}.json");
         atomic_write_json(&self.dir(), &name, &payload)
     }
@@ -273,7 +301,7 @@ impl OffsetStore {
         keys: &[String],
     ) -> io::Result<HashMap<String, bool>> {
         let mut removed = HashMap::new();
-        let snap_offsets = {
+        let (snap_offsets, snap_meta) = {
             let mut s = self.state.write();
             let group = match s.cache.get_mut(group_id) {
                 None => return Ok(removed),
@@ -284,15 +312,115 @@ impl OffsetStore {
                     removed.insert(k.clone(), true);
                 }
             }
-            group.clone()
+            let offsets = group.clone();
+            // The metadata map mirrors the offset map; a key dropped
+            // from one must go from the other or the next commit
+            // rewrites orphan metadata for an offset that no longer
+            // exists.
+            if let Some(m) = s.metadata.get_mut(group_id) {
+                for k in removed.keys() {
+                    m.remove(k);
+                }
+            }
+            let meta = s.metadata.get(group_id).cloned().unwrap_or_default();
+            (offsets, meta)
         };
-        // Legacy plain-map shape on disk after a partition-delete keeps
-        // the
-        // forward-compat read path working from either side of the
-        // cutover. New full Commits restamp the v2 envelope.
-        let name = format!("{group_id}.json");
-        atomic_write_json(&self.dir(), &name, &snap_offsets)?;
+        self.write_group(group_id, snap_offsets, snap_meta)?;
         Ok(removed)
+    }
+
+    /// Every group with an offset file on disk, whether or not this
+    /// broker has materialised it in memory. A purge has to reach the
+    /// un-materialised ones too: `load` pulls the file back into the
+    /// cache the first time the group is touched, so anything left in
+    /// the file comes straight back.
+    pub fn group_ids_on_disk(&self) -> Vec<String> {
+        let entries = match std::fs::read_dir(self.dir()) {
+            Ok(rd) => rd,
+            Err(_) => return Vec::new(),
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".json"))
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Drop every committed offset belonging to `topic` from
+    /// `group_id`, returning how many `(topic, partition)` entries went
+    /// (gh #240).
+    ///
+    /// Apache tombstones a topic's offsets out of `__consumer_offsets`
+    /// when the topic is deleted. Without that, a topic deleted and
+    /// recreated under the same name hands the new incarnation the dead
+    /// one's committed offsets — and if the new log is shorter, every
+    /// consumer in the group parks past its end and idles forever, with
+    /// no error raised on either side.
+    pub fn purge_topic(&self, group_id: &str, topic: &str) -> io::Result<usize> {
+        // Cached path. The cache is write-through on every commit, so
+        // for a group this broker coordinates it is the authority.
+        let cached = {
+            let mut s = self.state.write();
+            match s.cache.get_mut(group_id) {
+                None => None,
+                Some(g) => {
+                    let doomed: Vec<String> = g
+                        .keys()
+                        .filter(|k| key_has_topic(k, topic))
+                        .cloned()
+                        .collect();
+                    for k in &doomed {
+                        g.remove(k);
+                    }
+                    let offsets = g.clone();
+                    if let Some(m) = s.metadata.get_mut(group_id) {
+                        for k in &doomed {
+                            m.remove(k);
+                        }
+                    }
+                    let meta = s.metadata.get(group_id).cloned().unwrap_or_default();
+                    Some((doomed.len(), offsets, meta))
+                }
+            }
+        };
+        if let Some((n, offsets, metadata)) = cached {
+            if n == 0 {
+                return Ok(0);
+            }
+            self.write_group(group_id, offsets, metadata)?;
+            return Ok(n);
+        }
+        // Not in memory: rewrite the file in place. Deliberately does
+        // NOT go through `load` — populating the cache here would make
+        // `has_group` / `local_groups` report a group this broker never
+        // materialised, which the heartbeat path feeds to the
+        // controller's assignment loop.
+        let path = self.dir().join(format!("{group_id}.json"));
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let (mut offsets, metadata) = decode_offsets_file(&data)?;
+        let mut metadata = metadata.unwrap_or_default();
+        let doomed: Vec<String> = offsets
+            .keys()
+            .filter(|k| key_has_topic(k, topic))
+            .cloned()
+            .collect();
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        for k in &doomed {
+            offsets.remove(k);
+            metadata.remove(k);
+        }
+        self.write_group(group_id, offsets, metadata)?;
+        Ok(doomed.len())
     }
 
     /// Read a group's offsets from disk into the in-memory cache.
@@ -495,5 +623,168 @@ mod tests {
             }],
         );
         assert_eq!(got.get("t1/0"), Some(&-1));
+    }
+
+    /// `delete_partitions` used to write the surviving offsets as a
+    /// plain map, which is the pre-gh #21 v1 shape. `decode_offsets_file`
+    /// takes v2 only and serde ignores unknown fields, so the reload
+    /// didn't fail — it silently produced an EMPTY group, dropping every
+    /// surviving offset the moment a coordinator loaded it.
+    #[test]
+    fn delete_partitions_survives_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let mut both = HashMap::new();
+        both.insert(offset_key("t1", 0), 10);
+        both.insert(offset_key("t1", 1), 20);
+        s.commit("g1", both).unwrap();
+        s.delete_partitions("g1", &[offset_key("t1", 0)]).unwrap();
+
+        let fresh = store(tmp.path());
+        fresh.load("g1").unwrap();
+        let got = fresh.fetch(
+            "g1",
+            &[FetchSpec {
+                topic: "t1".to_owned(),
+                partitions: vec![0, 1],
+            }],
+        );
+        assert_eq!(got.get("t1/0"), Some(&-1), "deleted key came back");
+        assert_eq!(got.get("t1/1"), Some(&20), "surviving offset was lost");
+    }
+
+    // --- gh #240 purge-on-topic-delete --------------------------------
+
+    #[test]
+    fn purge_topic_drops_only_that_topic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let mut m = HashMap::new();
+        m.insert(offset_key("gone", 0), 10);
+        m.insert(offset_key("gone", 1), 11);
+        m.insert(offset_key("stays", 0), 20);
+        s.commit("g1", m).unwrap();
+
+        assert_eq!(s.purge_topic("g1", "gone").unwrap(), 2);
+
+        let fresh = store(tmp.path());
+        fresh.load("g1").unwrap();
+        let got = fresh.fetch(
+            "g1",
+            &[
+                FetchSpec {
+                    topic: "gone".to_owned(),
+                    partitions: vec![0, 1],
+                },
+                FetchSpec {
+                    topic: "stays".to_owned(),
+                    partitions: vec![0],
+                },
+            ],
+        );
+        assert_eq!(got.get("gone/0"), Some(&-1));
+        assert_eq!(got.get("gone/1"), Some(&-1));
+        assert_eq!(got.get("stays/0"), Some(&20));
+    }
+
+    /// The failure this whole fix exists for: the group has a file but
+    /// this broker has never materialised it, so an in-memory-only purge
+    /// misses it and `load` brings the stale offsets straight back.
+    #[test]
+    fn purge_topic_reaches_a_group_never_materialised_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        store(tmp.path())
+            .commit("g1", one("gone", 0, 51_607))
+            .unwrap();
+
+        let fresh = store(tmp.path());
+        assert!(!fresh.has_group("g1"), "precondition: cold cache");
+        assert_eq!(fresh.group_ids_on_disk(), vec!["g1".to_owned()]);
+        assert_eq!(fresh.purge_topic("g1", "gone").unwrap(), 1);
+        assert!(
+            !fresh.has_group("g1"),
+            "purge must not materialise the group — local_groups() feeds the controller"
+        );
+
+        let after = store(tmp.path());
+        after.load("g1").unwrap();
+        let got = after.fetch(
+            "g1",
+            &[FetchSpec {
+                topic: "gone".to_owned(),
+                partitions: vec![0],
+            }],
+        );
+        assert_eq!(got.get("gone/0"), Some(&-1));
+    }
+
+    #[test]
+    fn purge_topic_drops_the_metadata_with_the_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let mut meta = HashMap::new();
+        meta.insert(offset_key("gone", 0), "leader-epoch-3".to_owned());
+        s.commit_with_metadata("g1", one("gone", 0, 10), meta)
+            .unwrap();
+        s.purge_topic("g1", "gone").unwrap();
+
+        let fresh = store(tmp.path());
+        fresh.load("g1").unwrap();
+        assert!(fresh
+            .fetch_metadata(
+                "g1",
+                &[FetchSpec {
+                    topic: "gone".to_owned(),
+                    partitions: vec![0],
+                }]
+            )
+            .is_empty());
+    }
+
+    /// Keys split from the right, so a purge of `a` must not eat the
+    /// offsets of a topic literally named `a/b`.
+    #[test]
+    fn purge_topic_splits_the_key_from_the_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let mut m = HashMap::new();
+        m.insert(offset_key("a/b", 0), 10);
+        m.insert(offset_key("a", 0), 20);
+        s.commit("g1", m).unwrap();
+
+        assert_eq!(s.purge_topic("g1", "a").unwrap(), 1);
+        let got = s.fetch(
+            "g1",
+            &[
+                FetchSpec {
+                    topic: "a/b".to_owned(),
+                    partitions: vec![0],
+                },
+                FetchSpec {
+                    topic: "a".to_owned(),
+                    partitions: vec![0],
+                },
+            ],
+        );
+        assert_eq!(got.get("a/b/0"), Some(&10), "sibling topic was eaten");
+        assert_eq!(got.get("a/0"), Some(&-1));
+    }
+
+    #[test]
+    fn purge_topic_is_a_noop_for_unknown_group_or_topic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.commit("g1", one("t1", 0, 10)).unwrap();
+        assert_eq!(s.purge_topic("nosuchgroup", "t1").unwrap(), 0);
+        assert_eq!(s.purge_topic("g1", "nosuchtopic").unwrap(), 0);
+        // Idempotent: re-driven by the relist retraction path.
+        assert_eq!(s.purge_topic("g1", "t1").unwrap(), 1);
+        assert_eq!(s.purge_topic("g1", "t1").unwrap(), 0);
+    }
+
+    #[test]
+    fn group_ids_on_disk_is_empty_without_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(store(tmp.path()).group_ids_on_disk().is_empty());
     }
 }

@@ -444,6 +444,42 @@ impl Manager {
         }
     }
 
+    /// Drop every committed offset for `topic` from the groups this
+    /// broker coordinates (gh #240). Returns the number of
+    /// `(topic, partition)` entries removed, and the group IDs whose
+    /// files could not be rewritten.
+    ///
+    /// Two things this deliberately does:
+    ///
+    /// - **Filters by coordinator ownership.** A topic-delete event
+    ///   lands on *every* broker's topic watch, so an unfiltered purge
+    ///   would have N brokers read-modify-writing the same group file
+    ///   on the shared volume. A group's file has exactly one writer:
+    ///   its coordinator (NFS substrate rule 3).
+    /// - **Unions in the on-disk groups.** `self.groups` holds only the
+    ///   groups this broker has materialised; a coordinated group that
+    ///   nobody has touched yet still has a file, and `load` would
+    ///   bring its stale entries straight back.
+    pub fn purge_topic_offsets(&self, topic: &str) -> (usize, Vec<String>) {
+        let mut ids = self.offsets.group_ids_on_disk();
+        ids.extend(self.groups.iter().map(|kv| kv.key().clone()));
+        ids.sort();
+        ids.dedup();
+
+        let mut removed = 0;
+        let mut failed = Vec::new();
+        for gid in ids {
+            if !self.is_coordinator(&gid) {
+                continue;
+            }
+            match self.offsets.purge_topic(&gid, topic) {
+                Ok(n) => removed += n,
+                Err(_) => failed.push(gid),
+            }
+        }
+        (removed, failed)
+    }
+
     /// Snapshot every group this broker coordinates. Used by
     /// `ListGroups` (key 16) — handler filters by `states_filter`
     /// after.
@@ -599,6 +635,50 @@ mod tests {
         let r = m.find_coordinator("tx1", 1);
         assert_eq!(r.error_code, 0);
         assert_eq!(r.host, "kaas-0.example.com");
+    }
+
+    /// gh #240: the topic-delete event lands on every broker, so the
+    /// purge must touch only the groups this broker coordinates —
+    /// otherwise N brokers read-modify-write the same file on the
+    /// shared volume.
+    #[test]
+    fn purge_topic_offsets_skips_groups_this_broker_does_not_coordinate() {
+        struct OwnsOnlyMine;
+        impl GroupAssignmentSource for OwnsOnlyMine {
+            fn owns_group(&self, group_id: &str) -> bool {
+                group_id == "mine"
+            }
+            fn group_coordinator(&self, _group_id: &str) -> Option<BrokerId> {
+                Some("kaas-0".to_owned())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        // Both groups have a file; neither is materialised in memory.
+        for g in ["mine", "theirs"] {
+            let mut o = HashMap::new();
+            o.insert(offset_key("gone", 0), 51_607);
+            o.insert(offset_key("stays", 0), 7);
+            m.offsets.commit(g, o).unwrap();
+        }
+        m.set_group_assignment_source(Arc::new(OwnsOnlyMine));
+
+        let (removed, failed) = m.purge_topic_offsets("gone");
+        assert_eq!(removed, 1, "purged {removed} entries");
+        assert!(failed.is_empty());
+
+        let fresh = OffsetStore::new(tmp.path());
+        for (g, want) in [("mine", -1), ("theirs", 51_607)] {
+            fresh.load(g).unwrap();
+            let got = fresh.fetch(
+                g,
+                &[FetchSpec {
+                    topic: "gone".to_owned(),
+                    partitions: vec![0],
+                }],
+            );
+            assert_eq!(got.get("gone/0"), Some(&want), "group {g}");
+        }
     }
 
     #[test]
