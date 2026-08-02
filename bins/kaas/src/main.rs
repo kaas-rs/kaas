@@ -316,7 +316,14 @@ async fn main() -> Result<()> {
             if let Err(err) = kaas_k8s::kube_watchers::run_topic_watch(
                 client,
                 watch_ns,
-                move |name, partitions, volumes, migrate_to| {
+                move |ev| {
+                    let kaas_k8s::kube_watchers::TopicApply {
+                        name,
+                        partitions,
+                        volume_assignments: volumes,
+                        migrate_to,
+                        topic_id,
+                    } = ev;
                     let prev = topics_apply
                         .all()
                         .into_iter()
@@ -331,6 +338,11 @@ async fn main() -> Result<()> {
                     // placement — the engine resolves partition roots
                     // through the registry.
                     topics_apply.set_volume_assignments(name, volumes.clone());
+                    // gh #241: and the incarnation, so the engine can
+                    // refuse to open a directory the operator has yet
+                    // to reclaim. Recorded even when absent — "CR seen,
+                    // unstamped" is the state that must block.
+                    topics_apply.set_topic_id(name, topic_id);
                     // gh #224: `kaas.rs/migrate-to-volume` annotation —
                     // drive this topic's partitions onto the target log
                     // dir, one at a time, through the same path the
@@ -768,7 +780,10 @@ fn build_engine(
             }
             let engine =
                 DiskStorageEngine::new(Arc::new(RealFs), dir, cfg).with_extra_log_dirs(log_dirs);
-            engine.set_placement_resolver(placement);
+            engine.set_placement_resolver(placement.clone());
+            // gh #241: same registry, second role — the incarnation
+            // source for the identity gate on partition open.
+            engine.set_identity_resolver(placement);
             Ok(Arc::new(engine))
         }
         None => Ok(Arc::new(MemoryStorage::new())),

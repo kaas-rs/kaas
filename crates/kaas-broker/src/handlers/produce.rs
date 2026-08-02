@@ -250,6 +250,11 @@ fn map_error(topic: &str, index: i32, err: &StorageError) -> produce::PartitionR
         // Mid-migration (gh #221 phase 3): retriable; the client
         // refreshes metadata and retries after the cutover.
         StorageError::Migrating => ERR_LEADER_NOT_AVAILABLE,
+        // gh #241: the topic dir is still the previous incarnation's
+        // and the operator has not reclaimed it. Same retriable shape —
+        // far better than accepting the write into a directory that is
+        // about to be renamed out from under us.
+        StorageError::StaleTopicDir => ERR_LEADER_NOT_AVAILABLE,
         _ => ERR_GENERIC,
     };
     error_partition_bumped(topic, index, code)

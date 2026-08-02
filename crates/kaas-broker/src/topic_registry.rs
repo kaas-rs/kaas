@@ -55,6 +55,16 @@ pub struct TopicRegistry {
     /// construction sites. Keys are strings because the CR status
     /// map is JSON.
     volume_assignments: RwLock<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// gh #241: topic → `KafkaTopic.status.topicId`, stashed by the
+    /// topic watch. A **present key with an empty value** means "CR
+    /// seen, not stamped yet" and is load-bearing — the engine's
+    /// identity gate treats that differently from an absent key (no CR
+    /// knowledge at all). Side map for the same reason as
+    /// `volume_assignments`, plus one of its own: `TopicMeta.topic_id`
+    /// is what the Metadata handler serves on the wire, and filling it
+    /// in would flip kaas from advertising nil topic IDs to real ones
+    /// — that is gh #105's call to make, not this gate's.
+    topic_ids: RwLock<HashMap<String, String>>,
 }
 
 impl Default for TopicRegistry {
@@ -68,6 +78,7 @@ impl TopicRegistry {
         Self {
             inner: RwLock::new(HashMap::new()),
             volume_assignments: RwLock::new(HashMap::new()),
+            topic_ids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -94,6 +105,7 @@ impl TopicRegistry {
         Ok(Self {
             inner: RwLock::new(map),
             volume_assignments: RwLock::new(HashMap::new()),
+            topic_ids: RwLock::new(HashMap::new()),
         })
     }
 
@@ -115,6 +127,7 @@ impl TopicRegistry {
     pub fn remove(&self, name: &str) {
         self.inner.write().remove(name);
         self.volume_assignments.write().remove(name);
+        self.topic_ids.write().remove(name);
     }
 
     /// Replace the stashed partition→log-dir placement for `topic`
@@ -155,6 +168,26 @@ impl TopicRegistry {
             .cloned()
     }
 
+    /// Stash `KafkaTopic.status.topicId` for `topic` (gh #241). The
+    /// topic watch calls this on every CR apply, passing `None` while
+    /// the operator has yet to stamp the status — which is recorded as
+    /// an empty string, NOT as an absent key: "CR seen, unstamped" and
+    /// "never heard of it" mean opposite things to the identity gate.
+    pub fn set_topic_id(&self, topic: &str, id: Option<&str>) {
+        self.topic_ids
+            .write()
+            .insert(topic.to_owned(), id.unwrap_or_default().to_owned());
+    }
+
+    /// The incarnation this broker believes `topic` is at (gh #241).
+    pub fn incarnation(&self, topic: &str) -> kaas_storage::TopicIncarnation {
+        match self.topic_ids.read().get(topic) {
+            None => kaas_storage::TopicIncarnation::Unknown,
+            Some(id) if id.is_empty() => kaas_storage::TopicIncarnation::Pending,
+            Some(id) => kaas_storage::TopicIncarnation::Known(id.clone()),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
@@ -170,6 +203,16 @@ impl TopicRegistry {
 impl kaas_storage::PlacementResolver for TopicRegistry {
     fn log_dir_of(&self, topic: &str, partition: i32) -> Option<String> {
         self.volume_assignment(topic, partition)
+    }
+}
+
+/// gh #241: and the registry is also the incarnation source — the same
+/// watch that feeds placement feeds `status.topicId`, which is what
+/// lets the engine tell a directory the operator has reclaimed for
+/// *this* incarnation from one it has not touched yet.
+impl kaas_storage::TopicIdentityResolver for TopicRegistry {
+    fn incarnation_of(&self, topic: &str) -> kaas_storage::TopicIncarnation {
+        self.incarnation(topic)
     }
 }
 
@@ -199,6 +242,31 @@ mod tests {
     fn zero_partitions_rejected() {
         let err = TopicRegistry::from_env_json(r#"[{"name":"x","partitions":0}]"#).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidPartitions(_)));
+    }
+
+    /// gh #241: the three-valued incarnation. `Unknown` and `Pending`
+    /// look alike from the outside and mean opposite things — the first
+    /// adopts whatever is on disk, the second waits for the operator.
+    #[test]
+    fn incarnation_distinguishes_unknown_from_unstamped() {
+        let r = TopicRegistry::new();
+        assert_eq!(
+            r.incarnation("never-seen"),
+            kaas_storage::TopicIncarnation::Unknown
+        );
+
+        r.set_topic_id("t", None);
+        assert_eq!(r.incarnation("t"), kaas_storage::TopicIncarnation::Pending);
+
+        r.set_topic_id("t", Some("uuid-1"));
+        assert_eq!(
+            r.incarnation("t"),
+            kaas_storage::TopicIncarnation::Known("uuid-1".into())
+        );
+
+        // A delete drops the knowledge entirely, back to Unknown.
+        r.remove("t");
+        assert_eq!(r.incarnation("t"), kaas_storage::TopicIncarnation::Unknown);
     }
 
     #[test]

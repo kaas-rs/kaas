@@ -18,7 +18,9 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use crate::engine::{LogDirInfo, PlacementResolver, StorageEngine};
+use crate::engine::{
+    LogDirInfo, PlacementResolver, StorageEngine, TopicIdentityResolver, TopicIncarnation,
+};
 use crate::errors::StorageError;
 use crate::fs::Fs;
 use crate::partition::{Partition, PartitionConfig};
@@ -36,6 +38,11 @@ pub struct DiskStorageEngine {
     /// the resolver can never make a partition unopenable — worst
     /// case it lands in the legacy location.
     placement: RwLock<Option<Arc<dyn PlacementResolver>>>,
+    /// Resolves a topic name → the incarnation it should be at
+    /// (gh #241). `None` (no resolver installed) means every topic is
+    /// [`TopicIncarnation::Unknown`], i.e. the check is inert — which
+    /// is what dev mode and the unit tests want.
+    identity: RwLock<Option<Arc<dyn TopicIdentityResolver>>>,
     cfg: PartitionConfig,
     partitions: DashMap<(String, i32), Arc<Partition>>,
     /// Partitions mid-move between log dirs (gh #221 phase 3).
@@ -63,6 +70,7 @@ impl DiskStorageEngine {
             data_dir,
             extra_log_dirs: Vec::new(),
             placement: RwLock::new(None),
+            identity: RwLock::new(None),
             cfg,
             partitions: DashMap::new(),
             migrating: DashMap::new(),
@@ -85,6 +93,51 @@ impl DiskStorageEngine {
     /// partition open/create, not per record.
     pub fn set_placement_resolver(&self, r: Arc<dyn PlacementResolver>) {
         *self.placement.write() = Some(r);
+    }
+
+    /// Install the topic-incarnation source (gh #241 — the broker wires
+    /// the KafkaTopic registry here, same as placement). Without one
+    /// the identity gate is inert.
+    pub fn set_identity_resolver(&self, r: Arc<dyn TopicIdentityResolver>) {
+        *self.identity.write() = Some(r);
+    }
+
+    /// gh #241: may this broker open `topic`'s directory yet?
+    ///
+    /// The operator reclaims a recreated topic's directory by renaming
+    /// it aside (`stage_topic_dir`). That frees the live path atomically
+    /// for a broker about to open it (gh #203/#220) but does nothing for
+    /// one that already *has* it open — FDs follow the renamed inode, so
+    /// appends keep landing in the `.deleting-*` copy while the live
+    /// path serves an empty log, silently, until the copy is deleted.
+    /// The cure is to not open it in the first place: a stamped-but-not-
+    /// ours directory is one the operator has yet to reclaim.
+    ///
+    /// The `Unknown` arm is what keeps brokers runtime-independent of
+    /// the operator: no CR knowledge (unreachable API server, env-var
+    /// seeding, dev mode) means adopt, never block. An *unstamped*
+    /// directory is likewise always adopted — matching the operator's
+    /// own rule that unknown identity is never destructive.
+    fn identity_permits_open(&self, topic: &str, topic_dir: &Path) -> Result<(), StorageError> {
+        let expected = match self.identity.read().as_ref() {
+            None => return Ok(()),
+            Some(r) => r.incarnation_of(topic),
+        };
+        if matches!(expected, TopicIncarnation::Unknown) {
+            return Ok(());
+        }
+        // A read error is "unknown", never "stale" — an unreadable stamp
+        // must not wedge a partition.
+        let stamped = match crate::topic_identity::read_topic_identity(self.fs.as_ref(), topic_dir)
+        {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        match (expected, stamped) {
+            (_, None) => Ok(()),
+            (TopicIncarnation::Known(want), Some(have)) if have.topic_id == want => Ok(()),
+            _ => Err(StorageError::StaleTopicDir),
+        }
     }
 
     /// Root directory hosting `(topic, partition)` under the current
@@ -131,6 +184,12 @@ impl DiskStorageEngine {
             return Ok(entry.value().clone());
         }
         let dir = self.partition_dir(topic, partition);
+        // gh #241: refuse before `Partition::open` creates anything —
+        // its prologue mkdir_all's the path, which would re-materialise
+        // a directory the operator is midway through reclaiming.
+        if let Some(topic_dir) = dir.parent() {
+            self.identity_permits_open(topic, topic_dir)?;
+        }
         let p = Arc::new(
             Partition::open(
                 self.fs.clone(),
@@ -917,5 +976,127 @@ mod tests {
                 .unwrap();
             assert_eq!(same, src);
         });
+    }
+
+    // --- gh #241 identity gate ---------------------------------------
+
+    struct FixedIncarnation(TopicIncarnation);
+    impl TopicIdentityResolver for FixedIncarnation {
+        fn incarnation_of(&self, _topic: &str) -> TopicIncarnation {
+            self.0.clone()
+        }
+    }
+
+    fn engine_at(dir: &std::path::Path) -> DiskStorageEngine {
+        DiskStorageEngine::new(
+            Arc::new(RealFs),
+            dir.to_path_buf(),
+            PartitionConfig::default(),
+        )
+    }
+
+    /// Stamp `<root>/<topic>/.topic-id.json` as a previous incarnation
+    /// would have.
+    fn stamp(root: &std::path::Path, topic: &str, id: &str) {
+        let dir = root.join(topic);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::topic_identity::write_topic_identity(&RealFs, &dir, id).unwrap();
+    }
+
+    #[test]
+    fn stale_stamp_refuses_to_open_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        stamp(tmp.path(), "t", "old-incarnation");
+        let e = engine_at(tmp.path());
+        e.set_identity_resolver(Arc::new(FixedIncarnation(TopicIncarnation::Known(
+            "new-incarnation".into(),
+        ))));
+        rt().block_on(async {
+            let err = e.take_over("t", 0, 1).await.unwrap_err();
+            assert!(matches!(err, StorageError::StaleTopicDir), "got {err:?}");
+        });
+        // The refusal must land before `Partition::open`'s mkdir_all, or
+        // it re-materialises a directory the operator is reclaiming.
+        assert!(
+            !tmp.path().join("t").join("0").exists(),
+            "refused open still created the partition dir"
+        );
+    }
+
+    /// The operator stamps the freshly reclaimed dir; the gh #215
+    /// reconcile re-drives take-over and it must now succeed.
+    #[test]
+    fn matching_stamp_opens_after_the_reclaim_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        stamp(tmp.path(), "t", "old-incarnation");
+        let e = engine_at(tmp.path());
+        e.set_identity_resolver(Arc::new(FixedIncarnation(TopicIncarnation::Known(
+            "new-incarnation".into(),
+        ))));
+        rt().block_on(async {
+            assert!(e.take_over("t", 0, 1).await.is_err());
+            stamp(tmp.path(), "t", "new-incarnation");
+            e.take_over("t", 0, 1)
+                .await
+                .expect("re-drive after reclaim");
+        });
+    }
+
+    /// An unstamped dir is always adopted — the operator's own rule.
+    /// Anything else eats every pre-stamp topic on first open.
+    #[test]
+    fn unstamped_dir_is_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("t")).unwrap();
+        let e = engine_at(tmp.path());
+        e.set_identity_resolver(Arc::new(FixedIncarnation(TopicIncarnation::Known(
+            "whatever".into(),
+        ))));
+        rt().block_on(async { e.take_over("t", 0, 1).await.unwrap() });
+    }
+
+    /// No CR knowledge → adopt. This is what keeps brokers serving
+    /// existing topics with the API server unreachable.
+    #[test]
+    fn unknown_incarnation_adopts_even_a_stamped_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        stamp(tmp.path(), "t", "some-other-incarnation");
+        let e = engine_at(tmp.path());
+        e.set_identity_resolver(Arc::new(FixedIncarnation(TopicIncarnation::Unknown)));
+        rt().block_on(async { e.take_over("t", 0, 1).await.unwrap() });
+    }
+
+    /// CR seen but unstamped over a stamped dir = the operator has not
+    /// reclaimed this incarnation yet. This is the actual gh #241
+    /// window: the CR is recreated before its status carries an id.
+    #[test]
+    fn pending_incarnation_over_a_stamped_dir_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        stamp(tmp.path(), "t", "old-incarnation");
+        let e = engine_at(tmp.path());
+        e.set_identity_resolver(Arc::new(FixedIncarnation(TopicIncarnation::Pending)));
+        rt().block_on(async {
+            let err = e.take_over("t", 0, 1).await.unwrap_err();
+            assert!(matches!(err, StorageError::StaleTopicDir), "got {err:?}");
+        });
+    }
+
+    /// A brand-new topic has no directory at all, so a not-yet-stamped
+    /// CR must not block it.
+    #[test]
+    fn pending_incarnation_on_a_fresh_topic_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = engine_at(tmp.path());
+        e.set_identity_resolver(Arc::new(FixedIncarnation(TopicIncarnation::Pending)));
+        rt().block_on(async { e.take_over("t", 0, 1).await.unwrap() });
+    }
+
+    /// No resolver installed (dev mode, unit tests) → inert.
+    #[test]
+    fn without_a_resolver_the_gate_is_inert() {
+        let tmp = tempfile::tempdir().unwrap();
+        stamp(tmp.path(), "t", "old-incarnation");
+        let e = engine_at(tmp.path());
+        rt().block_on(async { e.take_over("t", 0, 1).await.unwrap() });
     }
 }

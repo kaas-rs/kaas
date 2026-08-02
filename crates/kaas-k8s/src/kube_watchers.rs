@@ -291,9 +291,28 @@ struct TopicWatchState {
     relist: Option<std::collections::HashSet<String>>,
 }
 
+/// One Apply/InitApply event, projected to what the broker needs. A
+/// struct rather than positional arguments because the optional
+/// fields are same-typed and silently swappable at the call site.
+#[derive(Debug, Clone, Copy)]
+pub struct TopicApply<'a> {
+    /// The effective Kafka name (`spec.topicName` when set).
+    pub name: &'a str,
+    pub partitions: i32,
+    /// gh #221 phase 2: `status.volumeAssignments`.
+    pub volume_assignments: &'a std::collections::BTreeMap<String, String>,
+    /// gh #224: the `kaas.rs/migrate-to-volume` annotation.
+    pub migrate_to: Option<&'a str>,
+    /// gh #241: `status.topicId`. `None` means the operator has not
+    /// stamped this incarnation yet — distinct from the topic being
+    /// unknown, and the engine's identity gate depends on the
+    /// difference.
+    pub topic_id: Option<&'a str>,
+}
+
 /// Stream `KafkaTopic` CR events into the broker's topic-registry
-/// callback. Called with an `on_apply` closure that receives `(name,
-/// partition_count)` on Apply/InitApply and an `on_delete` closure
+/// callback. Called with an `on_apply` closure that receives a
+/// [`TopicApply`] on Apply/InitApply and an `on_delete` closure
 /// that receives `name` on Delete — and, on relist, for any topic
 /// that vanished while the watch was down.
 ///
@@ -310,10 +329,7 @@ pub async fn run_topic_watch<A, D>(
     cancel: CancellationToken,
 ) -> Result<(), KubeWatchError>
 where
-    A: Fn(&str, i32, &std::collections::BTreeMap<String, String>, Option<&str>)
-        + Send
-        + Sync
-        + 'static,
+    A: Fn(TopicApply<'_>) + Send + Sync + 'static,
     D: Fn(&str) + Send + Sync + 'static,
 {
     let api: Api<kaas_operator_api::KafkaTopic> = Api::namespaced(client, &namespace);
@@ -378,7 +394,7 @@ fn handle_topic_event<A, D>(
     event: Event<kaas_operator_api::KafkaTopic>,
     state: &mut TopicWatchState,
 ) where
-    A: Fn(&str, i32, &std::collections::BTreeMap<String, String>, Option<&str>),
+    A: Fn(TopicApply<'_>),
     D: Fn(&str),
 {
     match event {
@@ -414,7 +430,22 @@ fn handle_topic_event<A, D>(
                 .as_ref()
                 .and_then(|a| a.get(MIGRATE_TO_VOLUME_ANNOTATION))
                 .map(String::as_str);
-            on_apply(&name, t.spec.partitions, volumes, migrate_to);
+            // gh #241: empty status.topicId means "not stamped yet",
+            // which must reach the registry as such — the identity gate
+            // reads it as "the operator has not reconciled this
+            // incarnation", not as "unknown topic".
+            let topic_id = t
+                .status
+                .as_ref()
+                .map(|st| st.topic_id.as_str())
+                .filter(|id| !id.is_empty());
+            on_apply(TopicApply {
+                name: &name,
+                partitions: t.spec.partitions,
+                volume_assignments: volumes,
+                migrate_to,
+                topic_id,
+            });
             state.known.insert(name.clone());
             if let Some(relist) = state.relist.as_mut() {
                 relist.insert(name);
@@ -556,10 +587,7 @@ mod tests {
         let deleted = std::cell::RefCell::new(Vec::new());
         let mut state = TopicWatchState::default();
         {
-            let on_apply = |_: &str,
-                            _: i32,
-                            _: &std::collections::BTreeMap<String, String>,
-                            _: Option<&str>| {};
+            let on_apply = |_: TopicApply<'_>| {};
             let on_delete = |n: &str| deleted.borrow_mut().push(n.to_owned());
             for evt in events {
                 handle_topic_event(&on_apply, &on_delete, evt, &mut state);
@@ -575,10 +603,7 @@ mod tests {
         let mut state = TopicWatchState::default();
         {
             let on_apply =
-                |n: &str,
-                 p: i32,
-                 _: &std::collections::BTreeMap<String, String>,
-                 _: Option<&str>| { applied.borrow_mut().push((n.to_owned(), p)) };
+                |a: TopicApply<'_>| applied.borrow_mut().push((a.name.to_owned(), a.partitions));
             let on_delete = |_: &str| {};
             for evt in events {
                 handle_topic_event(&on_apply, &on_delete, evt, &mut state);
@@ -655,6 +680,50 @@ mod tests {
             Event::InitDone,
         ]);
         assert!(deleted.is_empty(), "got {deleted:?}");
+    }
+
+    /// gh #241: `status.topicId` reaches the callback, and an *unset*
+    /// one arrives as `None` rather than `Some("")`. The registry turns
+    /// that None into "CR seen, unstamped", which is what makes the
+    /// engine wait for the operator's reclaim instead of opening a
+    /// directory it is about to rename aside.
+    #[test]
+    fn apply_carries_the_status_topic_id() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut state = TopicWatchState::default();
+        {
+            let on_apply = |a: TopicApply<'_>| {
+                seen.borrow_mut()
+                    .push((a.name.to_owned(), a.topic_id.map(str::to_owned)));
+            };
+            let on_delete = |_: &str| {};
+
+            let unstamped = topic("t1", 1);
+            let mut stamped = topic("t2", 1);
+            stamped.status = Some(kaas_operator_api::KafkaTopicStatus {
+                topic_id: "uuid-1".to_owned(),
+                ..Default::default()
+            });
+            // An explicitly-empty status id is still "unstamped".
+            let mut empty = topic("t3", 1);
+            empty.status = Some(kaas_operator_api::KafkaTopicStatus::default());
+
+            for evt in [
+                Event::Apply(unstamped),
+                Event::Apply(stamped),
+                Event::Apply(empty),
+            ] {
+                handle_topic_event(&on_apply, &on_delete, evt, &mut state);
+            }
+        }
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                ("t1".to_owned(), None),
+                ("t2".to_owned(), Some("uuid-1".to_owned())),
+                ("t3".to_owned(), None),
+            ]
+        );
     }
 
     #[test]

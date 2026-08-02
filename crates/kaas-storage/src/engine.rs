@@ -110,6 +110,34 @@ pub trait PlacementResolver: Send + Sync {
     fn log_dir_of(&self, topic: &str, partition: i32) -> Option<String>;
 }
 
+/// What the broker knows about the *incarnation* of a topic name
+/// (gh #241). Deliberately three-valued: "we have never heard of this
+/// topic" and "we have heard of it but it has not been stamped yet"
+/// must lead to opposite decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicIncarnation {
+    /// No `KafkaTopic` CR has been seen for this name — env-var seeded,
+    /// dev mode, or an API server we can't reach. Adopt whatever is on
+    /// disk: brokers serve existing topics without the operator, and
+    /// that invariant outranks this check.
+    Unknown,
+    /// A CR is known but carries no `Status.TopicID` yet, i.e. the
+    /// operator has not reconciled *this* incarnation. A directory
+    /// already stamped by a previous one is therefore un-reclaimed.
+    Pending,
+    /// The `Status.TopicID` of the current incarnation.
+    Known(String),
+}
+
+/// Resolves the incarnation a topic name is expected to be at, so the
+/// engine can refuse to open a directory the operator has not yet
+/// reclaimed (gh #241). Backed by the `KafkaTopic` registry in
+/// production; absent (→ [`TopicIncarnation::Unknown`]) everywhere
+/// else.
+pub trait TopicIdentityResolver: Send + Sync {
+    fn incarnation_of(&self, topic: &str) -> TopicIncarnation;
+}
+
 #[async_trait]
 pub trait StorageEngine: Send + Sync + 'static {
     /// Append a raw RecordBatch to `(topic, partition)`. The engine

@@ -51,6 +51,17 @@ pub enum StorageError {
     #[error("partition migrating between log dirs")]
     Migrating,
 
+    /// gh #241: the topic directory on disk still carries a previous
+    /// incarnation's identity stamp, so the operator has not reclaimed
+    /// it yet. Opening it would mean serving the dead incarnation's
+    /// segments *and* holding FDs the reclaim's rename-aside would move
+    /// out from under us — every subsequent append landing in a
+    /// `.deleting-*` copy nobody can read. Retriable: the gh #215
+    /// reconcile re-drives take-over, and clients see the same
+    /// retriable wire error as a log-dir move.
+    #[error("topic dir belongs to a previous incarnation; not reclaimed yet")]
+    StaleTopicDir,
+
     /// The engine doesn't implement this operation (e.g. log-dir
     /// moves on the in-memory dev engine).
     #[error("unsupported: {0}")]

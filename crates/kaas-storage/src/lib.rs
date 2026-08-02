@@ -40,7 +40,7 @@ pub use cleaner::{FixedPolicySource, PolicySource, RetentionCleaner, RetentionPo
 pub use disk::DiskStorageEngine;
 pub use engine::{
     fs_capacity, parse_log_dirs_json, LogDirInfo, PlacementResolver, StorageEngine,
-    DEFAULT_LOG_DIR_NAME,
+    TopicIdentityResolver, TopicIncarnation, DEFAULT_LOG_DIR_NAME,
 };
 pub use errors::StorageError;
 pub use fs::{Fs, RealFs};
