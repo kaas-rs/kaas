@@ -9,19 +9,62 @@
 //! it was constructed with, so a client that bootstrapped on
 //! the authed listener gets back the authed port, not the anonymous
 //! one. Phase 3 single-listener clusters resolve to the single entry.
+//!
+//! ## Topic auto-creation (gh #109, gh #242)
+//!
+//! Apache `auto.create.topics.enable`. An unknown topic named by a
+//! request that set `allowAutoTopicCreation` mints a `KafkaTopic` CR
+//! through the installed [`TopicCRWriter`] and answers
+//! `LEADER_NOT_AVAILABLE` (5) — a retriable code — because the CR
+//! exists but the operator hasn't materialised the partition dirs and
+//! the controller hasn't assigned a leader, so there is no truthful
+//! leader to advertise yet. The client re-requests metadata and gets
+//! the real thing.
+//!
+//! This matters beyond convenience: Kafka Streams' DSL `.to(sink)`
+//! never calls `AdminClient.createTopics` for its sink topic (only for
+//! changelog/repartition topics), so without this path a Streams app
+//! whose output topic doesn't already exist can never make progress.
+//!
+//! Four guards, each with a test: the broker-side switch must be on,
+//! the client must not have opted out (the flag exists in v4+; v0-v3
+//! carry no field and decode to Apache's `true` default, so the broker
+//! switch is the only gate for those), the `__` prefix is reserved, and
+//! the principal needs `Create` on the topic — otherwise Metadata would
+//! be a way around the authorizer that `CreateTopics` enforces.
+//!
+//! A request with an empty topic list can't trip any of this: it's the
+//! "all topics" form, so every name comes from the registry and the
+//! unknown-topic branch is unreachable. Apache carves the same case out
+//! explicitly via `!metadataRequest.isAllTopics`.
+//!
+//! [`TopicCRWriter`]: crate::topic_cr_writer::TopicCRWriter
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::metadata;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
 use crate::broker::Broker;
 use crate::cli::ListenerEntry;
+use crate::topic_cr_writer::TopicWriteError;
 
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
+const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
+
+/// Apache reserves the `__` prefix for internal topics
+/// (`__consumer_offsets`, `__transaction_state`). kaas has no such
+/// topics on disk — the equivalent state lives under `__cluster/`
+/// (see the non-goals in CLAUDE.md) — but a client asking for one
+/// must never mint a CR for it.
+fn is_reserved_internal(name: &str) -> bool {
+    name.starts_with("__")
+}
 
 /// Per-listener advertised endpoint precomputed at handler-build
 /// time. Keyed by the listener `name` stored on each connection.
@@ -36,12 +79,79 @@ struct ListenerAdvert {
 pub struct MetadataHandler {
     broker: Arc<Broker>,
     listeners: Vec<ListenerAdvert>,
+    /// Apache `auto.create.topics.enable` (gh #242). Off unless
+    /// [`with_auto_create`](Self::with_auto_create) says otherwise, so
+    /// tests and dev-mode wiring keep the plain
+    /// `UNKNOWN_TOPIC_OR_PARTITION` behaviour; `bins/kaas` turns it on
+    /// from `Cli`.
+    auto_create: bool,
+    /// Apache `num.partitions` — partition count for an auto-created
+    /// topic. Only read when `auto_create` is set.
+    num_partitions: i32,
 }
 
 impl MetadataHandler {
     pub fn new(broker: Arc<Broker>, listeners: &[ListenerEntry]) -> Self {
         let listeners = listeners.iter().map(advert_from).collect();
-        Self { broker, listeners }
+        Self {
+            broker,
+            listeners,
+            auto_create: false,
+            num_partitions: 1,
+        }
+    }
+
+    /// Enable broker-side topic auto-creation. `num_partitions` is
+    /// clamped to at least 1 — a zero-partition topic is unservable
+    /// and the CR would be rejected downstream anyway.
+    #[must_use]
+    pub fn with_auto_create(mut self, enabled: bool, num_partitions: i32) -> Self {
+        self.auto_create = enabled;
+        self.num_partitions = num_partitions.max(1);
+        self
+    }
+
+    /// Mint a `KafkaTopic` CR for an unknown topic named by a Metadata
+    /// request that opted into auto-creation, and return the error code
+    /// to report for it.
+    ///
+    /// `LEADER_NOT_AVAILABLE` is the success answer, not an error: the
+    /// CR exists but the operator hasn't created the partition dirs and
+    /// the controller hasn't assigned a leader yet, so there is nothing
+    /// truthful to advertise. Java clients treat code 5 as retriable and
+    /// re-request metadata, which is exactly the handshake Apache uses.
+    /// `AlreadyExists` gets the same answer — a concurrent request (or
+    /// an operator-authored CR the watch hasn't delivered yet) won the
+    /// race, which is success for this caller.
+    async fn auto_create_topic(&self, principal: &Principal, name: &str) -> i16 {
+        if is_reserved_internal(name) {
+            return ERR_UNKNOWN_TOPIC_OR_PARTITION;
+        }
+        // Auto-creation is a create, so it takes the same ACL as
+        // CreateTopics — otherwise Metadata would be a way around the
+        // authorizer.
+        if !self
+            .broker
+            .authorizer
+            .authorize(principal, &Resource::topic(name), Operation::Create)
+        {
+            return ERR_TOPIC_AUTHZ_FAILED;
+        }
+        let Some(writer) = self.broker.cr_writer() else {
+            // Dev mode / no kube client: nothing can create the topic,
+            // so the honest answer is that it doesn't exist.
+            return ERR_UNKNOWN_TOPIC_OR_PARTITION;
+        };
+        match writer.create_topic(name, self.num_partitions).await {
+            Ok(()) | Err(TopicWriteError::AlreadyExists(_)) => {
+                tracing::info!(topic = %name, partitions = self.num_partitions, "auto-created topic");
+                ERR_LEADER_NOT_AVAILABLE
+            }
+            Err(e) => {
+                tracing::warn!(topic = %name, error = %e, "topic auto-create failed");
+                ERR_UNKNOWN_TOPIC_OR_PARTITION
+            }
+        }
     }
 
     fn advert_for(&self, listener_name: &str) -> ListenerAdvert {
@@ -113,7 +223,13 @@ impl Handler for MetadataHandler {
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = metadata::decode_request(&mut body, version)?;
-        let listener_name = conn.lock().listener_name.clone();
+        let (listener_name, principal) = {
+            let c = conn.lock();
+            (
+                c.listener_name.clone(),
+                c.principal.clone().unwrap_or_else(Principal::anonymous),
+            )
+        };
         let advert = self.advert_for(&listener_name);
 
         // Cluster mode: advertise the live broker set. Peers run the
@@ -204,14 +320,26 @@ impl Handler for MetadataHandler {
                         topic_authorized_operations: 0,
                     });
                 }
-                None => topics.push(metadata::Topic {
-                    error_code: ERR_UNKNOWN_TOPIC_OR_PARTITION,
-                    name,
-                    topic_id: [0; 16],
-                    is_internal: false,
-                    partitions: Vec::new(),
-                    topic_authorized_operations: 0,
-                }),
+                None => {
+                    // gh #242: only when the broker has the feature on
+                    // AND the client asked for it. A client that didn't
+                    // set the flag (or a v0-v3 request, where the field
+                    // doesn't exist and decodes false) keeps the plain
+                    // UNKNOWN_TOPIC_OR_PARTITION answer.
+                    let error_code = if self.auto_create && req.allow_auto_topic_creation {
+                        self.auto_create_topic(&principal, &name).await
+                    } else {
+                        ERR_UNKNOWN_TOPIC_OR_PARTITION
+                    };
+                    topics.push(metadata::Topic {
+                        error_code,
+                        name,
+                        topic_id: [0; 16],
+                        is_internal: false,
+                        partitions: Vec::new(),
+                        topic_authorized_operations: 0,
+                    });
+                }
             }
         }
 
@@ -234,6 +362,7 @@ impl Handler for MetadataHandler {
 mod tests {
     use super::*;
     use crate::cli::ListenerEntry;
+    use crate::topic_cr_writer::TopicCRWriter;
     use crate::topic_registry::{TopicMeta, TopicRegistry};
     use kaas_codec::api::common::{write_array_len, write_str};
     use kaas_codec::primitives::write_i8;
@@ -282,6 +411,10 @@ mod tests {
     }
 
     fn encode_request_v9(topics: &[&str]) -> Bytes {
+        encode_request_v9_auto(topics, false)
+    }
+
+    fn encode_request_v9_auto(topics: &[&str], allow_auto_create: bool) -> Bytes {
         let flexible = true; // v9 flexible
         let mut w = BytesMut::new();
         write_array_len(&mut w, topics.len(), flexible).unwrap();
@@ -289,11 +422,66 @@ mod tests {
             write_str(&mut w, n, flexible).unwrap();
             tagged::write_empty(&mut w);
         }
-        write_i8(&mut w, 0); // allow_auto_topic_creation (v4+)
+        write_i8(&mut w, i8::from(allow_auto_create)); // allow_auto_topic_creation (v4+)
         write_i8(&mut w, 0); // include_cluster_authorized_operations (v8-10)
         write_i8(&mut w, 0); // include_topic_authorized_operations (v8+)
         tagged::write_empty(&mut w);
         w.freeze()
+    }
+
+    /// Records every `create_topic` call so a test can assert both
+    /// that the CR write happened and what partition count it carried.
+    #[derive(Debug, Default)]
+    struct RecordingWriter {
+        calls: Mutex<Vec<(String, i32)>>,
+        already_exists: bool,
+    }
+
+    impl RecordingWriter {
+        fn calls(&self) -> Vec<(String, i32)> {
+            self.calls.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TopicCRWriter for RecordingWriter {
+        async fn create_topic(&self, name: &str, n: i32) -> Result<(), TopicWriteError> {
+            self.calls.lock().push((name.to_owned(), n));
+            if self.already_exists {
+                return Err(TopicWriteError::AlreadyExists(name.into()));
+            }
+            Ok(())
+        }
+        async fn expand_topic(&self, _: &str, _: i32) -> Result<(), TopicWriteError> {
+            unreachable!("Metadata never expands a topic")
+        }
+        async fn update_topic_config(
+            &self,
+            _: &str,
+            _: &[crate::topic_cr_writer::ConfigOpWithValue],
+        ) -> Result<(), TopicWriteError> {
+            unreachable!("Metadata never edits topic config")
+        }
+        async fn delete_topic(&self, _: &str) -> Result<(), TopicWriteError> {
+            unreachable!("Metadata never deletes a topic")
+        }
+        async fn set_partition_log_dir(
+            &self,
+            _: &str,
+            _: i32,
+            _: &str,
+        ) -> Result<(), TopicWriteError> {
+            unreachable!("Metadata never moves a partition")
+        }
+    }
+
+    /// Drive one v9 Metadata request and return the per-topic error
+    /// code for the single requested topic.
+    async fn error_code_for(h: &MetadataHandler, topic: &str, allow_auto: bool) -> i16 {
+        let body = encode_request_v9_auto(&[topic], allow_auto);
+        let out = h.handle(&conn("internal"), 9, body).await.unwrap();
+        let mut r = out.freeze();
+        metadata::decode_response(&mut r, 9).unwrap().topics[0].error_code
     }
 
     #[tokio::test]
@@ -343,6 +531,142 @@ mod tests {
         let resp = metadata::decode_response(&mut r, 9).unwrap();
         assert_eq!(resp.topics[0].error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
         assert!(resp.topics[0].partitions.is_empty());
+    }
+
+    // --- gh #242: auto.create.topics.enable -----------------------
+
+    #[tokio::test]
+    async fn auto_create_mints_cr_and_answers_leader_not_available() {
+        let broker = broker_with(vec![("events", 1)]);
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 3);
+
+        assert_eq!(
+            error_code_for(&h, "brand-new", true).await,
+            ERR_LEADER_NOT_AVAILABLE
+        );
+        // The CR carries the configured num.partitions, not the
+        // requesting client's guess (Metadata has no such field).
+        assert_eq!(writer.calls(), vec![("brand-new".to_owned(), 3)]);
+    }
+
+    #[tokio::test]
+    async fn auto_create_requires_the_client_to_ask() {
+        let broker = broker_with(vec![("events", 1)]);
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 1);
+
+        // Feature on, but the v4+ client explicitly opted out. An
+        // opt-out must be honoured even with the broker switch on,
+        // or `allow.auto.create.topics=false` on the consumer means
+        // nothing.
+        assert_eq!(
+            error_code_for(&h, "nope", false).await,
+            ERR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+        assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_create_disabled_never_writes() {
+        let broker = broker_with(vec![("events", 1)]);
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners());
+
+        assert_eq!(
+            error_code_for(&h, "nope", true).await,
+            ERR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+        assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_create_refuses_reserved_internal_names() {
+        let broker = broker_with(vec![("events", 1)]);
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 1);
+
+        assert_eq!(
+            error_code_for(&h, "__consumer_offsets", true).await,
+            ERR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+        assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_create_without_a_writer_reports_unknown() {
+        // Dev mode: no kube client, so nothing can mint the CR and
+        // claiming LEADER_NOT_AVAILABLE would loop the client forever.
+        let h = MetadataHandler::new(broker_with(vec![("events", 1)]), &listeners())
+            .with_auto_create(true, 1);
+        assert_eq!(
+            error_code_for(&h, "nope", true).await,
+            ERR_UNKNOWN_TOPIC_OR_PARTITION
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_create_treats_already_exists_as_success() {
+        let broker = broker_with(vec![("events", 1)]);
+        broker.install_cr_writer(Arc::new(RecordingWriter {
+            calls: Mutex::new(Vec::new()),
+            already_exists: true,
+        }));
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 1);
+        // A concurrent creator won the race; the topic exists, so the
+        // caller should retry rather than be told it's unknown.
+        assert_eq!(
+            error_code_for(&h, "raced", true).await,
+            ERR_LEADER_NOT_AVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_create_honours_the_authorizer() {
+        // Auto-creation is a create. If Metadata skipped the ACL check,
+        // an unauthorized client could mint topics through it even
+        // though CreateTopics would refuse.
+        #[derive(Debug)]
+        struct DenyAll;
+        impl kaas_auth::Authorizer for DenyAll {
+            fn authorize(&self, _: &Principal, _: &Resource, _: Operation) -> bool {
+                false
+            }
+        }
+
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let broker = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "kaas-dev",
+            0,
+            Arc::new(DenyAll),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 1);
+
+        assert_eq!(
+            error_code_for(&h, "forbidden-topic", true).await,
+            ERR_TOPIC_AUTHZ_FAILED
+        );
+        assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_create_leaves_known_topics_alone() {
+        let broker = broker_with(vec![("events", 2)]);
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 9);
+
+        assert_eq!(error_code_for(&h, "events", true).await, 0);
+        assert!(writer.calls().is_empty());
     }
 
     #[tokio::test]

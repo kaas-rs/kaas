@@ -193,6 +193,16 @@ pub struct Cli {
     /// Apache `ssl.principal.mapping.rules` (gh #43, KIP-371).
     /// Empty → CN unchanged.
     pub ssl_principal_mapping_rules: String,
+    /// `KAAS_AUTO_CREATE_TOPICS_ENABLE` — Apache
+    /// `auto.create.topics.enable` (gh #109, gh #242). When set, a
+    /// Metadata request that names an unknown topic *and* carries
+    /// `allowAutoTopicCreation` mints a `KafkaTopic` CR and answers
+    /// `LEADER_NOT_AVAILABLE` so the client retries. Defaults to
+    /// Apache's `true`; inert without a CR writer (dev mode).
+    pub auto_create_topics: bool,
+    /// `KAAS_NUM_PARTITIONS` — Apache `num.partitions`, the partition
+    /// count given to an auto-created topic. Apache's default is 1.
+    pub num_partitions: i32,
 }
 
 impl Cli {
@@ -274,6 +284,18 @@ impl Cli {
         let ssl_principal_mapping_rules =
             env::var("KAAS_SSL_PRINCIPAL_MAPPING_RULES").unwrap_or_default();
 
+        // Apache's defaults: auto.create.topics.enable=true,
+        // num.partitions=1. A non-positive or unparseable partition
+        // count degrades to 1 rather than failing boot — the chart
+        // always sets it, so a bad value is an operator typo and a
+        // dead broker is the worse outcome.
+        let auto_create_topics = parse_bool_env("KAAS_AUTO_CREATE_TOPICS_ENABLE").unwrap_or(true);
+        let num_partitions = env::var("KAAS_NUM_PARTITIONS")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1);
+
         Ok(Self {
             listeners,
             data_dir,
@@ -288,6 +310,8 @@ impl Cli {
             authorization_type,
             super_users,
             ssl_principal_mapping_rules,
+            auto_create_topics,
+            num_partitions,
         })
     }
 

@@ -153,10 +153,15 @@ pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecErr
         }
     }
 
+    // The field only exists in v4+. Apache's schema declares
+    // `"default": "true"`, so a v0-v3 request means "auto-create
+    // allowed" — pre-v4 clients had no way to opt out and the broker
+    // config was the only gate. Decoding absent-as-false would make
+    // kaas silently stricter than Apache for those versions.
     let allow_auto_topic_creation = if version >= 4 {
         read_i8(buf)? != 0
     } else {
-        false
+        true
     };
     let include_cluster_authorized_operations = if (8..=10).contains(&version) {
         read_i8(buf)? != 0
@@ -406,7 +411,9 @@ mod tests {
     fn sample_request(version: i16) -> Request {
         Request {
             topics: vec!["events".to_owned(), "audit".to_owned()],
-            allow_auto_topic_creation: version >= 4,
+            // True at every version: v4+ round-trips the written byte,
+            // v0-v3 has no field and decodes to the Apache default.
+            allow_auto_topic_creation: true,
             include_cluster_authorized_operations: (8..=10).contains(&version),
             include_topic_authorized_operations: version >= 8,
         }
@@ -511,6 +518,38 @@ mod tests {
     #[test]
     fn request_v4_auto_create_present() {
         roundtrip_request(4);
+    }
+    #[test]
+    fn request_below_v4_defaults_auto_create_true() {
+        // No field on the wire at v1-v3; Apache's schema default is
+        // true, so the broker's own auto.create.topics.enable is the
+        // only gate for those clients.
+        let w = encode_request(
+            &Request {
+                topics: vec!["events".to_owned()],
+                allow_auto_topic_creation: false,
+                include_cluster_authorized_operations: false,
+                include_topic_authorized_operations: false,
+            },
+            3,
+        );
+        let mut r = w.freeze();
+        assert!(decode_request(&mut r, 3).unwrap().allow_auto_topic_creation);
+    }
+    #[test]
+    fn request_v4_auto_create_false_is_preserved() {
+        // v4+ clients that opt out must stay opted out.
+        let w = encode_request(
+            &Request {
+                topics: vec!["events".to_owned()],
+                allow_auto_topic_creation: false,
+                include_cluster_authorized_operations: false,
+                include_topic_authorized_operations: false,
+            },
+            4,
+        );
+        let mut r = w.freeze();
+        assert!(!decode_request(&mut r, 4).unwrap().allow_auto_topic_creation);
     }
     #[test]
     fn request_v8_authz_flags_present() {

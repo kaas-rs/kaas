@@ -508,7 +508,13 @@ async fn main() -> Result<()> {
     // so the first served request sees the latest disk state.
     let _reload_task = spawn_reloader(auth.creds.clone(), auth.acls.clone());
 
-    let dispatcher = build_dispatcher(broker.clone(), &cli.listeners, auth.engines.clone());
+    let dispatcher = build_dispatcher(
+        broker.clone(),
+        &cli.listeners,
+        auth.engines.clone(),
+        cli.auto_create_topics,
+        cli.num_partitions,
+    );
     let listeners = parse_listeners(&cli.listeners, &auth.engines, &auth.principal_mapper)?;
     let server = Server::new(ServerConfigBuilder::new(listeners), Arc::new(dispatcher));
 
@@ -800,6 +806,8 @@ fn build_dispatcher(
     broker: Arc<Broker>,
     listeners: &[ListenerEntry],
     engines: Arc<PerListenerAuthEngine>,
+    auto_create_topics: bool,
+    num_partitions: i32,
 ) -> Dispatcher {
     let mut d = Dispatcher::new();
     d.register(0, 3, 9, Arc::new(ProduceHandler::new(broker.clone())));
@@ -809,7 +817,10 @@ fn build_dispatcher(
         3,
         1,
         10,
-        Arc::new(MetadataHandler::new(broker.clone(), listeners)),
+        Arc::new(
+            MetadataHandler::new(broker.clone(), listeners)
+                .with_auto_create(auto_create_topics, num_partitions),
+        ),
     );
     // Phase 5 consumer-group surface (keys 8-16, 42, 47).
     d.register(8, 2, 8, Arc::new(OffsetCommitHandler::new(broker.clone())));

@@ -178,12 +178,14 @@ spec:
             # producers first if changing).
             - name: KAAS_TXN_NUM_SLOTS
               value: "{{ .Values.broker.txnState.numSlots }}"
-            # gh #109: auto.create.topics.enable (default true, matches
-            # Apache 3.7). When the broker receives MetadataRequest for
-            # an unknown topic with AllowAutoTopicCreation=true, it
-            # writes a KafkaTopic CR via TopicCRWriter and returns
-            # LEADER_NOT_AVAILABLE so the client retries. Internal
-            # topics (`__` prefix) are reserved.
+            # gh #109 / gh #242: auto.create.topics.enable (default
+            # true, matches Apache 3.7). When the broker receives a
+            # MetadataRequest for an unknown topic with
+            # AllowAutoTopicCreation=true, it writes a KafkaTopic CR via
+            # TopicCRWriter and returns LEADER_NOT_AVAILABLE so the
+            # client retries. Internal topics (`__` prefix) are
+            # reserved, and the principal needs Create on the topic —
+            # the same ACL CreateTopics enforces.
             - name: KAAS_AUTO_CREATE_TOPICS_ENABLE
               value: "{{ .Values.broker.autoCreateTopics.enabled }}"
             - name: KAAS_NUM_PARTITIONS
