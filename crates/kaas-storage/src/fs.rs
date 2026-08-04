@@ -66,6 +66,22 @@ pub trait Fs: Send + Sync + 'static {
 
     fn remove(&self, p: &Path) -> io::Result<()>;
 
+    /// Shrink `p` to exactly `len` bytes. Used by recovery to drop a
+    /// torn tail before the log is appended to again (gh #226).
+    ///
+    /// The default impl reports `Unsupported` so wrapper/fake `Fs`
+    /// implementations don't silently claim to have truncated. Callers
+    /// must treat `Unsupported` as "the bytes are still there" and stay
+    /// correct anyway — recovery does, by appending from the scan's
+    /// valid end regardless.
+    fn truncate(&self, p: &Path, len: u64) -> io::Result<()> {
+        let _ = (p, len);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "truncate not implemented for this Fs",
+        ))
+    }
+
     fn mkdir_all(&self, p: &Path) -> io::Result<()>;
 
     fn readdir(&self, p: &Path) -> io::Result<Vec<PathBuf>>;
@@ -174,6 +190,13 @@ impl Fs for RealFs {
         std::fs::remove_file(p)
     }
 
+    fn truncate(&self, p: &Path, len: u64) -> io::Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)?
+            .set_len(len)
+    }
+
     fn mkdir_all(&self, p: &Path) -> io::Result<()> {
         std::fs::create_dir_all(p)
     }
@@ -266,6 +289,62 @@ mod tests {
         fs.rename(&from, &to).unwrap();
         assert!(!fs.exists(&from));
         assert!(fs.exists(&to));
+    }
+
+    #[test]
+    fn realfs_truncate_shrinks_and_never_grows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let path = tmp.path().join("log");
+        {
+            let mut f = fs.create(&path).unwrap();
+            f.write_all(b"0123456789").unwrap();
+        }
+        fs.truncate(&path, 4).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123");
+        // set_len can extend; recovery never asks it to, and callers
+        // guard on `valid_end < log_size` — but pin the semantics so a
+        // future change to that guard is a visible decision.
+        fs.truncate(&path, 8).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn default_fs_truncate_reports_unsupported() {
+        // Wrapper/fake Fs impls inherit this, so recovery must stay
+        // correct when truncation silently can't happen.
+        struct Bare;
+        impl Fs for Bare {
+            fn open_read(&self, _: &Path) -> io::Result<Box<dyn FileRead>> {
+                unimplemented!()
+            }
+            fn open_write(&self, _: &Path, _: bool) -> io::Result<Box<dyn FileWrite>> {
+                unimplemented!()
+            }
+            fn create(&self, _: &Path) -> io::Result<Box<dyn FileWrite>> {
+                unimplemented!()
+            }
+            fn fsync(&self, _: &mut dyn FileWrite) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn remove(&self, _: &Path) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn mkdir_all(&self, _: &Path) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn readdir(&self, _: &Path) -> io::Result<Vec<PathBuf>> {
+                unimplemented!()
+            }
+            fn stat(&self, _: &Path) -> io::Result<Metadata> {
+                unimplemented!()
+            }
+        }
+        let err = Bare.truncate(Path::new("/x"), 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

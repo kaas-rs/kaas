@@ -175,6 +175,7 @@ mod tests {
         buf[23..27].copy_from_slice(&last_offset_delta.to_be_bytes());
         buf[35..43].copy_from_slice(&max_timestamp.to_be_bytes());
         buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
         Bytes::from(buf)
     }
 

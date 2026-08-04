@@ -19,6 +19,7 @@ dashmap          = { workspace = true }
 parking_lot      = { workspace = true }
 nix              = { workspace = true }
 arc-swap         = { workspace = true }
+crc32c           = { workspace = true }
 kaas-observability = { workspace = true }
 
 [dev-dependencies]

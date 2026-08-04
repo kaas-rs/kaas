@@ -1618,6 +1618,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
+ "crc32c",
  "dashmap",
  "kaas-observability",
  "nix",

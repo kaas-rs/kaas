@@ -260,7 +260,7 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     // The active segment is the last one (highest base_offset);
     // if none exist yet, create at offset 0 with our current
     // epoch.
-    let active = if let Some(last) = closed.pop() {
+    let mut active = if let Some(last) = closed.pop() {
         let mut a = ActiveSegment::open_meta_only(last);
         a.open_handles(fs)?;
         a
@@ -293,10 +293,26 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         }
         _ => (0, active.meta.base_offset),
     };
-    let hwm = {
+    let scan = {
         let mut f = fs.open_read(&active.meta.log_path)?;
         segment::scan_high_watermark_from(&mut f, scan_start, scan_seed)?
     };
+    let hwm = scan.high_watermark;
+
+    // gh #226: the scan stopped at the end of the last *valid* batch,
+    // but `log_size` still says "whatever stat() reported", so appends
+    // would resume past the torn tail — leaving
+    // `[valid][garbage][new valid]`. The next recovery stops at the
+    // garbage again and every record after it is gone, having been
+    // acked and (at flushIntervalMessages=1) fsynced. Worse, the rewound
+    // HWM re-issues offsets that were already handed out.
+    //
+    // Drop the tail before any write handle is used. Doing it here — in
+    // open, before the partition is reachable — is what makes it safe:
+    // no appender exists yet, so there is nothing to race.
+    if scan.stop != segment::ScanStop::Eof {
+        active.truncate_to(fs, scan.valid_end)?;
+    }
 
     // Restore the idempotence window.
     let producer_states = read_producer_snapshot(fs, dir)
@@ -1579,6 +1595,7 @@ mod tests {
         buf[35..43].copy_from_slice(&max_timestamp.to_be_bytes());
         // Producer ID = -1 (non-idempotent) so no classifier path.
         buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
         Bytes::from(buf)
     }
 
@@ -1600,6 +1617,7 @@ mod tests {
         buf[43..51].copy_from_slice(&pid.to_be_bytes());
         // baseSequence at [53..57] stays 0 = first batch of a fresh
         // PID per the idempotence classifier.
+        crate::segment::stamp_crc(&mut buf);
         Bytes::from(buf)
     }
 
@@ -1620,6 +1638,7 @@ mod tests {
         buf[53..57].copy_from_slice(&(-1i32).to_be_bytes());
         // key type at byte 69: 0=ABORT, 1=COMMIT
         buf[69] = if commit { 1 } else { 0 };
+        crate::segment::stamp_crc(&mut buf);
         Bytes::from(buf)
     }
 
@@ -1641,6 +1660,119 @@ mod tests {
             assert_eq!(p.last_stable_offset(), p.high_watermark());
             assert!(p.aborted_in_range(0, i64::MAX).is_empty());
             p.close().await.unwrap();
+        });
+    }
+
+    // --- gh #226 / gh #228: torn-tail recovery ---------------------------
+
+    /// Append `extra` bytes of garbage to the partition's active log,
+    /// mimicking a crash that left a partial batch (or a fenced writer's
+    /// interleaved bytes) at the end of the file.
+    fn append_garbage(dir: &std::path::Path, extra: usize) -> (std::path::PathBuf, u64) {
+        let fs = RealFs::new();
+        let meta = crate::segment::list_segments(&fs, dir)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let before = std::fs::metadata(&meta.log_path).unwrap().len();
+        let mut bytes = std::fs::read(&meta.log_path).unwrap();
+        bytes.extend(std::iter::repeat_n(0xABu8, extra));
+        std::fs::write(&meta.log_path, &bytes).unwrap();
+        (meta.log_path, before)
+    }
+
+    /// The core gh #226 defect: records written *after* a torn tail were
+    /// acked (and at flushIntervalMessages=1 fsynced) and then silently
+    /// vanished on the next recovery, with their offsets re-issued.
+    ///
+    /// Pre-fix this test fails at the final assertion: the reopen resumed
+    /// appends at the file's stat length, so the log became
+    /// `[valid][garbage][new]` and the *next* scan stopped at the garbage.
+    #[test]
+    fn records_appended_after_a_torn_tail_survive_the_next_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let open = || {
+                Partition::open(
+                    fs.clone(),
+                    "t".into(),
+                    0,
+                    tmp.path().to_path_buf(),
+                    PartitionConfig::default(),
+                )
+            };
+
+            let p = open().await.unwrap();
+            p.append(0, -1, build_batch(3, 1_000)).await.unwrap();
+            assert_eq!(p.high_watermark(), 3);
+            p.close().await.unwrap();
+
+            let (log_path, clean_len) = append_garbage(tmp.path(), 40);
+
+            // Recovery drops the garbage instead of appending past it.
+            let p = open().await.unwrap();
+            assert_eq!(p.high_watermark(), 3, "valid batches must survive");
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().len(),
+                clean_len,
+                "torn tail must be truncated away"
+            );
+
+            // Write a record on top of the repaired log and make it durable.
+            p.append(0, -1, build_batch(1, 2_000)).await.unwrap();
+            assert_eq!(p.high_watermark(), 4);
+            p.close().await.unwrap();
+
+            let p = open().await.unwrap();
+            assert_eq!(
+                p.high_watermark(),
+                4,
+                "the record appended after repair must not be lost"
+            );
+        });
+    }
+
+    /// A clean log must never be touched — truncation is only ever
+    /// allowed to remove bytes the scan proved unparseable.
+    #[test]
+    fn clean_log_is_not_truncated_on_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
+            p.close().await.unwrap();
+
+            let meta = crate::segment::list_segments(&RealFs::new(), tmp.path())
+                .unwrap()
+                .pop()
+                .unwrap();
+            let len_before = std::fs::metadata(&meta.log_path).unwrap().len();
+
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(p.high_watermark(), 2);
+            assert_eq!(
+                std::fs::metadata(&meta.log_path).unwrap().len(),
+                len_before,
+                "a clean log must survive reopen byte-for-byte"
+            );
         });
     }
 

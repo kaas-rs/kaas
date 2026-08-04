@@ -198,17 +198,66 @@ pub fn parse_batch_offsets(raw: &[u8]) -> Result<(i64, i32, i64), io::Error> {
 // scan_high_watermark
 // ---------------------------------------------------------------------------
 
+/// Fill in a v2 batch's CRC32C field so it survives the recovery
+/// scan's gh #228 verification.
+///
+/// Test-only: real producers compute this client-side, and a synthetic
+/// batch that leaves the field zeroed is byte-for-byte indistinguishable
+/// from bit-rot — which is exactly what the scan now rejects.
+#[cfg(test)]
+pub(crate) fn stamp_crc(buf: &mut [u8]) {
+    let crc = crc32c::crc32c(&buf[21..]);
+    buf[17..21].copy_from_slice(&crc.to_be_bytes());
+}
+
+/// Why [`scan_high_watermark_from`] stopped walking the log.
+///
+/// Only [`ScanStop::Eof`] means the whole file was valid. The other two
+/// say the log has a tail that must not be kept: `Torn` is a short or
+/// structurally impossible batch (the classic crash-mid-write shape),
+/// `CrcMismatch` is a batch whose bytes decode structurally but do not
+/// match their own checksum — bit-rot, or the byte-interleaving a
+/// dual-writer window produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanStop {
+    /// Clean end of file — every byte scanned was a valid batch.
+    Eof,
+    /// A batch was short, or its length field was structurally impossible.
+    Torn,
+    /// A batch failed CRC32C verification (gh #228).
+    CrcMismatch,
+}
+
+/// Outcome of a log scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanResult {
+    /// Next offset to write — one past the last record of the last
+    /// valid batch.
+    pub high_watermark: i64,
+    /// Byte position just past the last *valid* batch. Anything at or
+    /// after this is garbage and must be truncated before the log is
+    /// appended to again (gh #226), or writes land past it and the next
+    /// recovery silently drops them.
+    pub valid_end: u64,
+    /// Why the scan stopped.
+    pub stop: ScanStop,
+}
+
 /// Scan a log file to find the high watermark (next offset to write).
 ///
-/// Stops at the first malformed or truncated batch — that's the
-/// post-crash partial-write boundary, and the returned HWM reflects
+/// Stops at the first malformed, truncated, or CRC-failing batch — that's
+/// the post-crash partial-write boundary, and the returned HWM reflects
 /// only fully-persisted batches. Read through a 4 MiB-window
 /// [`BufReader`] so NFS substrates open large logs in MB/s, not
 /// RPCs/s.
+///
+/// Returns only the high watermark; callers that intend to *write* to
+/// the log need [`scan_high_watermark_from`]'s `valid_end` as well, or
+/// they will append past a torn tail.
 pub fn scan_high_watermark<R: Read + Seek>(f: &mut R, segment_base_offset: i64) -> io::Result<i64> {
     // Whole-segment scan: start at byte 0, seed the running HWM with
     // the segment's base offset (an empty segment has HWM == base).
-    scan_high_watermark_from(f, 0, segment_base_offset)
+    Ok(scan_high_watermark_from(f, 0, segment_base_offset)?.high_watermark)
 }
 
 /// Like [`scan_high_watermark`] but resumes a partial scan: start at
@@ -222,37 +271,51 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
     f: &mut R,
     start_byte: u64,
     start_hwm: i64,
-) -> io::Result<i64> {
+) -> io::Result<ScanResult> {
     f.seek(SeekFrom::Start(start_byte))?;
     let mut br = BufReader::with_capacity(SCAN_HWM_BUF_SIZE, f);
 
     let mut hwm = start_hwm;
+    let mut valid_end = start_byte;
     let mut header = [0u8; 12];
     let mut body_head = [0u8; 16];
 
-    loop {
+    let stop = loop {
         if br.read_exact(&mut header).is_err() {
-            break;
+            break ScanStop::Eof;
         }
         let mut len_bytes = [0u8; 4];
         len_bytes.copy_from_slice(&header[8..12]);
         let batch_length = i32::from_be_bytes(len_bytes);
         let body_head_len_i32 = i32::try_from(body_head.len()).unwrap_or(i32::MAX);
         if batch_length < body_head_len_i32 {
-            break;
+            break ScanStop::Torn;
         }
         if br.read_exact(&mut body_head).is_err() {
-            break;
+            break ScanStop::Torn;
         }
-        // Discard the rest of the body.
+        // Read (not discard) the rest of the body: the CRC covers it.
         let body_head_len_i32_2 = body_head_len_i32;
         let rest_i32 = batch_length - body_head_len_i32_2;
         let Ok(rest_us) = usize::try_from(rest_i32) else {
-            break;
+            break ScanStop::Torn;
         };
-        let mut discard = vec![0u8; rest_us];
-        if br.read_exact(&mut discard).is_err() {
-            break;
+        let mut rest = vec![0u8; rest_us];
+        if br.read_exact(&mut rest).is_err() {
+            break ScanStop::Torn;
+        }
+        // gh #228: verify the batch against its own CRC32C before
+        // trusting the offsets in its header. The v2 CRC field sits at
+        // batch byte 17..21 and covers byte 21 to the end of the batch,
+        // i.e. body_head[5..9] and body_head[9..] ++ rest here. This
+        // reads no record contents — byte-opacity is preserved.
+        let mut crc_bytes = [0u8; 4];
+        crc_bytes.copy_from_slice(&body_head[5..9]);
+        let expected = u32::from_be_bytes(crc_bytes);
+        let mut digest = crc32c::crc32c(&body_head[9..]);
+        digest = crc32c::crc32c_append(digest, &rest);
+        if digest != expected {
+            break ScanStop::CrcMismatch;
         }
         // base_offset := [0..8]; last_offset_delta := body_head[11..15].
         let mut o8 = [0u8; 8];
@@ -262,8 +325,16 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
         d4.copy_from_slice(&body_head[11..15]);
         let last_offset_delta = i32::from_be_bytes(d4);
         hwm = base_offset + i64::from(last_offset_delta) + 1;
-    }
-    Ok(hwm)
+        // Only now is the batch known-good, so only now does the valid
+        // region grow. 12 = baseOffset + batchLength fields, which
+        // batch_length itself does not cover.
+        valid_end += u64::from(u32::try_from(batch_length).unwrap_or(0)) + 12;
+    };
+    Ok(ScanResult {
+        high_watermark: hwm,
+        valid_end,
+        stop,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +528,38 @@ impl ActiveSegment {
             // exact value isn't required for appends.
             self.last_indexed_log_pos = meta.len() / 8 * 4096;
         }
+        Ok(())
+    }
+
+    /// Drop everything at or after `valid_end` (gh #226).
+    ///
+    /// Called from partition open once the recovery scan has found the
+    /// end of the last valid batch. Two effects, and the second is the
+    /// load-bearing one:
+    ///
+    /// 1. The file shrinks, so a later scan doesn't re-encounter the
+    ///    garbage.
+    /// 2. `log_size` — the offset `append_batch` writes at — moves back
+    ///    to the valid end. Without this, appends resume at the file's
+    ///    *stat* length, i.e. past the torn region, and the next
+    ///    recovery stops at the tear and silently drops every record
+    ///    written after it (they were acked, and at
+    ///    `flushIntervalMessages: 1` they were fsynced).
+    ///
+    /// An `Fs` without a real `truncate` still gets effect 2, which is
+    /// what keeps the data-loss window closed; it just leaves the dead
+    /// bytes on disk to be overwritten.
+    pub fn truncate_to(&mut self, fs: &dyn Fs, valid_end: u64) -> io::Result<()> {
+        if valid_end >= self.log_size {
+            return Ok(());
+        }
+        match fs.truncate(&self.meta.log_path, valid_end) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+            Err(e) => return Err(e),
+        }
+        self.log_size = valid_end;
+        self.meta.size = valid_end;
         Ok(())
     }
 
@@ -793,6 +896,7 @@ mod tests {
         buf[23..27].copy_from_slice(&last_offset_delta.to_be_bytes());
         // maxTimestamp at [35..43]
         buf[35..43].copy_from_slice(&max_timestamp.to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
         buf
     }
 
@@ -930,6 +1034,141 @@ mod tests {
         assert_eq!(hwm, 2, "torn batch 2 dropped; HWM points just past batch 1");
     }
 
+    // --- gh #228: CRC verification during recovery ----------------------
+
+    /// Write `n` single-record batches and return (log path, byte
+    /// position after each batch).
+    fn log_with_batches(fs: &RealFs, dir: &Path, n: i64) -> (PathBuf, Vec<u64>) {
+        let mut seg = ActiveSegment::create(fs, dir, 0, 1).unwrap();
+        let mut ends = Vec::new();
+        for offset in 0..n {
+            seg.append_batch(&build_batch(offset, 0, 1_000, 32), 4096)
+                .unwrap();
+            ends.push(seg.log_size());
+        }
+        seg.sync_log().unwrap();
+        let path = seg.meta.log_path.clone();
+        seg.close_handles();
+        (path, ends)
+    }
+
+    #[test]
+    fn scan_reports_eof_and_full_length_on_a_clean_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, ends) = log_with_batches(&RealFs::new(), tmp.path(), 3);
+
+        let mut f = std::fs::File::open(&path).unwrap();
+        let r = scan_high_watermark_from(&mut f, 0, 0).unwrap();
+        assert_eq!(r.stop, ScanStop::Eof);
+        assert_eq!(r.high_watermark, 3);
+        assert_eq!(r.valid_end, *ends.last().unwrap());
+    }
+
+    /// The gh #228 case that used to be undetectable: the batch is
+    /// structurally perfect — length field intact, header parseable — but
+    /// a payload byte has rotted. Pre-fix the scan trusted the header and
+    /// served the corrupt record; now it stops at the batch.
+    #[test]
+    fn scan_stops_at_a_batch_whose_payload_fails_crc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, ends) = log_with_batches(&RealFs::new(), tmp.path(), 3);
+
+        // Flip a byte inside batch 2's records payload. Batch 1 ends at
+        // ends[0]; the payload sits well past that batch's 61-byte header.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let corrupt_at = usize::try_from(ends[0]).unwrap() + 70;
+        bytes[corrupt_at] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut f = std::fs::File::open(&path).unwrap();
+        let r = scan_high_watermark_from(&mut f, 0, 0).unwrap();
+        assert_eq!(r.stop, ScanStop::CrcMismatch, "corruption must be detected");
+        assert_eq!(
+            r.high_watermark, 1,
+            "only batch 0 is trustworthy, so the HWM is 1"
+        );
+        assert_eq!(
+            r.valid_end, ends[0],
+            "valid region ends where the last good batch ended"
+        );
+    }
+
+    /// A corrupt *length* field that stays plausible desynchronises the
+    /// walk onto a non-boundary. Without CRC checking the scan would
+    /// happily parse garbage as headers and invent an arbitrary HWM.
+    #[test]
+    fn scan_stops_when_a_plausible_length_field_desyncs_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, ends) = log_with_batches(&RealFs::new(), tmp.path(), 3);
+
+        // Shrink batch 1's length by 4 bytes: still >= the 16-byte floor,
+        // so the old guard passes and the next "header" is read from the
+        // middle of batch 1.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = usize::try_from(ends[0]).unwrap();
+        let len = i32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap());
+        bytes[at + 8..at + 12].copy_from_slice(&(len - 4).to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut f = std::fs::File::open(&path).unwrap();
+        let r = scan_high_watermark_from(&mut f, 0, 0).unwrap();
+        assert_ne!(r.stop, ScanStop::Eof, "must not accept a desynced walk");
+        assert_eq!(r.high_watermark, 1);
+        assert_eq!(r.valid_end, ends[0]);
+    }
+
+    /// A torn tail (crash mid-write) still stops the scan, and now also
+    /// reports where the valid bytes end so the caller can truncate.
+    #[test]
+    fn scan_reports_valid_end_for_a_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, ends) = log_with_batches(&RealFs::new(), tmp.path(), 3);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let new_len = bytes.len() - 5;
+        bytes.truncate(new_len);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut f = std::fs::File::open(&path).unwrap();
+        let r = scan_high_watermark_from(&mut f, 0, 0).unwrap();
+        assert_eq!(r.stop, ScanStop::Torn);
+        assert_eq!(r.high_watermark, 2);
+        assert_eq!(r.valid_end, ends[1], "batch 2 is incomplete, so it's out");
+    }
+
+    // --- gh #226: truncate_to -------------------------------------------
+
+    #[test]
+    fn truncate_to_shrinks_the_file_and_the_append_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let (path, ends) = log_with_batches(&fs, tmp.path(), 3);
+
+        let meta = list_segments(&fs, tmp.path()).unwrap().pop().unwrap();
+        let mut seg = ActiveSegment::open_meta_only(meta);
+        seg.open_handles(&fs).unwrap();
+        seg.truncate_to(&fs, ends[0]).unwrap();
+
+        assert_eq!(seg.log_size(), ends[0], "appends must resume at valid end");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), ends[0]);
+    }
+
+    #[test]
+    fn truncate_to_is_a_noop_at_or_past_the_current_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let (path, ends) = log_with_batches(&fs, tmp.path(), 2);
+        let full = *ends.last().unwrap();
+
+        let meta = list_segments(&fs, tmp.path()).unwrap().pop().unwrap();
+        let mut seg = ActiveSegment::open_meta_only(meta);
+        seg.truncate_to(&fs, full).unwrap();
+        seg.truncate_to(&fs, full + 999).unwrap();
+
+        assert_eq!(seg.log_size(), full);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), full);
+    }
+
     /// gh #recovery-checkpoint: resuming the scan from a mid-log byte
     /// position (with the HWM seed for that boundary) yields the same
     /// answer as a full scan — and a checkpoint at EOF reads nothing.
@@ -960,11 +1199,19 @@ mod tests {
         // Resume after batch 2 (HWM there = 3) → same result, tail only.
         let mut f = std::fs::File::open(&log_path).unwrap();
         let resumed = scan_high_watermark_from(&mut f, pos_after_2, 3).unwrap();
-        assert_eq!(resumed, full, "checkpoint resume must equal full scan");
+        assert_eq!(
+            resumed.high_watermark, full,
+            "checkpoint resume must equal full scan"
+        );
+        // A clean log's valid end is EOF no matter where the scan began.
+        assert_eq!(resumed.valid_end, eof);
+        assert_eq!(resumed.stop, ScanStop::Eof);
 
         // Checkpoint at EOF (HWM 5) → nothing to read, returns the seed.
         let mut f = std::fs::File::open(&log_path).unwrap();
-        assert_eq!(scan_high_watermark_from(&mut f, eof, 5).unwrap(), 5);
+        let at_eof = scan_high_watermark_from(&mut f, eof, 5).unwrap();
+        assert_eq!(at_eof.high_watermark, 5);
+        assert_eq!(at_eof.valid_end, eof);
     }
 
     #[test]

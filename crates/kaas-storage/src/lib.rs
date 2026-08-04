@@ -58,7 +58,8 @@ pub use producer_snapshot::{
 pub use segment::{
     legacy_segment_log_path, list_segments, parse_batch_offsets, parse_segment_stem, read_batches,
     scan_high_watermark, scan_high_watermark_from, search_index, search_index_bytes,
-    segment_index_path, segment_log_path, ActiveSegment, RolledTail, SegmentMeta, INDEX_ENTRY_SIZE,
+    segment_index_path, segment_log_path, ActiveSegment, RolledTail, ScanResult, ScanStop,
+    SegmentMeta, INDEX_ENTRY_SIZE,
 };
 pub use topic_identity::{
     classify as classify_topic_identity, read_topic_identity, write_topic_identity,
