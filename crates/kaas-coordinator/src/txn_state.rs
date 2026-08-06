@@ -146,14 +146,18 @@ pub struct TxnAbortRecord {
     pub groups: Vec<String>,
 }
 
-/// Return value of [`TxnStateStore::end_txn`]. Carries the
-/// partition + group lists snapshotted *before* the state
-/// transition cleared them so the handler can dispatch
-/// COMMIT / ABORT control batches to each partition leader
-/// (gh #114) and run any post-transition bookkeeping.
-/// `transition_fired = false` is the idempotent-retry path —
-/// state was already `CompleteCommit`/`CompleteAbort`, no fresh
-/// side effects required.
+/// Return value of [`TxnStateStore::prepare_end_txn`]. Carries the
+/// partition + group lists the caller must dispatch COMMIT / ABORT
+/// control batches for (gh #114 / gh #175).
+///
+/// The lists are *copies* — they stay on the persisted entry until
+/// [`TxnStateStore::complete_end_txn`] clears them, so a dispatch
+/// failure or a coordinator crash re-derives the identical set on the
+/// next attempt (gh #225).
+///
+/// `transition_fired = false` is the nothing-to-do path — the txn was
+/// already `CompleteCommit`/`CompleteAbort`, its markers are long
+/// written, and no fresh side effects are required.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EndTxnOutcome {
     pub partitions: Vec<TxnTopic>,
@@ -434,23 +438,43 @@ impl TxnStateStore {
         Ok(())
     }
 
-    /// The `EndTxn` (API key 26) state transition. gh #25 / #26.
+    /// Phase 1 of the `EndTxn` (API key 26) transition. gh #25 / #26,
+    /// split out under gh #225.
     ///
     /// ```text
-    /// Ongoing       → CompleteCommit  (commit = true)
-    /// Ongoing       → CompleteAbort   (commit = false)
-    /// CompleteCommit + commit = true  → Ok(()) idempotent
-    /// CompleteAbort  + commit = false → Ok(()) idempotent
-    /// CompleteCommit + commit = false → InvalidState
-    /// CompleteAbort  + commit = true  → InvalidState
-    /// Empty                           → InvalidState
-    /// Prepare*                        → Concurrent
+    /// Ongoing        → PrepareCommit   (commit = true)
+    /// Ongoing        → PrepareAbort    (commit = false)
+    /// PrepareCommit  + commit = true   → re-drive (same lists)
+    /// PrepareAbort   + commit = false  → re-drive (same lists)
+    /// PrepareCommit  + commit = false  → InvalidState
+    /// PrepareAbort   + commit = true   → InvalidState
+    /// CompleteCommit + commit = true   → Ok, transition_fired = false
+    /// CompleteAbort  + commit = false  → Ok, transition_fired = false
+    /// Complete* mismatched             → InvalidState
+    /// Empty                            → InvalidState
     /// ```
     ///
-    /// Kaas collapses `Prepare → Complete` into a single atomic
-    /// transition because the marker-write phase (gh #114) hasn't
-    /// landed; the Prepare* arms exist for forward compat.
-    pub fn end_txn(
+    /// **The partition and group lists are deliberately NOT cleared
+    /// here** — that is the whole point of the split. `Prepare*` plus a
+    /// retained partition list *is* the durable record of "these
+    /// markers still owe a write", so a dispatch failure, a coordinator
+    /// crash, or a producer retry all re-derive the same dispatch set
+    /// instead of losing it. Clearing happens in
+    /// [`Self::complete_end_txn`], which the caller may only invoke once
+    /// every marker is durable.
+    ///
+    /// This is the NFS-substrate rule-2 shape (see
+    /// `docs/src/architecture/nfs-substrate.md`): the compound
+    /// "transition + write N markers" op is not a single atomic
+    /// primitive, so it is made idempotent and driven to completion by
+    /// retry rather than fired once and hoped for.
+    ///
+    /// Re-driving on a matching `Prepare*` replaces the previous
+    /// `Concurrent` error. A producer retrying `EndTxn` after a failed
+    /// dispatch must be able to push it through; answering
+    /// CONCURRENT_TRANSACTIONS forever is exactly the wedge gh #225
+    /// describes.
+    pub fn prepare_end_txn(
         &self,
         txn_id: &str,
         pid: i64,
@@ -475,39 +499,45 @@ impl TxnStateStore {
             return Err(TxnStateError::EpochFenced);
         }
 
+        let want_prepare = if commit {
+            TxnState::PrepareCommit
+        } else {
+            TxnState::PrepareAbort
+        };
+
         match entry.state {
             TxnState::Ongoing => {
-                entry.state = if commit {
-                    TxnState::CompleteCommit
-                } else {
-                    TxnState::CompleteAbort
-                };
-                // Snapshot the partition + group lists BEFORE clearing
-                // so the handler can dispatch marker writes (gh #114
-                // same-broker fast path) and the offset hook fires
-                // against the right groups.
-                let partitions = std::mem::take(&mut entry.partitions);
-                let groups = std::mem::take(&mut entry.groups);
-                entry.ongoing_since_ms = 0;
+                entry.state = want_prepare;
+                // Lists stay put — see the doc comment. They are read
+                // out for the caller but remain on the entry so a
+                // re-drive sees the same set.
+                let partitions = entry.partitions.clone();
+                let groups = entry.groups.clone();
                 state.insert(txn_id.to_owned(), entry);
                 self.persist_slot(slot, &state)?;
-                let hook = self.hook.read().clone();
-                if let Some(hook) = hook {
-                    for g in &groups {
-                        hook.on_end_txn(g, pid, commit);
-                    }
-                }
                 Ok(EndTxnOutcome {
                     partitions,
                     groups,
                     transition_fired: true,
                 })
             }
+            // Already preparing: re-drive with the retained lists so a
+            // retry re-attempts dispatch for exactly the same targets.
+            TxnState::PrepareCommit | TxnState::PrepareAbort => {
+                if entry.state != want_prepare {
+                    return Err(TxnStateError::InvalidState);
+                }
+                Ok(EndTxnOutcome {
+                    partitions: entry.partitions.clone(),
+                    groups: entry.groups.clone(),
+                    transition_fired: true,
+                })
+            }
             TxnState::CompleteCommit => {
-                if !commit {
-                    Err(TxnStateError::InvalidState)
-                } else {
+                if commit {
                     Ok(EndTxnOutcome::default())
+                } else {
+                    Err(TxnStateError::InvalidState)
                 }
             }
             TxnState::CompleteAbort => {
@@ -517,9 +547,91 @@ impl TxnStateStore {
                     Ok(EndTxnOutcome::default())
                 }
             }
-            TxnState::PrepareCommit | TxnState::PrepareAbort => Err(TxnStateError::Concurrent),
             TxnState::Empty => Err(TxnStateError::InvalidState),
         }
+    }
+
+    /// Phase 2 of `EndTxn`: `Prepare* → Complete*`, clearing the
+    /// partition + group lists and firing the offset hook.
+    ///
+    /// **Only call this once every marker for the transaction is
+    /// durable.** It is the step that discards the dispatch set, so
+    /// calling it early re-creates gh #225: the txn reads as finished
+    /// while some partition never received its marker, leaving
+    /// `read_committed` consumers with a permanently pinned LSO and no
+    /// way for any retry to notice.
+    ///
+    /// The offset hook fires here rather than in
+    /// [`Self::prepare_end_txn`] so staged `TxnOffsetCommit` offsets
+    /// only become visible once the markers backing them are durable.
+    ///
+    /// Idempotent on `Complete*` with a matching `commit`.
+    pub fn complete_end_txn(&self, txn_id: &str, pid: i64, epoch: i16, commit: bool) -> Result<()> {
+        if txn_id.is_empty() {
+            return Err(TxnStateError::EmptyTxnId);
+        }
+        let _guard = self.mu.lock();
+        let slot = self.slot_for(txn_id);
+        let mut state = self.load_slot(slot)?;
+
+        let mut entry = state
+            .get(txn_id)
+            .cloned()
+            .ok_or(TxnStateError::UnknownProducer)?;
+        if entry.pid != pid {
+            return Err(TxnStateError::UnknownProducer);
+        }
+        if entry.epoch != epoch {
+            return Err(TxnStateError::EpochFenced);
+        }
+
+        let (want_prepare, want_complete) = if commit {
+            (TxnState::PrepareCommit, TxnState::CompleteCommit)
+        } else {
+            (TxnState::PrepareAbort, TxnState::CompleteAbort)
+        };
+
+        if entry.state == want_complete {
+            return Ok(()); // idempotent
+        }
+        if entry.state != want_prepare {
+            return Err(TxnStateError::InvalidState);
+        }
+
+        entry.state = want_complete;
+        let groups = std::mem::take(&mut entry.groups);
+        entry.partitions.clear();
+        entry.ongoing_since_ms = 0;
+        state.insert(txn_id.to_owned(), entry);
+        self.persist_slot(slot, &state)?;
+        let hook = self.hook.read().clone();
+        if let Some(hook) = hook {
+            for g in &groups {
+                hook.on_end_txn(g, pid, commit);
+            }
+        }
+        Ok(())
+    }
+
+    /// Single-phase `EndTxn` — [`Self::prepare_end_txn`] immediately
+    /// followed by [`Self::complete_end_txn`].
+    ///
+    /// **Not for the production EndTxn path.** It completes the
+    /// transaction without giving the caller a window to write markers,
+    /// which is precisely the gh #225 defect. It exists for tests and
+    /// for callers that have no markers to dispatch.
+    pub fn end_txn(
+        &self,
+        txn_id: &str,
+        pid: i64,
+        epoch: i16,
+        commit: bool,
+    ) -> Result<EndTxnOutcome> {
+        let outcome = self.prepare_end_txn(txn_id, pid, epoch, commit)?;
+        if outcome.transition_fired {
+            self.complete_end_txn(txn_id, pid, epoch, commit)?;
+        }
+        Ok(outcome)
     }
 
     /// As [`abort_overdue_owned`] without the ownership gate.
@@ -871,6 +983,152 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, TxnStateError::EpochFenced));
+    }
+
+    /// gh #225: `prepare_end_txn` must leave the dispatch set on the
+    /// persisted entry. It is the only durable record that these
+    /// markers still owe a write — clearing it early is what made a
+    /// failed dispatch unrecoverable.
+    #[test]
+    fn prepare_retains_the_dispatch_set_until_complete() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions(
+            "tx-1",
+            pid,
+            epoch,
+            &[TxnTopic {
+                topic: "t".into(),
+                partitions: vec![0, 1],
+            }],
+            100,
+        )
+        .unwrap();
+
+        let out = s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert!(out.transition_fired);
+        assert_eq!(out.partitions.len(), 1);
+        let snap = s.snapshot();
+        assert_eq!(snap["tx-1"].state, TxnState::PrepareCommit);
+        assert_eq!(
+            snap["tx-1"].partitions.len(),
+            1,
+            "dispatch set must survive prepare"
+        );
+
+        s.complete_end_txn("tx-1", pid, epoch, true).unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap["tx-1"].state, TxnState::CompleteCommit);
+        assert!(snap["tx-1"].partitions.is_empty());
+    }
+
+    /// A retry after a failed dispatch must re-derive the *same*
+    /// targets, not an empty set.
+    #[test]
+    fn prepare_is_re_drivable_with_the_same_dispatch_set() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions(
+            "tx-1",
+            pid,
+            epoch,
+            &[TxnTopic {
+                topic: "t".into(),
+                partitions: vec![0],
+            }],
+            100,
+        )
+        .unwrap();
+        let first = s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+        let second = s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert!(second.transition_fired);
+        assert_eq!(first.partitions, second.partitions);
+    }
+
+    /// Prepared-to-commit cannot be flipped to an abort (and vice
+    /// versa) — that would write the opposite marker for a txn whose
+    /// COMMIT may already be on disk at some partition.
+    #[test]
+    fn prepare_rejects_the_opposite_outcome() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions(
+            "tx-1",
+            pid,
+            epoch,
+            &[TxnTopic {
+                topic: "t".into(),
+                partitions: vec![0],
+            }],
+            100,
+        )
+        .unwrap();
+        s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert!(matches!(
+            s.prepare_end_txn("tx-1", pid, epoch, false),
+            Err(TxnStateError::InvalidState)
+        ));
+        assert!(matches!(
+            s.complete_end_txn("tx-1", pid, epoch, false),
+            Err(TxnStateError::InvalidState)
+        ));
+    }
+
+    /// Staged offsets must not become visible until the markers
+    /// backing them are durable, so the hook fires on complete.
+    #[test]
+    fn offset_hook_fires_on_complete_not_on_prepare() {
+        struct CapturingHook(parking_lot::Mutex<Vec<(String, i64, bool)>>);
+        impl TxnOffsetHook for CapturingHook {
+            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) {
+                self.0
+                    .lock()
+                    .push((group_id.to_owned(), producer_id, commit));
+            }
+        }
+        let (_t, s) = store();
+        let hook = Arc::new(CapturingHook(parking_lot::Mutex::new(Vec::new())));
+        s.set_offset_hook(hook.clone());
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_offsets_to_txn("tx-1", pid, epoch, "g1", 100).unwrap();
+
+        s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert!(
+            hook.0.lock().is_empty(),
+            "prepare must not publish staged offsets"
+        );
+
+        s.complete_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert_eq!(hook.0.lock().len(), 1);
+        assert_eq!(hook.0.lock()[0], ("g1".to_owned(), pid, true));
+    }
+
+    #[test]
+    fn complete_without_prepare_is_invalid() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions(
+            "tx-1",
+            pid,
+            epoch,
+            &[TxnTopic {
+                topic: "t".into(),
+                partitions: vec![0],
+            }],
+            100,
+        )
+        .unwrap();
+        // Still Ongoing — completing without preparing would clear the
+        // dispatch set with no marker written.
+        assert!(matches!(
+            s.complete_end_txn("tx-1", pid, epoch, true),
+            Err(TxnStateError::InvalidState)
+        ));
     }
 
     #[test]

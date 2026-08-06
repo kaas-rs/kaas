@@ -1,23 +1,34 @@
 //! EndTxn handler (key 26, v0–v3).
 //!
-//! EndTxn (API key 26), including a same-broker marker fast path
-//! (an improvement over v0.1).
+//! Three steps, in this order, and the order is the correctness
+//! property (gh #225):
 //!
-//! Sequence:
-//! 1. Validate ownership + (pid, epoch) and transition state via
-//!    [`TxnStateStore::end_txn`]. The wired [`TxnOffsetHook`]
-//!    (workstream F) materialises or discards pending offsets.
-//! 2. For every partition this broker leads from the snapshotted
-//!    partition list, build a COMMIT / ABORT control batch via
-//!    [`build_control_batch`] and `engine.append` it with
-//!    `acks = -1` so a `read_committed` consumer can immediately see
-//!    the commit. Partitions led by another broker are silently
-//!    skipped — the gh #114 cross-broker `WriteTxnMarkers` RPC picks
-//!    them up.
+//! 1. Validate ownership + (pid, epoch), then **prepare** the txn via
+//!    [`TxnStateStore::prepare_end_txn`] — `Ongoing → Prepare{Commit,
+//!    Abort}`, keeping the partition list on the persisted entry.
+//! 2. Place a COMMIT / ABORT marker for every partition in that list.
+//!    Partitions this broker leads get a [`build_control_batch`]
+//!    control batch appended with `acks = -1`; peer-led partitions get
+//!    a marker-queue entry on the shared PVC, which the peer's
+//!    `MarkerWatcher` retries until applied (gh #175).
+//! 3. Only once every marker is durable, **complete** via
+//!    [`TxnStateStore::complete_end_txn`] — `Prepare* → Complete*`,
+//!    clearing the list and firing the [`TxnOffsetHook`] that
+//!    materialises or discards staged offsets.
 //!
-//! `acks = -1` for marker dispatch: control markers commit
+//! If step 2 fails for any partition the handler returns a retriable
+//! error and the entry stays in `Prepare*` with its list intact, so the
+//! producer's retry re-drives the identical dispatch set. Before
+//! gh #225 the state advanced to `Complete*` first, the list was
+//! cleared, dispatch failures were logged and swallowed, and EndTxn
+//! answered success regardless — leaving `read_committed` consumers
+//! with a permanently pinned LSO and nothing able to notice.
+//!
+//! `acks = -1` for local marker dispatch: control markers commit
 //! transactions, so they must be durable before we ack the producer.
 //!
+//! [`TxnStateStore::prepare_end_txn`]: kaas_coordinator::TxnStateStore::prepare_end_txn
+//! [`TxnStateStore::complete_end_txn`]: kaas_coordinator::TxnStateStore::complete_end_txn
 //! [`TxnOffsetHook`]: kaas_coordinator::TxnOffsetHook
 //! [`build_control_batch`]: crate::control_batch::build_control_batch
 
@@ -95,12 +106,34 @@ impl EndTxnHandler {
         None
     }
 
+    /// Two-phase EndTxn (gh #225).
+    ///
+    /// ```text
+    /// prepare  →  dispatch every marker  →  complete
+    ///                     │
+    ///                     └─ any failure: stay in Prepare*, return a
+    ///                        retriable code, producer retry re-drives
+    /// ```
+    ///
+    /// The ordering is the fix. Before gh #225 the store transitioned
+    /// straight to `Complete*` — clearing the partition list — and then
+    /// dispatched markers on a best-effort basis, logging and swallowing
+    /// every failure while still answering `error_code = 0`. A marker
+    /// that failed to land was then unrecoverable: the dispatch set was
+    /// gone, a producer retry was a documented no-op, and no reconcile
+    /// pass existed. For `read_committed` consumers that pins the
+    /// partition's LSO forever — not just for the lost transaction, but
+    /// for every committed record written after it.
+    ///
+    /// So: never complete before the markers are durable, and never
+    /// answer success for a transaction whose markers we could not
+    /// place.
     async fn transition_and_dispatch(&self, req: &end_txn::Request) -> i16 {
         let store = match self.broker.txn_state() {
             Some(s) => s,
             None => return ERR_COORDINATOR_NOT_AVAILABLE,
         };
-        let outcome = match store.end_txn(
+        let outcome = match store.prepare_end_txn(
             &req.transactional_id,
             req.producer_id,
             req.producer_epoch,
@@ -109,17 +142,46 @@ impl EndTxnHandler {
             Ok(o) => o,
             Err(e) => return map_store_error(&e),
         };
-        // Same-broker fast path: write markers for every partition we
-        // currently lead. Cross-broker partitions are left to gh #114.
-        // Idempotent retry returns `transition_fired = false` with an
-        // empty partition list, so this loop is a no-op there.
-        self.dispatch_markers(req, &outcome).await;
-        0
+        // Already `Complete*` — markers were written on an earlier
+        // attempt, nothing owed.
+        if !outcome.transition_fired {
+            return 0;
+        }
+        if let Err(code) = self.dispatch_markers(req, &outcome).await {
+            // Entry stays in Prepare* with its partition list intact.
+            // The producer's retry re-drives the identical dispatch set.
+            tracing::warn!(
+                txn_id = %req.transactional_id,
+                producer_id = req.producer_id,
+                error_code = code,
+                "EndTxn: marker dispatch incomplete; transaction left in Prepare \
+                 state for retry rather than acked as complete (gh #225)",
+            );
+            return code;
+        }
+        match store.complete_end_txn(
+            &req.transactional_id,
+            req.producer_id,
+            req.producer_epoch,
+            req.committed,
+        ) {
+            Ok(()) => 0,
+            Err(e) => map_store_error(&e),
+        }
     }
 
-    async fn dispatch_markers(&self, req: &end_txn::Request, outcome: &EndTxnOutcome) {
-        if !outcome.transition_fired || outcome.partitions.is_empty() {
-            return;
+    /// Place a COMMIT/ABORT marker for every partition in the dispatch
+    /// set. `Ok(())` means every marker is durable: locally appended
+    /// with `acks = -1`, or written to the peer's marker-queue inbox on
+    /// the shared PVC (from where the peer's `MarkerWatcher` retries
+    /// until it applies). `Err(code)` is a retriable wire code.
+    async fn dispatch_markers(
+        &self,
+        req: &end_txn::Request,
+        outcome: &EndTxnOutcome,
+    ) -> Result<(), i16> {
+        if outcome.partitions.is_empty() {
+            return Ok(());
         }
 
         // Group partitions by which broker leads them. Same-broker
@@ -156,18 +218,31 @@ impl EndTxnHandler {
         // Same-broker write — happens before the queue write so a
         // crash mid-dispatch still leaves the local marker in place.
         if !local_partitions.is_empty() {
-            self.write_local_markers(req, &local_partitions).await;
+            self.write_local_markers(req, &local_partitions).await?;
         }
 
         // Cross-broker dispatch via the shared-PVC queue. Receiver's
         // MarkerWatcher picks it up within ~2 s and applies it on the
         // peer leader (gh #175).
         if !queued.is_empty() {
-            self.enqueue_cross_broker_markers(req, &queued);
+            self.enqueue_cross_broker_markers(req, &queued)?;
         }
+        Ok(())
     }
 
-    async fn write_local_markers(&self, req: &end_txn::Request, partitions: &[(String, i32)]) {
+    /// Append the control batch to every locally-led partition.
+    ///
+    /// A failed append aborts the whole dispatch: the caller leaves the
+    /// txn in Prepare* so the retry re-appends. Re-appending a marker
+    /// the first attempt already landed writes a duplicate control
+    /// batch, which is wasteful but not incorrect — control batches
+    /// carry no sequence numbers and consumers don't react to duplicate
+    /// markers (same property `MarkerWatcher` already relies on).
+    async fn write_local_markers(
+        &self,
+        req: &end_txn::Request,
+        partitions: &[(String, i32)],
+    ) -> Result<(), i16> {
         let batch = Bytes::from(build_control_batch(
             req.producer_id,
             req.producer_epoch,
@@ -195,28 +270,40 @@ impl EndTxnHandler {
                     topic,
                     partition = p,
                     %err,
-                    "EndTxn marker append failed; consumers in read_committed mode \
-                     will not see the txn as committed until the producer retries",
+                    "EndTxn marker append failed; transaction stays in Prepare state \
+                     and the producer's retry re-drives this marker (gh #225)",
                 );
+                return Err(ERR_COORDINATOR_NOT_AVAILABLE);
             }
         }
+        Ok(())
     }
 
+    /// Hand peer-led partitions to the shared-PVC marker queue.
+    ///
+    /// A successful `enqueue` is the durability boundary for a peer
+    /// partition: the entry is on the shared volume, and the peer's
+    /// `MarkerWatcher` retries application until it succeeds
+    /// (`ApplyOutcome::Retry` keeps the file). So enqueue success is
+    /// enough to complete the transaction; only enqueue *failure* is
+    /// fatal to this attempt.
     fn enqueue_cross_broker_markers(
         &self,
         req: &end_txn::Request,
         queued: &HashMap<String, Vec<(String, i32)>>,
-    ) {
+    ) -> Result<(), i16> {
         let queue = match self.broker.marker_queue() {
             Some(q) => q,
             None => {
+                // Previously this returned silently and EndTxn still
+                // answered success, so peer partitions kept their LSO
+                // pinned with nothing left to notice it (gh #225).
                 tracing::warn!(
                     txn_id = %req.transactional_id,
                     "EndTxn: cross-broker markers needed but no MarkerQueue is wired; \
-                     peer partitions will not see this commit/abort until the txn \
-                     coord retries",
+                     refusing to complete the transaction",
                 );
-                return;
+                return Err(ERR_COORDINATOR_NOT_AVAILABLE);
             }
         };
         for (target_broker, parts) in queued {
@@ -243,11 +330,13 @@ impl EndTxnHandler {
                     target = %target_broker,
                     txn_id = %req.transactional_id,
                     %err,
-                    "EndTxn: marker queue enqueue failed; peer will not see this \
-                     commit/abort until the txn coord retries"
+                    "EndTxn: marker queue enqueue failed; transaction stays in \
+                     Prepare state for the producer's retry (gh #225)"
                 );
+                return Err(ERR_COORDINATOR_NOT_AVAILABLE);
             }
         }
+        Ok(())
     }
 }
 
@@ -396,6 +485,154 @@ mod tests {
         )
         .await;
         assert_eq!(resp.error_code, ERR_PRODUCER_FENCED);
+    }
+
+    /// Build a coordinator that says `t/0` is led by a *peer*, so the
+    /// dispatch takes the cross-broker (marker-queue) path rather than
+    /// the local-append one.
+    fn install_peer_leader_coordinator(b: &Arc<Broker>, cluster_dir: &std::path::Path) {
+        use crate::assignment::{
+            Assignment, BrokerAssignment, BrokerHealth, PartitionAssignment, PartitionRole,
+        };
+        use crate::coordinator::{Coordinator, LocalHeartbeat, LocalLeaseEpoch};
+        let a = Assignment {
+            controller_epoch: 1,
+            assignment_version: 1,
+            generated_at: "2026-01-01T00:00:00Z".to_owned(),
+            controller: "test".to_owned(),
+            brokers: vec![
+                BrokerAssignment {
+                    id: "test".to_owned(),
+                    health: BrokerHealth::Alive,
+                    last_seen: "x".to_owned(),
+                },
+                BrokerAssignment {
+                    id: "kaas-1".to_owned(),
+                    health: BrokerHealth::Alive,
+                    last_seen: "x".to_owned(),
+                },
+            ],
+            partitions: vec![PartitionAssignment {
+                topic: "t".to_owned(),
+                partition: 0,
+                broker: "kaas-1".to_owned(), // peer leads it
+                epoch: 1,
+                role: PartitionRole::Leader,
+            }],
+            consumer_groups: Vec::new(),
+        };
+        std::fs::write(
+            cluster_dir.join("assignment.json"),
+            serde_json::to_vec(&a).unwrap(),
+        )
+        .unwrap();
+        let c = Coordinator::new(
+            "test",
+            cluster_dir,
+            Arc::new(LocalLeaseEpoch),
+            Arc::new(LocalHeartbeat),
+        );
+        assert!(c.apply_if_new(), "coordinator must load the assignment");
+        assert_eq!(c.leader_for("t", 0).as_deref(), Some("kaas-1"));
+        b.install_coordinator(c);
+    }
+
+    fn ongoing_txn(b: &Arc<Broker>) -> (i64, i16) {
+        let store = b.txn_state().unwrap();
+        let (pid, epoch) = store.get_or_allocate("tx-1", || 1).unwrap();
+        store
+            .add_partitions(
+                "tx-1",
+                pid,
+                epoch,
+                &[TxnTopic {
+                    topic: "t".into(),
+                    partitions: vec![0],
+                }],
+                100,
+            )
+            .unwrap();
+        (pid, epoch)
+    }
+
+    /// gh #225: a transaction whose markers could not be placed must
+    /// NOT be acked as committed, and must stay re-drivable.
+    ///
+    /// Cross-broker partition + no MarkerQueue wired = nowhere to put
+    /// the marker. The old code logged, returned early, and answered
+    /// `error_code = 0` with the partition list already cleared, so the
+    /// peer's LSO stayed pinned forever with nothing left to notice.
+    #[tokio::test]
+    async fn dispatch_failure_is_not_acked_as_success_and_stays_recoverable() {
+        let (t, b) = broker_with_txn();
+        install_peer_leader_coordinator(&b, t.path());
+        let (pid, epoch) = ongoing_txn(&b);
+
+        let h = EndTxnHandler::new(b.clone());
+        let resp = call(
+            &h,
+            &end_txn::Request {
+                transactional_id: "tx-1".into(),
+                producer_id: pid,
+                producer_epoch: epoch,
+                committed: true,
+            },
+        )
+        .await;
+
+        assert_ne!(
+            resp.error_code, 0,
+            "EndTxn must not ack success when no marker could be placed"
+        );
+        assert_eq!(resp.error_code, ERR_COORDINATOR_NOT_AVAILABLE);
+
+        // The dispatch set survives for the retry.
+        let snap = b.txn_state().unwrap().snapshot();
+        assert_eq!(
+            snap["tx-1"].state,
+            kaas_coordinator::TxnState::PrepareCommit
+        );
+        assert!(
+            !snap["tx-1"].partitions.is_empty(),
+            "partition list must be retained so a retry re-drives the same markers"
+        );
+    }
+
+    /// The other half: once dispatch can succeed, the producer's retry
+    /// pushes the same transaction through to Complete.
+    #[tokio::test]
+    async fn retry_after_dispatch_failure_completes_and_enqueues_the_marker() {
+        let (t, b) = broker_with_txn();
+        install_peer_leader_coordinator(&b, t.path());
+        let (pid, epoch) = ongoing_txn(&b);
+        let h = EndTxnHandler::new(b.clone());
+        let req = end_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+            committed: true,
+        };
+
+        // First attempt fails — no queue wired.
+        assert_ne!(call(&h, &req).await.error_code, 0);
+
+        // Operator/bootstrap wires the queue; producer retries.
+        let queue = kaas_coordinator::MarkerQueue::open(t.path()).unwrap();
+        b.install_marker_queue(queue.clone());
+        let resp = call(&h, &req).await;
+        assert_eq!(resp.error_code, 0, "retry must push the txn through");
+
+        let pending = queue.list("kaas-1").unwrap();
+        assert_eq!(pending.len(), 1, "peer marker must be queued");
+        assert_eq!(pending[0].1.producer_id, pid);
+        assert!(pending[0].1.commit);
+
+        let snap = b.txn_state().unwrap().snapshot();
+        assert_eq!(
+            snap["tx-1"].state,
+            kaas_coordinator::TxnState::CompleteCommit
+        );
+        assert!(snap["tx-1"].partitions.is_empty());
     }
 
     #[tokio::test]
