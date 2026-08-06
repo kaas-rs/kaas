@@ -26,6 +26,7 @@ pub mod takeover;
 pub mod topic_config_defaults;
 pub mod topic_cr_writer;
 pub mod topic_registry;
+pub mod txn_markers;
 
 #[cfg(feature = "cr-writer")]
 pub use acl_cr_writer::KubeAclCRWriter;

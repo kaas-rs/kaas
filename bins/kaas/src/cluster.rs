@@ -233,12 +233,15 @@ pub fn install(
         mw_clone.run(mw_cancel).await;
     }));
 
-    // Txn-timeout reaper (gh #28). Walks every slot every 10 s,
-    // aborts Ongoing entries past their TransactionTimeoutMs.
+    // Txn-timeout reaper (gh #28) + marker reconcile (gh #225). Walks
+    // every slot every 10 s: prepares Ongoing entries past their
+    // TransactionTimeoutMs for abort, then drives every prepared
+    // transaction to Complete by placing its markers.
     let reaper_cancel = cancel.clone();
     let reaper_store = txn_state.clone();
+    let reaper_broker = broker.clone();
     tasks.push(tokio::spawn(async move {
-        run_txn_reaper(reaper_store, reaper_cancel).await;
+        run_txn_reaper(reaper_store, reaper_broker, reaper_cancel).await;
     }));
     let coordinator = match data_dir {
         None => {
@@ -475,7 +478,23 @@ impl MarkerApplier for BrokerMarkerApplier {
     }
 }
 
-async fn run_txn_reaper(store: Arc<TxnStateStore>, cancel: CancellationToken) {
+/// Timeout reaper + marker reconcile, on the same tick.
+///
+/// The reaper moves overdue `Ongoing` transactions to `PrepareAbort`
+/// (gh #28), and the reconcile then drives every `Prepare*` transaction
+/// to `Complete*` by placing its COMMIT / ABORT markers (gh #225).
+///
+/// They share a tick because they are two halves of one obligation.
+/// The reaper only ever *creates* marker debt — a timed-out
+/// transaction has no producer left to retry its `EndTxn`, so without
+/// the reconcile its partitions would keep a pinned LSO forever. The
+/// reconcile also covers the transactions the `EndTxn` handler left
+/// prepared because dispatch failed and the producer never came back.
+async fn run_txn_reaper(
+    store: Arc<TxnStateStore>,
+    broker: Arc<kaas_broker::broker::Broker>,
+    cancel: CancellationToken,
+) {
     let mut tick = tokio::time::interval(TXN_REAPER_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -493,7 +512,22 @@ async fn run_txn_reaper(store: Arc<TxnStateStore>, cancel: CancellationToken) {
                 if !aborted.is_empty() {
                     info!(
                         count = aborted.len(),
-                        "txn-timeout reaper aborted overdue Ongoing transactions"
+                        "txn-timeout reaper prepared overdue Ongoing transactions for abort"
+                    );
+                }
+                // Ungated like `abort_overdue` above — the known
+                // multi-broker sharp edge (see CLAUDE.md "gate the
+                // reaper"). Applying a marker twice is wasteful, not
+                // incorrect, so an N-way race here degrades to
+                // duplicate control batches rather than lost ones.
+                let completed = kaas_broker::txn_markers::reconcile_pending_markers(
+                    &broker, &store, None,
+                )
+                .await;
+                if completed > 0 {
+                    info!(
+                        count = completed,
+                        "txn marker reconcile completed prepared transactions"
                     );
                 }
             }

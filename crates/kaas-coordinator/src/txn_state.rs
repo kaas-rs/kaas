@@ -134,6 +134,21 @@ fn i32_is_zero(v: &i32) -> bool {
     *v == 0
 }
 
+/// One transaction still owing markers, as reported by
+/// [`TxnStateStore::pending_marker_dispatches`]. `epoch` is the
+/// entry's *current* epoch — for a reaper-prepared abort that is the
+/// already-bumped one, and it is what
+/// [`TxnStateStore::complete_end_txn`] validates against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMarkerDispatch {
+    pub txn_id: String,
+    pub pid: i64,
+    pub epoch: i16,
+    /// `true` for COMMIT, `false` for ABORT.
+    pub commit: bool,
+    pub partitions: Vec<TxnTopic>,
+}
+
 /// Side-effect record [`TxnStateStore::abort_overdue_owned`] returns
 /// per aborted txn — feeds metrics, the future cross-broker marker
 /// writer (gh #114), and tests.
@@ -641,10 +656,82 @@ impl TxnStateStore {
         self.abort_overdue_owned(now_ms, None)
     }
 
+    /// Every transaction sitting in `Prepare*` with partitions still
+    /// owed a COMMIT / ABORT marker (gh #225).
+    ///
+    /// This is the reconcile half of NFS-substrate rule 2. The retry
+    /// half — a producer re-sending `EndTxn` — only covers producers
+    /// that come back. A producer that crashed, gave up, or was fenced
+    /// leaves the transaction prepared forever, and every timed-out
+    /// transaction the reaper prepares has no producer to retry at all.
+    /// Something has to drive those to completion, or their partitions
+    /// keep a pinned LSO indefinitely.
+    ///
+    /// Entries with an empty partition list are skipped: there is
+    /// nothing to dispatch, and the caller's `complete_end_txn` closes
+    /// them out on the next pass anyway.
+    ///
+    /// `owns_txn` gates the sweep exactly as
+    /// [`Self::abort_overdue_owned`] does — a slot file has one legal
+    /// writer (NFS substrate rule 3), so a multi-broker deployment must
+    /// pass a real closure.
+    /// The `Sync` bound (unlike [`Self::abort_overdue_owned`]'s) is
+    /// what lets an async caller hold the closure across an await and
+    /// still have a `Send` future — the marker reconcile drives this
+    /// from a spawned task.
+    pub fn pending_marker_dispatches(
+        &self,
+        owns_txn: Option<&(dyn Fn(&str) -> bool + Sync)>,
+    ) -> Vec<PendingMarkerDispatch> {
+        let _guard = self.mu.lock();
+        let mut out = Vec::new();
+        for slot in 0..self.num_slots {
+            let state = match self.load_slot(slot) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for (txn_id, entry) in state {
+                let commit = match entry.state {
+                    TxnState::PrepareCommit => true,
+                    TxnState::PrepareAbort => false,
+                    _ => continue,
+                };
+                if entry.partitions.is_empty() {
+                    continue;
+                }
+                if let Some(owns) = owns_txn {
+                    if !owns(&txn_id) {
+                        continue;
+                    }
+                }
+                out.push(PendingMarkerDispatch {
+                    txn_id,
+                    pid: entry.pid,
+                    epoch: entry.epoch,
+                    commit,
+                    partitions: entry.partitions,
+                });
+            }
+        }
+        out
+    }
+
     /// Walk every slot, abort `Ongoing` entries past their
     /// `ongoing_since_ms + transaction_timeout_ms` deadline. gh #28.
     /// Bumps the producer epoch on abort so the next `InitProducerId`
     /// from the stuck client fences out via the gh #22 path.
+    ///
+    /// Lands the entry in **`PrepareAbort`, not `CompleteAbort`**, with
+    /// its partition and group lists intact (gh #225). A timed-out
+    /// transaction owes its partitions an ABORT marker exactly like a
+    /// client-driven abort does; completing it here would clear the
+    /// dispatch set with nothing written, leaving `read_committed`
+    /// consumers with a pinned LSO and no record that anything was
+    /// owed. [`Self::pending_marker_dispatches`] is what picks these up.
+    ///
+    /// The offset hook therefore fires in
+    /// [`Self::complete_end_txn`] rather than here, so staged offsets
+    /// are discarded on the same edge that writes the markers.
     ///
     /// `owns_txn` gates the sweep: when `Some`, only entries this
     /// broker is the coordinator for are touched (gh #91). When
@@ -656,7 +743,6 @@ impl TxnStateStore {
     ) -> Vec<TxnAbortRecord> {
         let _guard = self.mu.lock();
         let mut aborted = Vec::new();
-        let hook = self.hook.read().clone();
         for slot in 0..self.num_slots {
             let mut state = match self.load_slot(slot) {
                 Ok(s) => s,
@@ -689,24 +775,21 @@ impl TxnStateStore {
                 let groups = entry.groups.clone();
 
                 let mut updated = entry;
-                updated.state = TxnState::CompleteAbort;
-                updated.partitions.clear();
+                // PrepareAbort, not CompleteAbort: the partition and
+                // group lists stay so the marker reconcile can find
+                // them (gh #225). `complete_end_txn` clears them and
+                // fires the offset hook once the markers are durable.
+                updated.state = TxnState::PrepareAbort;
                 updated.ongoing_since_ms = 0;
                 updated.epoch = if updated.epoch == i16::MAX {
                     0
                 } else {
                     updated.epoch + 1
                 };
-                updated.groups.clear();
                 let new_epoch = updated.epoch;
                 state.insert(txn_id.clone(), updated);
                 changed = true;
 
-                if let Some(hook) = hook.as_ref() {
-                    for g in &groups {
-                        hook.on_end_txn(g, pid, false);
-                    }
-                }
                 aborted.push(TxnAbortRecord {
                     txn_id,
                     pid,
@@ -1252,12 +1335,45 @@ mod tests {
         assert_eq!(aborted[0].new_epoch, epoch + 1);
         assert_eq!(aborted[0].groups, vec!["g1".to_owned()]);
 
+        // gh #225: the reaper leaves the txn in PrepareAbort with its
+        // dispatch set intact — a timed-out txn owes ABORT markers just
+        // like a client-driven one. Completing here would drop the
+        // partition list with nothing written and pin the LSO.
         let snap = s.snapshot();
         let entry = &snap["tx-1"];
-        assert_eq!(entry.state, TxnState::CompleteAbort);
+        assert_eq!(entry.state, TxnState::PrepareAbort);
         assert_eq!(entry.epoch, epoch + 1);
+        assert_eq!(
+            entry.partitions,
+            vec![TxnTopic {
+                topic: "t".into(),
+                partitions: vec![0]
+            }],
+            "dispatch set must survive for the marker reconcile"
+        );
+        assert!(
+            hook.0.lock().is_empty(),
+            "offset hook fires on complete, not on the reaper's prepare"
+        );
+
+        // The reconcile finds it, and completing discards the staged
+        // offsets. Note the *bumped* epoch is what completes it.
+        let pending = s.pending_marker_dispatches(None);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].txn_id, "tx-1");
+        assert_eq!(pending[0].pid, pid);
+        assert_eq!(pending[0].epoch, epoch + 1);
+        assert!(!pending[0].commit, "timed-out txn aborts");
+
+        s.complete_end_txn("tx-1", pid, epoch + 1, false).unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap["tx-1"].state, TxnState::CompleteAbort);
+        assert!(snap["tx-1"].partitions.is_empty());
         let fired = hook.0.lock().clone();
         assert_eq!(fired, vec![("g1".to_owned(), pid, false)]);
+
+        // Nothing left owing once completed.
+        assert!(s.pending_marker_dispatches(None).is_empty());
     }
 
     #[test]
