@@ -731,12 +731,27 @@ impl Partition {
             }
 
             // Idempotence: classify before touching the log.
+            //
+            // `accepted` gates the window update below. Only an
+            // `Accept` may advance the dedupe window — that is
+            // `record_accepted`'s documented contract, and gh #195 was
+            // this call site breaking it. A COMMIT/ABORT marker carries
+            // a real PID with `base_sequence == -1`, so it classifies
+            // `NotIdempotent` (correctly exempt), but it was still
+            // recorded, pushing `{first_seq: -1, last_seq: -1}` onto the
+            // producer's window. The next data batch was then measured
+            // against `last_seq + 1 == 0`, so a producer continuing its
+            // sequence across a transaction boundary — which the Java
+            // producer always does — got OUT_OF_ORDER_SEQUENCE_NUMBER
+            // every time.
+            let mut accepted = false;
             if let Some(info) = prod_info {
                 match idempotence::classify(&guard.producer_states, info) {
                     Outcome::Duplicate { base_offset } => return Ok(base_offset),
                     Outcome::OutOfOrder => return Err(StorageError::OutOfOrderSequence),
                     Outcome::InvalidEpoch => return Err(StorageError::InvalidProducerEpoch),
-                    Outcome::Accept | Outcome::NotIdempotent => {}
+                    Outcome::Accept => accepted = true,
+                    Outcome::NotIdempotent => {}
                 }
             }
 
@@ -793,9 +808,13 @@ impl Partition {
             guard.pending_flush_records += advanced_records;
 
             // Record the idempotence outcome only after the log write
-            // succeeded (so a failed append doesn't poison the window).
-            if let Some(info) = prod_info {
-                idempotence::record_accepted(&mut guard.producer_states, info, assigned);
+            // succeeded (so a failed append doesn't poison the window),
+            // and only for an `Accept` (so a marker or a non-idempotent
+            // batch doesn't consume a sequence slot — gh #195).
+            if accepted {
+                if let Some(info) = prod_info {
+                    idempotence::record_accepted(&mut guard.producer_states, info, assigned);
+                }
             }
 
             // gh #176 — update the open + aborted-txn indexes off the
@@ -1621,6 +1640,26 @@ mod tests {
         Bytes::from(buf)
     }
 
+    /// As [`build_txn_data_batch`] but with an explicit base sequence,
+    /// so a test can continue a producer's sequence across a marker
+    /// the way a real transactional producer does.
+    fn build_txn_data_batch_seq(pid: i64, num_records: i32, base_seq: i32) -> Bytes {
+        let body_size = 49 + 16;
+        let total = 12 + body_size;
+        let mut buf = vec![0u8; total];
+        buf[0..8].copy_from_slice(&0i64.to_be_bytes());
+        let body_len_i32 = i32::try_from(body_size).unwrap();
+        buf[8..12].copy_from_slice(&body_len_i32.to_be_bytes());
+        buf[16] = 2;
+        buf[21..23].copy_from_slice(&0x0010i16.to_be_bytes());
+        let last_offset_delta = num_records - 1;
+        buf[23..27].copy_from_slice(&last_offset_delta.to_be_bytes());
+        buf[43..51].copy_from_slice(&pid.to_be_bytes());
+        buf[53..57].copy_from_slice(&base_seq.to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
+        Bytes::from(buf)
+    }
+
     /// Build a control batch (COMMIT or ABORT marker). attributes
     /// has bits 4 (transactional) | 5 (control) set; base_sequence
     /// = -1 so the idempotence classifier returns NotIdempotent
@@ -1640,6 +1679,51 @@ mod tests {
         buf[69] = if commit { 1 } else { 0 };
         crate::segment::stamp_crc(&mut buf);
         Bytes::from(buf)
+    }
+
+    /// gh #195: a transactional producer continues its sequence across
+    /// a COMMIT marker. The marker must not consume a sequence slot —
+    /// `classify` exempts it (`base_sequence == -1` → `NotIdempotent`),
+    /// but the append path recorded *every* batch into the dedupe
+    /// window, marker included. That pushed `{first_seq: -1, last_seq:
+    /// -1}` on, so the next data batch was measured against
+    /// `last_seq + 1 == 0` and anything else came back
+    /// OUT_OF_ORDER_SEQUENCE_NUMBER — at every transaction boundary.
+    #[test]
+    fn marker_does_not_consume_a_sequence_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            // Transaction 1: sequences 0..=9.
+            p.append(0, -1, build_txn_data_batch_seq(42, 10, 0))
+                .await
+                .expect("first txn batch accepted");
+            // COMMIT marker for the same PID.
+            p.append(0, -1, build_marker_batch(42, true))
+                .await
+                .expect("marker appended");
+
+            // Transaction 2 from the same producer session: the Java
+            // producer does NOT reset sequences across transactions, so
+            // this continues at 10.
+            let res = p.append(0, -1, build_txn_data_batch_seq(42, 10, 10)).await;
+            assert!(
+                res.is_ok(),
+                "post-marker batch must be accepted, got {:?} — the marker \
+                 consumed a sequence slot (gh #195)",
+                res.err()
+            );
+        });
     }
 
     #[test]
