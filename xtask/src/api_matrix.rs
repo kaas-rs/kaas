@@ -34,7 +34,8 @@ struct ApiDoc {
 /// (implemented + partial). Everything else in the tracked set links to
 /// the non-goals page.
 const KIPS_WITH_PAGES: &[u16] = &[
-    482, 516, 107, 195, 339, 546, 290, 800, 13, 371, 58, 354, 32, 98, 360, 447, // implemented
+    482, 516, 107, 195, 339, 546, 290, 800, 13, 371, 58, 354, 32, 98, 360, 447,
+    700, // implemented
     101, 219, 345, 394, 554, // partial
 ];
 
@@ -261,6 +262,12 @@ const API_DOCS: &[ApiDoc] = &[
         page: "acls-quotas",
         kips: &[546],
     },
+    ApiDoc {
+        key: 60,
+        name: "DescribeCluster",
+        page: "cluster-misc",
+        kips: &[700],
+    },
 ];
 
 /// Apache Kafka 3.7 surface kaas does not serve. `(key, name, note)` —
@@ -285,11 +292,6 @@ const GAPS: &[(i16, &str, &str)] = &[
         51,
         "AlterUserScramCredentials",
         "[KIP-554](kip/kip-554.md) partial — same as key 50. Open follow-up.",
-    ),
-    (
-        60,
-        "DescribeCluster",
-        "Not yet registered; AdminClient falls back to Metadata. Open follow-up.",
     ),
 ];
 

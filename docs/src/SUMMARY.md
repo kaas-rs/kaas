@@ -53,6 +53,7 @@
   - [KIP-516 — topic IDs (partial)](compat/kip/kip-516.md)
   - [KIP-546 — client-quota APIs](compat/kip/kip-546.md)
   - [KIP-554 — SCRAM admin API (partial)](compat/kip/kip-554.md)
+  - [KIP-700 — DescribeCluster](compat/kip/kip-700.md)
   - [KIP-800 — join/leave reasons](compat/kip/kip-800.md)
 - [Non-goals](compat/non-goals.md)
 - [Verification story](compat/verification.md)

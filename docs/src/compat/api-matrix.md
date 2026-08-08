@@ -4,7 +4,7 @@
 `cargo xtask check-docs-drift` (CI) fails when this file drifts from
 crates/kaas-codec/src/api/registry.rs. -->
 
-kaas registers **37 Kafka API keys**. This table is generated from the
+kaas registers **38 Kafka API keys**. This table is generated from the
 `ApiSpec` registry (`crates/kaas-codec/src/api/registry.rs`) — the same table
 that builds the ApiVersions response — so the version ranges below are the
 wire truth, not documentation aspiration. "Flexible" is the first version
@@ -49,6 +49,7 @@ using KIP-482 flexible encoding (see [Wire protocol & framing](wire-protocol.md)
 | 47 | OffsetDelete | v0–v0 | — | — | [OffsetDelete](api/consumer-groups.md#offsetdelete) |
 | 48 | DescribeClientQuotas | v0–v1 | v1+ | [KIP-546](kip/kip-546.md) | [DescribeClientQuotas](api/acls-quotas.md#describeclientquotas) |
 | 49 | AlterClientQuotas | v0–v1 | v1+ | [KIP-546](kip/kip-546.md) | [AlterClientQuotas](api/acls-quotas.md#alterclientquotas) |
+| 60 | DescribeCluster | v0–v1 | v0+ | [KIP-700](kip/kip-700.md) | [DescribeCluster](api/cluster-misc.md#describecluster) |
 
 ## Apache 3.7 keys kaas does not serve
 
@@ -62,7 +63,6 @@ follow-up or a documented [non-goal](non-goals.md):
 | 33 | AlterConfigs (legacy) | Superseded by [IncrementalAlterConfigs](api/topics-configs.md#incrementalalterconfigs) (key 44) but still served by Apache 3.7. Open follow-up. |
 | 50 | DescribeUserScramCredentials | [KIP-554](kip/kip-554.md) partial — credential rotation is operator-side only; no codec module, no dispatch. Open follow-up. |
 | 51 | AlterUserScramCredentials | [KIP-554](kip/kip-554.md) partial — same as key 50. Open follow-up. |
-| 60 | DescribeCluster | Not yet registered; AdminClient falls back to Metadata. Open follow-up. |
 
 Inter-broker/KRaft keys (LeaderAndIsr, StopReplica, UpdateMetadata,
 ControlledShutdown, the quorum/Envelope family), delegation-token keys, and

@@ -31,6 +31,7 @@ pub mod delete_records;
 pub mod delete_topics;
 pub mod describe_acls;
 pub mod describe_client_quotas;
+pub mod describe_cluster;
 pub mod describe_configs;
 pub mod describe_groups;
 pub mod describe_log_dirs;

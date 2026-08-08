@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use kaas_broker::{
-    ApiVersionsHandler, Broker, FetchHandler, InitProducerIdHandler, ListOffsetsHandler,
-    ListenerEntry, MetadataHandler, ProduceHandler, TopicMeta, TopicRegistry,
+    ApiVersionsHandler, Broker, DescribeClusterHandler, FetchHandler, InitProducerIdHandler,
+    ListOffsetsHandler, ListenerEntry, MetadataHandler, ProduceHandler, TopicMeta, TopicRegistry,
 };
 use kaas_codec::api::common::{
     write_array_len, write_nullable_bytes, write_nullable_str, write_str,
 };
-use kaas_codec::api::{fetch, metadata, produce};
+use kaas_codec::api::{describe_cluster, fetch, metadata, produce};
 use kaas_codec::headers::{encode_request_header, HeaderVersion};
 use kaas_codec::primitives::{write_i16, write_i32, write_i64, write_i8};
 use kaas_codec::tagged;
@@ -69,6 +69,12 @@ fn build_dispatcher(broker: Arc<Broker>, listeners: &[ListenerEntry]) -> Arc<Dis
         Arc::new(MetadataHandler::new(broker.clone(), listeners)),
     );
     d.register(18, 0, 4, Arc::new(ApiVersionsHandler::new()));
+    d.register(
+        60,
+        0,
+        1,
+        Arc::new(DescribeClusterHandler::new(broker.clone(), listeners)),
+    );
     d.register(22, 0, 4, Arc::new(InitProducerIdHandler::new(broker)));
     Arc::new(d)
 }
@@ -188,6 +194,29 @@ fn metadata_v9_request(topic: &str) -> Vec<u8> {
     body.to_vec()
 }
 
+/// DescribeCluster v1. Flexible from v0, so the request header is V2
+/// and the response header V1 — there is no legacy shape to fall back
+/// on, which makes this the one key where a wrong registry header entry
+/// misparses *every* request rather than only the new versions.
+fn describe_cluster_v1_request() -> Vec<u8> {
+    let mut body = BytesMut::new();
+    encode_request_header(
+        &mut body,
+        &RequestHeader {
+            api_key: 60,
+            api_version: 1,
+            correlation_id: 4,
+            client_id: Some("smoke".to_owned()),
+        },
+        HeaderVersion::V2,
+    )
+    .unwrap();
+    write_i8(&mut body, 1); // include_cluster_authorized_operations
+    write_i8(&mut body, describe_cluster::endpoint_type::BROKER);
+    tagged::write_empty(&mut body); // request tag
+    body.to_vec()
+}
+
 fn skip_response_header(body: &[u8], hv: HeaderVersion) -> &[u8] {
     // [correlation_id:i32][maybe tagged-fields uvarint=0]
     let mut off = 4;
@@ -247,6 +276,25 @@ async fn produce_fetch_metadata_roundtrip() {
     // production cli config will always carry concrete ports.
     assert_eq!(md.topics[0].name, topic);
     assert_eq!(md.topics[0].partitions.len(), 1);
+
+    // ---- DescribeCluster ----
+    let req = describe_cluster_v1_request();
+    let resp = send(&mut sock, &req).await;
+    let body = skip_response_header(&resp, HeaderVersion::V1); // flexible → V1 resp hdr
+    let mut buf = Bytes::copy_from_slice(body);
+    let dc = describe_cluster::decode_response(&mut buf, 1).unwrap();
+    assert_eq!(dc.error_code, 0, "describe cluster error: {dc:#?}");
+    assert_eq!(dc.cluster_id, "kaas-smoke");
+    assert_eq!(dc.brokers.len(), 1, "single broker advertised");
+    assert_eq!(dc.brokers[0].broker_id, md.brokers[0].node_id);
+    assert_eq!(
+        dc.controller_id, md.controller_id,
+        "the two discovery APIs must name the same controller"
+    );
+    assert!(
+        dc.cluster_authorized_operations > 0,
+        "asked for authorized ops under the default allow-all authorizer"
+    );
 
     // ---- Produce ----
     let batch = build_record_batch(3, 1_700_000_000_000);

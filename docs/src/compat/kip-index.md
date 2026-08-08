@@ -20,7 +20,7 @@ silence. Wire-facing KIPs also appear per key in the
 > are config plumbing without an enforcing compactor — no background
 > cleaner runs at all.
 
-## Implemented (12)
+## Implemented (13)
 
 | KIP | What it is | kaas page |
 |---|---|---|
@@ -35,6 +35,7 @@ silence. Wire-facing KIPs also appear per key in the
 | KIP-447 | EOS v2: producer-scalable transactional offsets | [KIP-447](kip/kip-447.md) |
 | KIP-482 | Flexible versions + tagged fields | [KIP-482](kip/kip-482.md) |
 | KIP-546 | Client-quota admin APIs (keys 48/49) | [KIP-546](kip/kip-546.md) |
+| KIP-700 | `DescribeCluster` admin API (key 60) | [KIP-700](kip/kip-700.md) |
 | KIP-800 | Join/leave reason strings | [KIP-800](kip/kip-800.md) |
 
 ## Partial (9)

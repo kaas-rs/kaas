@@ -20,8 +20,19 @@ required=(
   CreateTopics DeleteTopics InitProducerId
   DescribeConfigs DescribeCluster
 )
+# The name alone proves nothing: for a key the broker does NOT serve,
+# the Java tool still prints a line — "DescribeCluster(60): UNSUPPORTED"
+# — because it enumerates every API the *client* knows. Matching the
+# name and stopping there is what let key 60 sit unregistered through a
+# green run of this script. Require a version range on the line.
 for api in "${required[@]}"; do
-  echo "$out" | grep -qE "^[[:space:]]*$api\b" || { echo "FAIL: $api not advertised" >&2; exit 1; }
+  # `|| true`: under `set -euo pipefail` a non-matching grep would
+  # abort the script before the FAIL line below ever prints.
+  line=$(echo "$out" | grep -E "^[[:space:]]*$api\(" | head -1 || true)
+  [ -n "$line" ] || { echo "FAIL: $api not advertised" >&2; exit 1; }
+  case "$line" in
+    *UNSUPPORTED*) echo "FAIL: $api advertised as UNSUPPORTED: $line" >&2; exit 1 ;;
+  esac
 done
 
 # gh #1 cross-client check: usable-version negotiation. Each line in

@@ -51,6 +51,9 @@ use parking_lot::Mutex;
 
 use crate::broker::Broker;
 use crate::cli::ListenerEntry;
+use crate::listener_advert::{
+    advertised_brokers, controller_id, trailing_ordinal, ListenerAdverts,
+};
 use crate::topic_cr_writer::TopicWriteError;
 
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
@@ -66,19 +69,10 @@ fn is_reserved_internal(name: &str) -> bool {
     name.starts_with("__")
 }
 
-/// Per-listener advertised endpoint precomputed at handler-build
-/// time. Keyed by the listener `name` stored on each connection.
-#[derive(Debug, Clone)]
-struct ListenerAdvert {
-    name: String,
-    host: String,
-    port: i32,
-}
-
 #[derive(Debug)]
 pub struct MetadataHandler {
     broker: Arc<Broker>,
-    listeners: Vec<ListenerAdvert>,
+    listeners: ListenerAdverts,
     /// Apache `auto.create.topics.enable` (gh #242). Off unless
     /// [`with_auto_create`](Self::with_auto_create) says otherwise, so
     /// tests and dev-mode wiring keep the plain
@@ -92,10 +86,9 @@ pub struct MetadataHandler {
 
 impl MetadataHandler {
     pub fn new(broker: Arc<Broker>, listeners: &[ListenerEntry]) -> Self {
-        let listeners = listeners.iter().map(advert_from).collect();
         Self {
             broker,
-            listeners,
+            listeners: ListenerAdverts::new(listeners),
             auto_create: false,
             num_partitions: 1,
         }
@@ -153,64 +146,6 @@ impl MetadataHandler {
             }
         }
     }
-
-    fn advert_for(&self, listener_name: &str) -> ListenerAdvert {
-        self.listeners
-            .iter()
-            .find(|l| l.name == listener_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                // The connection's listener tag didn't match any
-                // configured entry — should only happen with a
-                // programming error in main.rs. Fall back to the
-                // first listener so the response is still well-formed.
-                self.listeners.first().cloned().unwrap_or(ListenerAdvert {
-                    name: "internal".to_owned(),
-                    host: "127.0.0.1".to_owned(),
-                    port: 9092,
-                })
-            })
-    }
-}
-
-fn self_broker_row(node_id: i32, advert: &ListenerAdvert) -> metadata::Broker {
-    metadata::Broker {
-        node_id,
-        host: advert.host.clone(),
-        port: advert.port,
-        rack: None,
-    }
-}
-
-/// `"kaas-2"` → `2`. Broker identity strings carry the ordinal as
-/// the trailing hyphen segment (StatefulSet pod-name shape); a
-/// malformed id yields `None` and the caller falls back to self.
-fn trailing_ordinal(id: &str) -> Option<i32> {
-    id.rsplit('-').next()?.parse().ok()
-}
-
-fn advert_from(entry: &ListenerEntry) -> ListenerAdvert {
-    // Best-effort parse: bad addrs (which shouldn't occur — `Cli`
-    // validates earlier) degrade to localhost:9092 so the Metadata
-    // response stays well-formed.
-    let addr: std::net::SocketAddr = entry
-        .addr
-        .parse()
-        .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9092)));
-    let port = i32::from(addr.port());
-    let host = match entry.advertised_host.as_deref() {
-        Some(h) if !h.is_empty() => h.to_owned(),
-        // 0.0.0.0 is a wildcard bind, not a routable target.
-        // For dev clients connecting on the same box, localhost is
-        // the right echo.
-        _ if addr.ip().is_unspecified() => "127.0.0.1".to_owned(),
-        _ => addr.ip().to_string(),
-    };
-    ListenerAdvert {
-        name: entry.name.clone(),
-        host,
-        port,
-    }
 }
 
 #[async_trait]
@@ -230,49 +165,30 @@ impl Handler for MetadataHandler {
                 c.principal.clone().unwrap_or_else(Principal::anonymous),
             )
         };
-        let advert = self.advert_for(&listener_name);
+        let advert = self.listeners.for_listener(&listener_name);
 
-        // Cluster mode: advertise the live broker set. Peers run the
-        // same chart, so each peer is advertised at its stable FQDN
-        // with the port of the listener this client connected on
-        // (gh #125 symmetry). Self keeps the listener's own
-        // advertised host so external hostname templates still win.
+        // Cluster mode: advertise the live broker set, each peer at
+        // its stable FQDN with the port of the listener this client
+        // connected on (gh #125 symmetry). DescribeCluster (key 60)
+        // shares this catalog — see `crate::listener_advert`.
         // (External per-broker hostname templates for peers are a
         // follow-up — the external listener ships disabled.)
-        let brokers = match self.broker.broker_view() {
-            Some(view) => {
-                let mut v: Vec<metadata::Broker> = view
-                    .brokers()
-                    .into_iter()
-                    .map(|b| metadata::Broker {
-                        node_id: b.node_id,
-                        host: if b.node_id == self.broker.broker_id {
-                            advert.host.clone()
-                        } else {
-                            b.host
-                        },
-                        port: advert.port,
-                        rack: None,
-                    })
-                    .collect();
-                if v.is_empty() {
-                    v.push(self_broker_row(self.broker.broker_id, &advert));
-                }
-                v
-            }
-            None => vec![self_broker_row(self.broker.broker_id, &advert)],
-        };
+        let brokers: Vec<metadata::Broker> = advertised_brokers(&self.broker, &advert)
+            .into_iter()
+            .map(|b| metadata::Broker {
+                node_id: b.node_id,
+                host: b.host,
+                port: b.port,
+                rack: None,
+            })
+            .collect();
 
         // Per-partition leader from the applied assignment; self
         // when no coordinator is wired (dev) or the partition is
         // missing from the assignment (fresh topic, next recompute
         // pending).
         let coord = self.broker.coordinator();
-        let controller_id = coord
-            .as_ref()
-            .and_then(|c| c.snapshot())
-            .and_then(|a| trailing_ordinal(&a.controller))
-            .unwrap_or(self.broker.broker_id);
+        let controller_id = controller_id(&self.broker);
 
         // If the request topic list is empty, return every known topic
         // (Apache: an empty list means "all topics"). If non-empty,

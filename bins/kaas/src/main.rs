@@ -39,12 +39,13 @@ use kaas_broker::{
     AlterReplicaLogDirsHandler, ApiVersionsHandler, Broker, Cli, CliTlsConfig, CreateAclsHandler,
     CreatePartitionsHandler, CreateTopicsHandler, DeleteAclsHandler, DeleteGroupsHandler,
     DeleteRecordsHandler, DeleteTopicsHandler, DescribeAclsHandler, DescribeClientQuotasHandler,
-    DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler, EndTxnHandler,
-    FetchHandler, FindCoordinatorHandler, HeartbeatHandler, IncrementalAlterConfigsHandler,
-    InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler, ListGroupsHandler,
-    ListOffsetsHandler, ListenerEntry, MetadataHandler, OffsetCommitHandler, OffsetDeleteHandler,
-    OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler, SaslHandshakeHandler,
-    SyncGroupHandler, TopicRegistry, TxnOffsetCommitHandler, WriteTxnMarkersHandler,
+    DescribeClusterHandler, DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler,
+    EndTxnHandler, FetchHandler, FindCoordinatorHandler, HeartbeatHandler,
+    IncrementalAlterConfigsHandler, InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler,
+    ListGroupsHandler, ListOffsetsHandler, ListenerEntry, MetadataHandler, OffsetCommitHandler,
+    OffsetDeleteHandler, OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler,
+    SaslHandshakeHandler, SyncGroupHandler, TopicRegistry, TxnOffsetCommitHandler,
+    WriteTxnMarkersHandler,
 };
 use kaas_protocol::{Dispatcher, ListenerConfig, MtlsConfig, Server, ServerConfigBuilder};
 use kaas_storage::{DiskStorageEngine, MemoryStorage, PartitionConfig, RealFs, StorageEngine};
@@ -864,6 +865,15 @@ fn build_dispatcher(
         0,
         4,
         Arc::new(DescribeLogDirsHandler::new(broker.clone())),
+    );
+    // KIP-700: what AdminClient.describeCluster() calls. Shares the
+    // Metadata handler's listener table so both advertise the same
+    // endpoints (gh #125).
+    d.register(
+        60,
+        0,
+        1,
+        Arc::new(DescribeClusterHandler::new(broker.clone(), listeners)),
     );
     d.register(17, 0, 1, Arc::new(SaslHandshakeHandler::new()));
     d.register(18, 0, 4, Arc::new(ApiVersionsHandler::new()));

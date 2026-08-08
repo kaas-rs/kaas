@@ -72,6 +72,8 @@ pub const ALL: &[ApiSpec] = &[
     crate::api::delete_acls::SPEC,
     crate::api::alter_replica_log_dirs::SPEC,
     crate::api::describe_log_dirs::SPEC,
+    // KIP-700 cluster describe
+    crate::api::describe_cluster::SPEC,
 ];
 
 /// Look up the [`ApiSpec`] for a given API key, if registered.
@@ -117,15 +119,16 @@ mod tests {
         // key 19 (CreateTopics) once the scripts smoke started
         // needing it. gh #152 added the
         // admin keys 20, 21, 29, 30, 31, 35 (DeleteTopics,
-        // DeleteRecords, the ACL trio, DescribeLogDirs).
-        assert_eq!(ALL.len(), 37);
+        // DeleteRecords, the ACL trio, DescribeLogDirs). Key 60
+        // (DescribeCluster, KIP-700) followed.
+        assert_eq!(ALL.len(), 38);
         let mut keys: Vec<i16> = ALL.iter().map(|s| s.key).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
             vec![
                 0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26,
-                27, 28, 29, 30, 31, 32, 34, 35, 36, 37, 42, 44, 47, 48, 49,
+                27, 28, 29, 30, 31, 32, 34, 35, 36, 37, 42, 44, 47, 48, 49, 60,
             ]
         );
     }

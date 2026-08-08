@@ -18,6 +18,7 @@ pub mod group_hash;
 pub mod group_takeover;
 pub mod handlers;
 pub mod heartbeat_client;
+pub mod listener_advert;
 pub mod local_lease;
 pub mod marker_watcher;
 pub mod producer_id;
@@ -52,9 +53,9 @@ pub use handlers::{
     migrate_partition, AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, AlterClientQuotasHandler,
     AlterReplicaLogDirsHandler, ApiVersionsHandler, CreateAclsHandler, CreatePartitionsHandler,
     CreateTopicsHandler, DeleteAclsHandler, DeleteGroupsHandler, DeleteRecordsHandler,
-    DeleteTopicsHandler, DescribeAclsHandler, DescribeClientQuotasHandler, DescribeConfigsHandler,
-    DescribeGroupsHandler, DescribeLogDirsHandler, EndTxnHandler, FetchHandler,
-    FindCoordinatorHandler, HeartbeatHandler, IncrementalAlterConfigsHandler,
+    DeleteTopicsHandler, DescribeAclsHandler, DescribeClientQuotasHandler, DescribeClusterHandler,
+    DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler, EndTxnHandler,
+    FetchHandler, FindCoordinatorHandler, HeartbeatHandler, IncrementalAlterConfigsHandler,
     InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler, ListGroupsHandler,
     ListOffsetsHandler, MetadataHandler, OffsetCommitHandler, OffsetDeleteHandler,
     OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler, SaslHandshakeHandler,

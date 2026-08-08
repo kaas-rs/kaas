@@ -13,7 +13,7 @@ guessed.
 **Handling**: the response is built directly from the codec's `ApiSpec`
 registry — the same table that generates the
 [API support matrix](../api-matrix.md) — so the advertised surface is the wire
-truth by construction: 36 keys, sorted, deduplicated (a registry test asserts
+truth by construction: 38 keys, sorted, deduplicated (a registry test asserts
 both). The API is on the pre-auth allowlist, so it works before SASL
 completes. Two protocol subtleties are implemented faithfully:
 
@@ -50,6 +50,61 @@ API set is advertised and that every advertised range overlaps the Java
 client's — any `[usable: -1]` line fails the run); handler and codec
 round-trip tests in the source files above; dispatcher clamp tests in
 `crates/kaas-protocol/src/dispatch.rs`.
+
+## DescribeCluster
+
+What `AdminClient.describeCluster()` calls: cluster id, controller, and the
+live broker set — the same three facts Metadata carries, without the per-topic
+payload. `kafka-cluster.sh cluster-id` and most UIs' cluster panes land here.
+
+**Versions**: v0–v1 (flexible from v0 — this API postdates
+[KIP-482](../kip/kip-482.md), so there is no legacy encoding). Apache 3.7 stops
+at v1; v2 (`IncludeFencedBrokers`, KIP-1073) is 4.x.
+
+**Handling**: broker rows come from the same catalog Metadata advertises, so
+both APIs answer with the port of the listener the request arrived on, peers at
+their stable per-broker DNS name, and self at its own advertised host. A client
+that reached one API on the authed listener is never handed the anonymous port
+by the other. The controller is the broker holding the `kaas-controller` Lease,
+read from the applied `assignment.json`.
+
+The API itself is not authorization-gated — Apache answers the broker list to
+any authenticated principal. The optional `ClusterAuthorizedOperations`
+bitfield is: it needs `Describe` on the cluster resource, and then each
+supported operation is evaluated in turn. Three distinct answers, which clients
+read differently: `-2147483648` when the client didn't ask, `0` when it asked
+but lacks `Describe`, and the computed bitfield otherwise.
+
+kaas serves broker endpoints only — controller election runs on a Kubernetes
+Lease rather than a KRaft quorum (see [Non-goals](../non-goals.md)) — so a v1
+request for the controller endpoint type gets `MISMATCHED_ENDPOINT_TYPE` (114)
+and any other value `UNSUPPORTED_ENDPOINT_TYPE` (115), mirroring Apache. v0
+carries no endpoint-type field, so neither error can reach a v0 client.
+
+**Deviations from Apache 3.7**:
+
+- The `ClusterAuthorizedOperations` bitfield never sets the `ClusterAction` or
+  `IdempotentWrite` bits. Apache lists both as cluster-scoped operations; kaas
+  models neither — there is no Kafka-RPC inter-broker surface for
+  `ClusterAction` to guard (peers talk gRPC heartbeats), and idempotent produce
+  is gated by `Write` on the topic rather than by a cluster-level grant.
+  Reporting a bit the authorizer cannot evaluate would be a guess.
+- `Rack` is always null — kaas has no rack awareness (it has no replicas to
+  place).
+- `ControllerId` falls back to *this* broker when no assignment has been
+  applied yet, where Apache would answer `-1`. Every kaas broker serves the same
+  admin surface, so a client that dials the answer always reaches something
+  that can serve it.
+
+**Source**: `crates/kaas-broker/src/handlers/describe_cluster.rs`,
+`crates/kaas-broker/src/listener_advert.rs` (the catalog shared with Metadata),
+`crates/kaas-codec/src/api/describe_cluster.rs`.
+
+**Verified by**: `scripts/kafka-cluster.sh` (cluster-id round trip plus an
+`AdminClient.describeCluster()` call through `kafka-broker-api-versions`);
+handler tests in the source file above; the DescribeCluster leg of
+`bins/kaas/tests/smoke.rs`, which drives the flexible-from-v0 header path
+through the real dispatcher.
 
 ## DescribeLogDirs
 
