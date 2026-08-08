@@ -48,6 +48,19 @@ message BrokerStatus {
   // false, which is the safe reading for an old client that never sets
   // it (treated as not-alive → its partitions move).
   bool healthy = 6;
+
+  // gh #249: has this broker begun a graceful shutdown? Set once
+  // SIGTERM lands, before partitions are relinquished, so the
+  // controller can move work off proactively instead of waiting for
+  // the heartbeat to time out. The controller drops a draining broker
+  // from the alive set (its partitions and groups move now) but keeps
+  // it in the assignment's broker list marked `draining`, which is
+  // what holds the coordinator-hash divisor stable.
+  //
+  // Distinct from healthy=false: a draining broker is working
+  // normally and still serving, it is simply leaving. Proto3 default
+  // is false, the correct reading for a broker that never sets it.
+  bool draining = 7;
 }
 
 message PartitionStatus {

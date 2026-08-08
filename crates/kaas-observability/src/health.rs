@@ -330,6 +330,29 @@ pub fn main_alive() -> bool {
     last > 0 && (mono_ms() - last) < MAIN_LIVENESS_THRESHOLD_MS
 }
 
+/// Set once SIGTERM lands (gh #249). Latching, never cleared: a
+/// broker that has begun shutting down never un-begins.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Announce that this broker is shutting down gracefully. Called from
+/// the SIGTERM path **before** partitions are relinquished, so the
+/// next heartbeat carries it and the controller can move work off
+/// proactively rather than waiting out a heartbeat timeout.
+///
+/// Deliberately not wired into `/readyz`: readiness is about whether
+/// this broker can serve the request in front of it, and a draining
+/// broker still can until its listeners close. Kubernetes already
+/// removes a terminating pod's endpoint.
+pub fn mark_draining() {
+    DRAINING.store(true, Ordering::SeqCst);
+}
+
+/// Has this broker begun a graceful shutdown?
+#[must_use]
+pub fn is_draining() -> bool {
+    DRAINING.load(Ordering::SeqCst)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

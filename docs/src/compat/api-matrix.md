@@ -49,7 +49,7 @@ using KIP-482 flexible encoding (see [Wire protocol & framing](wire-protocol.md)
 | 47 | OffsetDelete | v0–v0 | — | — | [OffsetDelete](api/consumer-groups.md#offsetdelete) |
 | 48 | DescribeClientQuotas | v0–v1 | v1+ | [KIP-546](kip/kip-546.md) | [DescribeClientQuotas](api/acls-quotas.md#describeclientquotas) |
 | 49 | AlterClientQuotas | v0–v1 | v1+ | [KIP-546](kip/kip-546.md) | [AlterClientQuotas](api/acls-quotas.md#alterclientquotas) |
-| 60 | DescribeCluster | v0–v1 | v0+ | [KIP-700](kip/kip-700.md) | [DescribeCluster](api/cluster-misc.md#describecluster) |
+| 60 | DescribeCluster | v0–v2 | v0+ | [KIP-700](kip/kip-700.md) | [DescribeCluster](api/cluster-misc.md#describecluster) |
 
 ## Apache 3.7 keys kaas does not serve
 

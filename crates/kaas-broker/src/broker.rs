@@ -24,19 +24,31 @@ use crate::coordinator::Coordinator;
 use crate::local_lease::LocalLeaseManager;
 use crate::topic_registry::TopicRegistry;
 
-/// One row of the live cluster broker catalog served by Metadata.
+/// One row of the live cluster broker catalog served by Metadata and
+/// DescribeCluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerNode {
     pub node_id: i32,
     /// Stable per-broker DNS name (StatefulSet FQDN in cluster mode).
     pub host: String,
     pub port: i32,
+    /// gh #249: registered but not serving. Metadata omits these
+    /// rows; DescribeCluster v2 reports them as `IsFenced`. Always
+    /// false in dev/single-broker mode, where the only broker is
+    /// self and self is never fenced.
+    pub fenced: bool,
 }
 
-/// Live cluster broker catalog for the Metadata response — backed
-/// by the EndpointSlice registry in cluster mode. Defined here (not
-/// kaas-k8s) because the dependency arrow points kaas-k8s → kaas-broker;
-/// the broker binary supplies the registry-backed impl.
+/// Live cluster broker catalog — backed by the EndpointSlice registry
+/// in cluster mode. Defined here (not kaas-k8s) because the dependency
+/// arrow points kaas-k8s → kaas-broker; the broker binary supplies the
+/// registry-backed impl.
+///
+/// Returns **registered** brokers, fenced ones included and flagged
+/// (gh #249). Filtering is the caller's call, because the two
+/// consumers want opposite things: Metadata must not advertise a
+/// broker that isn't serving, DescribeCluster v2 exists precisely to
+/// report it.
 pub trait ClusterBrokerView: Send + Sync {
     fn brokers(&self) -> Vec<BrokerNode>;
 }

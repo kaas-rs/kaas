@@ -1,6 +1,6 @@
 //! DescribeCluster — API key 60 ([KIP-700]).
 //!
-//! Versions 0..=1, matching Apache 3.7's served range:
+//! Versions 0..=2:
 //!
 //! - v0 — flexible from the first version (this API postdates
 //!   KIP-482 entirely, so there is no legacy encoding to support).
@@ -8,9 +8,17 @@
 //!   `1` = brokers, `2` = controllers), and makes
 //!   `MISMATCHED_ENDPOINT_TYPE` / `UNSUPPORTED_ENDPOINT_TYPE` valid
 //!   top-level error codes.
+//! - v2 — adds `IncludeFencedBrokers` to the request and `IsFenced`
+//!   per broker row (KIP-1073).
 //!
-//! Apache 3.7 stops at v1; v2 (`IncludeFencedBrokers` / `IsFenced`,
-//! KIP-1073) is 4.x and out of the parity target.
+//! **v2 is a deliberate exception to the Apache 3.7 parity target**
+//! (it is 4.0 surface), taken with gh #249 because kaas grew a real
+//! fenced state and had no way to report it: a broker that exists but
+//! isn't serving is simply absent from Metadata, so a degraded
+//! cluster is indistinguishable from a smaller one. Serving v2 also
+//! means clients that ask for fenced brokers — which several do
+//! unconditionally — negotiate a version where the field is legal
+//! instead of failing to encode their own request.
 //!
 //! The response's `ClusterAuthorizedOperations` is a 32-bit field of
 //! `1 << AclOperation.code` bits. `-2147483648` (`i32::MIN`) is the
@@ -33,7 +41,7 @@ use crate::primitives::{
 use crate::tagged;
 use crate::Bytes;
 
-pub const VERSIONS: (i16, i16) = (0, 1);
+pub const VERSIONS: (i16, i16) = (0, 2);
 /// Flexible from the very first version — no legacy branch anywhere in
 /// this module.
 pub const MIN_FLEXIBLE: i16 = 0;
@@ -73,6 +81,10 @@ pub struct Request {
     /// v1+; v0 requests carry no field and decode to the schema default
     /// [`endpoint_type::BROKER`], so a v0 client can never mismatch.
     pub endpoint_type: i8,
+    /// v2+ (KIP-1073). Below v2 there is no way to ask, so fenced
+    /// brokers are always omitted — which is also Apache's answer
+    /// when the flag is false.
+    pub include_fenced_brokers: bool,
 }
 
 impl Default for Request {
@@ -80,6 +92,7 @@ impl Default for Request {
         Self {
             include_cluster_authorized_operations: false,
             endpoint_type: endpoint_type::BROKER,
+            include_fenced_brokers: false,
         }
     }
 }
@@ -118,6 +131,9 @@ pub struct Broker {
     pub host: String,
     pub port: i32,
     pub rack: Option<String>,
+    /// v2+ (KIP-1073): registered but not serving. Dropped from the
+    /// encoding below v2, where a fenced broker is simply not listed.
+    pub is_fenced: bool,
 }
 
 pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecError> {
@@ -127,10 +143,12 @@ pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecErr
     } else {
         endpoint_type::BROKER
     };
+    let include_fenced_brokers = if version >= 2 { read_bool(buf)? } else { false };
     tagged::read(buf)?;
     Ok(Request {
         include_cluster_authorized_operations,
         endpoint_type,
+        include_fenced_brokers,
     })
 }
 
@@ -138,6 +156,9 @@ pub fn encode_request(buf: &mut BytesMut, req: &Request, version: i16) -> Result
     write_bool(buf, req.include_cluster_authorized_operations);
     if version >= 1 {
         write_i8(buf, req.endpoint_type);
+    }
+    if version >= 2 {
+        write_bool(buf, req.include_fenced_brokers);
     }
     tagged::write_empty(buf);
     Ok(())
@@ -163,6 +184,9 @@ pub fn encode_response(
         write_str(buf, &b.host, FLEX)?;
         write_i32(buf, b.port);
         write_nullable_str(buf, b.rack.as_deref(), FLEX)?;
+        if version >= 2 {
+            write_bool(buf, b.is_fenced);
+        }
         tagged::write_empty(buf);
     }
     write_i32(buf, resp.cluster_authorized_operations);
@@ -189,12 +213,14 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
         let host = read_str(buf, FLEX)?;
         let port = read_i32(buf)?;
         let rack = read_nullable_str(buf, FLEX)?;
+        let is_fenced = if version >= 2 { read_bool(buf)? } else { false };
         tagged::read(buf)?;
         brokers.push(Broker {
             broker_id,
             host,
             port,
             rack,
+            is_fenced,
         });
     }
     let cluster_authorized_operations = read_i32(buf)?;
@@ -219,6 +245,7 @@ mod tests {
         let req = Request {
             include_cluster_authorized_operations: true,
             endpoint_type: endpoint_type::BROKER,
+            include_fenced_brokers: version >= 2,
         };
         let mut w = BytesMut::new();
         encode_request(&mut w, &req, version).unwrap();
@@ -240,12 +267,14 @@ mod tests {
                     host: "kaas-0.kaas-brokers".into(),
                     port: 9092,
                     rack: None,
+                    is_fenced: false,
                 },
                 Broker {
                     broker_id: 1,
                     host: "kaas-1.kaas-brokers".into(),
                     port: 9092,
                     rack: Some("zone-a".into()),
+                    is_fenced: version >= 2,
                 },
             ],
             cluster_authorized_operations: 0b1010,
@@ -276,6 +305,7 @@ mod tests {
             &Request {
                 include_cluster_authorized_operations: false,
                 endpoint_type: endpoint_type::CONTROLLER,
+                include_fenced_brokers: false,
             },
             0,
         )
@@ -294,6 +324,7 @@ mod tests {
             &Request {
                 include_cluster_authorized_operations: false,
                 endpoint_type: endpoint_type::CONTROLLER,
+                include_fenced_brokers: false,
             },
             1,
         )
@@ -303,6 +334,48 @@ mod tests {
             decode_request(&mut r, 1).unwrap().endpoint_type,
             endpoint_type::CONTROLLER
         );
+    }
+
+    /// The KIP-1073 fields are v2-only on both sides: below v2 they
+    /// must vanish from the encoding entirely rather than shift the
+    /// following bytes. A fenced broker is simply not listed there.
+    #[test]
+    fn fenced_fields_are_v2_gated() {
+        let resp = Response {
+            cluster_id: "kaas-dev".into(),
+            brokers: vec![Broker {
+                broker_id: 1,
+                host: "kaas-1".into(),
+                port: 9092,
+                rack: None,
+                is_fenced: true,
+            }],
+            ..Default::default()
+        };
+        for v in [0, 1] {
+            let mut w = BytesMut::new();
+            encode_response(&mut w, &resp, v).unwrap();
+            let got = decode_response(&mut w.freeze(), v).unwrap();
+            assert!(!got.brokers[0].is_fenced, "v{v} carries no IsFenced");
+        }
+        let mut w = BytesMut::new();
+        encode_response(&mut w, &resp, 2).unwrap();
+        let got = decode_response(&mut w.freeze(), 2).unwrap();
+        assert!(got.brokers[0].is_fenced);
+
+        // Request side: the flag only exists at v2.
+        let req = Request {
+            include_fenced_brokers: true,
+            ..Default::default()
+        };
+        let mut w = BytesMut::new();
+        encode_request(&mut w, &req, 1).unwrap();
+        let got = decode_request(&mut w.freeze(), 1).unwrap();
+        assert!(!got.include_fenced_brokers);
+        let mut w = BytesMut::new();
+        encode_request(&mut w, &req, 2).unwrap();
+        let got = decode_request(&mut w.freeze(), 2).unwrap();
+        assert!(got.include_fenced_brokers);
     }
 
     /// `i32::MIN` is the "client didn't ask" sentinel and must survive

@@ -208,4 +208,58 @@ mod tests {
         assert!(!alive["kaas-1"]);
         assert!(!alive["kaas-2"]);
     }
+
+    /// gh #249 end-to-end: the tri-state exists so that losing a
+    /// broker doesn't rehash every coordinator. This is the payoff
+    /// the `group_hash` divisor rule promises, exercised through the
+    /// real `broker_sets` → `pick_coordinator` chain — a path that
+    /// never ran against a non-`Alive` entry before, because nothing
+    /// produced one.
+    #[test]
+    fn a_dead_broker_moves_only_its_own_groups() {
+        use crate::group_hash::pick_group_coordinator;
+
+        let entry = |id: &str, health| BrokerAssignment {
+            id: id.to_owned(),
+            health,
+            last_seen: "x".to_owned(),
+        };
+        let assignment = |third_health| Assignment {
+            controller_epoch: 1,
+            assignment_version: 1,
+            generated_at: "x".to_owned(),
+            controller: "kaas-0".to_owned(),
+            brokers: vec![
+                entry("kaas-0", BrokerHealth::Alive),
+                entry("kaas-1", BrokerHealth::Alive),
+                entry("kaas-2", third_health),
+            ],
+            partitions: vec![],
+            consumer_groups: vec![],
+        };
+
+        let (b_ok, alive_ok) = assignment(BrokerHealth::Alive).broker_sets();
+        let (b_dead, alive_dead) = assignment(BrokerHealth::Dead).broker_sets();
+
+        let mut moved = 0;
+        for i in 0..200 {
+            let g = format!("group-{i}");
+            let before = pick_group_coordinator(&g, &b_ok, &alive_ok).unwrap();
+            let after = pick_group_coordinator(&g, &b_dead, &alive_dead).unwrap();
+            if before != after {
+                moved += 1;
+                // Only groups that lived on the dead broker move, and
+                // they never move back onto it.
+                assert_eq!(before, "kaas-2");
+                assert_ne!(after, "kaas-2");
+            }
+        }
+        // ~1/3 of groups hashed to kaas-2; the other ~2/3 must not
+        // have budged. Dropping the dead broker from the list instead
+        // would have rehashed ~2/3 of everything.
+        assert!(
+            (40..=90).contains(&moved),
+            "expected only kaas-2's share to move, got {moved}/200"
+        );
+    }
 }

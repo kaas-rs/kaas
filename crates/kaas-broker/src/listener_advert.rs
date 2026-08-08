@@ -86,16 +86,24 @@ fn advert_from(entry: &ListenerEntry) -> ListenerAdvert {
 
 /// The broker catalog to advertise on `advert`'s listener.
 ///
-/// Cluster mode returns the live broker set; dev/single-broker mode (no
-/// installed view) returns self only. An installed-but-empty view also
+/// Cluster mode returns the registered broker set with each row's
+/// `fenced` flag (gh #249); dev/single-broker mode (no installed
+/// view) returns self only. A view that yields no *servable* row
 /// degrades to self: the cluster runtime is up but the endpoint watch
-/// hasn't delivered yet, and an empty broker list would leave a client
-/// with nowhere to go.
+/// hasn't delivered yet, or every peer is fenced, and either way a
+/// client needs somewhere to go.
+///
+/// Self is force-unfenced. This broker is answering the request, so a
+/// stale not-ready reading of its own endpoint — a readiness blip, or
+/// the boot window before takeover completes — must not make it
+/// advertise itself as unavailable.
 pub fn advertised_brokers(broker: &Broker, advert: &ListenerAdvert) -> Vec<BrokerNode> {
     let self_row = || BrokerNode {
         node_id: broker.broker_id,
         host: advert.host.clone(),
         port: advert.port,
+        // Self is never fenced: this broker is answering the request.
+        fenced: false,
     };
     match broker.broker_view() {
         Some(view) => {
@@ -110,9 +118,14 @@ pub fn advertised_brokers(broker: &Broker, advert: &ListenerAdvert) -> Vec<Broke
                         b.host
                     },
                     port: advert.port,
+                    fenced: b.fenced && b.node_id != broker.broker_id,
                 })
                 .collect();
-            if v.is_empty() {
+            if !v.iter().any(|b| !b.fenced) {
+                // Every row fenced (or none at all) would leave a
+                // client with nowhere to go once Metadata filters.
+                // This broker is serving by definition — say so.
+                v.retain(|b| b.node_id != broker.broker_id);
                 v.push(self_row());
             }
             v

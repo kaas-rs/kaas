@@ -18,6 +18,7 @@
 - [Listeners, authentication, authorization](architecture/listeners-auth.md)
 - [Kubernetes integration](architecture/kubernetes.md)
 - [Honest readiness & rollout pacing](architecture/readiness-rollout.md)
+- [Broker fencing](architecture/broker-fencing.md)
 - [Observability](architecture/observability.md)
 
 # Part II — Kafka Compatibility

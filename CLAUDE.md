@@ -10,6 +10,10 @@ kaas is a Rust workspace: `Cargo.toml` at the root, `rust-toolchain.toml` (pin =
 
 kaas targets **Apache Kafka 3.7** for wire-protocol and Kafka Streams parity. Behaviour is verified against the matrix tracked in the [kaas-migration-parity](https://github.com/users/Woestebanaan/projects/2) GitHub project. When a feature is ambiguous, default to "match Apache Kafka 3.7" rather than inventing kaas-specific semantics.
 
+- **Deliberate post-3.7 exception:** DescribeCluster **v2** (KIP-1073,
+  `IncludeFencedBrokers` / `IsFenced`) is served, because kaas has a real
+  fenced state (gh #249) and no other way to report it. This is the only
+  such exception; adding another needs the same explicit justification.
 - **Deferred (intended later, not now):** tiered storage / S3 backend. Skip the tiered-storage-only API surfaces (e.g. `EARLIEST_LOCAL_TIMESTAMP`, `EARLIEST_PENDING_UPLOAD_OFFSET`) — clients only request them when configured for remote tiers.
 - **Non-goals (off the table by design):** KRaft / metadata quorum (kaas uses K8s Leases instead), replication / ISR (single-writer-per-partition), and a literal `__transaction_state` internal topic (kaas uses per-broker JSON slot files on the shared NFS PVC — see "Idempotent producer" + "Transaction coordinator state machine" below; gh #29). Don't add any of these; flag if a "parity" task implicitly requires them.
 
@@ -113,6 +117,44 @@ Segment roll splits the work: the in-memory swap (log fsync + create new active 
 
 **`/readyz` is honest — serving-gated, not a bind-time latch (gh #208, gh #211).** `/readyz` = listeners-bound AND `main_alive()` AND (cluster mode ? `serving`). `serving` (`kaas_broker::is_serving`) means every partition `assignment.json` assigns to this broker is open in the engine — i.e. takeover is complete. It is served from a **dedicated thread + runtime** (`bins/kaas/src/main.rs`), never the main runtime it reports on, so a wedge yields readyz=unready instead of a hung probe. Two signals, and don't conflate them: `serving` (takeover done) gates `/readyz`; **`healthy`** — a 1 s liveness tick on the *main* runtime (`kaas_observability::record_main_tick`/`main_alive`), reported in `BrokerStatus.healthy` — is what the controller's alive set uses. `serving` can't detect a wedge (a wedged runtime keeps its partitions *open*), which is why `healthy` exists. `alive_brokers()` → `decide_alive()` in `bins/kaas/src/cluster.rs` = connected brokers reporting `healthy` — trusted unconditionally (the old-image `ever_healthy` guard was dropped per the pre-v1 no-backcompat policy). EndpointSlice readiness is now only the no-heartbeats-yet bootstrap fallback. Full write-up: `docs/src/architecture/readiness-rollout.md`. `broker.minReadySeconds` (default 60) stays as belt-and-braces. The PDB is inert for rollouts — StatefulSet updates delete pods directly, not via the eviction API — though it still applies to node drains.
 
+### Broker fencing (gh #249)
+
+Three states, not two: **serving** (EndpointSlice-listed and Ready),
+**fenced** (listed, not Ready — exists but isn't serving), **gone** (not
+listed). K8s supplies the registry, so a scale-down *is* deregistration —
+no `unregister` verb, no tombstones. `BrokerRegistry` keeps not-ready
+entries rather than filtering them; an ordinal absent from its **owning
+slice** (sharded Services exist) is removed; self is never inserted,
+downgraded, or removed by slice data (the gh #208 self-eviction death
+spiral). The controller writes the tri-state into `assignment.json`'s
+long-dormant `BrokerHealth { Alive, Draining, Dead }`: every *registered*
+broker gets a row, and a fenced one keeps the `last_seen` from when it was
+last alive.
+
+**The reporting was the motive; the divisor was the bug.** `group_hash`
+documents that `hash(groupID) % num_brokers` MUST divide by the full broker
+set "including draining / dead", but the list came from `assignment.json`,
+which held only the alive set — so losing 1 of 3 brokers silently moved the
+divisor 3 → 2 and rehashed ~2/3 of all group and txn coordinators, exactly
+when the cluster was already degraded. Don't "clean up" `Dead` rows: they
+are the divisor. Test: `a_dead_broker_moves_only_its_own_groups`.
+
+**Draining is fencing from the other side.** SIGTERM calls
+`mark_draining()` *before* teardown; the next heartbeat (~1 s) carries it,
+the controller drops the broker from the alive set while it is still
+healthy enough to hand over, and marks it `Draining` (still registered, so
+the divisor holds). The self-pin in `decide_alive` outranks draining — an
+empty alive set would unassign the cluster. This is the proactive drain
+hint the gh #61/#139 shutdown notes left open.
+
+Fenced is derived from readiness, so a **booting** broker reads as fenced
+until takeover completes — deliberate, and what Apache reports for a
+registered-but-not-caught-up broker. Readiness still does NOT drive the
+alive set (gh #208): that stays on the heartbeat's `healthy` bit, so a
+booting broker remains assignable while reading as fenced. Metadata omits
+fenced rows; DescribeCluster v2 reports them. Book page:
+`docs/src/architecture/broker-fencing.md`.
+
 **Retention/compaction are NOT enforced yet (gh #158).** The `min.compaction.lag.ms` (KIP-58) and `delete.retention.ms` (KIP-354) knobs exist as config plumbing only (`crates/kaas-storage/src/topicconfig.rs`, CR → `.config.json` → DescribeConfigs, which advertises a 24 h `delete.retention.ms` default); no compactor exists, and even the size-based `RetentionCleaner` (`cleaner.rs`) is never instantiated by `bins/kaas` — the interval loop its docstring promises was never wired. Disk is reclaimed only by `DeleteRecords` and topic deletion. When compaction lands, tombstone-expiry granularity will be per-batch (Apache is per-record) per the byte-opacity contract.
 
 ### Idempotent producer (gh #12, #22, #30)
@@ -202,10 +244,10 @@ Reclaim of a deleted topic's directory is two-track and neither track needs a de
 - `crates/kaas-protocol` — `dispatch.rs` (per-listener pre-auth gate), `server.rs` (multi-listener TCP/TLS bring-up; TCP_NODELAY on accept, gh #188; principal-mapper wiring), `frame.rs`, `connstate.rs`.
 - `crates/kaas-storage` — `DiskStorageEngine` with segment files, manifest, and cleaner (`engine.rs`, `disk.rs`, `partition.rs`, `segment.rs`, `manifest.rs`, `cleaner.rs`, `topicconfig.rs`). Single-writer enforcement is coordinator ownership + epoch-prefixed segment filenames. `idempotence.rs` + `producer_snapshot.rs` carry the gh #12 idempotent-producer state; `txn_index.rs` the aborted-txn index; `memory.rs` the dev-mode in-memory engine; `atomic_write.rs` the tmp+fsync+rename helper; `topic_identity.rs` the gh #219 `.topic-id.json` incarnation stamp. See "Storage hot path & file-handle ownership" above — those semantics are easy to miss if you read the engine code in isolation.
 - `crates/kaas-coordinator` — consumer-group coordinator (`group.rs`, `manager.rs`, `offset_store.rs`) plus transaction coordinator (`txn_state.rs`, `marker_queue.rs`, `fence_log.rs`). Offsets persisted under the data dir. Group ownership comes from a group-assignment source, txn ownership from a txn-assignment source — both backed by the broker `Coordinator` in prod (gh #91 / #92 hash-fallthrough) and by local stubs in single-broker tests.
-- `crates/kaas-broker` — broker glue: `broker.rs`, the on-broker `Coordinator` (`coordinator.rs` — assignment.json watcher with hash-fallthrough group ownership), `takeover.rs`, `group_takeover.rs` (incl. orphan sweep, gh #89), `group_hash.rs` (gh #92 deterministic coordinator), `self_fence.rs`, `heartbeat_client.rs`, `fence_watcher.rs`, `marker_watcher.rs`, `txn_markers.rs` (gh #225 shared COMMIT/ABORT dispatch + the prepared-txn reconcile), `producer_id.rs` (gh #219 persisted PID blocks), `topic_registry.rs`, `topic_cr_writer.rs` / `acl_cr_writer.rs` (K8s CR write paths), `cli.rs` (env/listener parsing), `listener_advert.rs` (the advertised-endpoint rule + broker catalog + controller-id derivation, shared by Metadata and DescribeCluster — two discovery APIs that disagreed on the port would loop an authed client on SASL retry), `local_lease.rs` (dev mode), and `handlers/` (one module per API: `produce.rs`, `fetch.rs` (stateless `SessionID=0`, gh #4; read-committed isolation, gh #31), `metadata.rs` (per-listener port advertisement gh #125; TopicID gh #105), `describe_cluster.rs` (key 60, KIP-700 — same catalog as Metadata; broker endpoints only, so KIP-919's controller endpoint type answers `MISMATCHED_ENDPOINT_TYPE`), the group APIs (incl. DeleteGroups gh #89), `list_offsets.rs` (earliest/latest sentinels; timestamp→offset resolution still stubbed to `(-1,-1)` in `kaas-storage/src/disk.rs`), admin surfaces, `create_partitions.rs` (key 37, gh #52), `incremental_alter_configs.rs` (key 44, gh #9), `sasl.rs` (per-listener engine selection, gh #124), `api_versions.rs`, `init_producer_id.rs` (gh #12), the txn handlers).
+- `crates/kaas-broker` — broker glue: `broker.rs`, the on-broker `Coordinator` (`coordinator.rs` — assignment.json watcher with hash-fallthrough group ownership), `takeover.rs`, `group_takeover.rs` (incl. orphan sweep, gh #89), `group_hash.rs` (gh #92 deterministic coordinator), `self_fence.rs`, `heartbeat_client.rs`, `fence_watcher.rs`, `marker_watcher.rs`, `txn_markers.rs` (gh #225 shared COMMIT/ABORT dispatch + the prepared-txn reconcile), `producer_id.rs` (gh #219 persisted PID blocks), `topic_registry.rs`, `topic_cr_writer.rs` / `acl_cr_writer.rs` (K8s CR write paths), `cli.rs` (env/listener parsing), `listener_advert.rs` (the advertised-endpoint rule + broker catalog + controller-id derivation, shared by Metadata and DescribeCluster — two discovery APIs that disagreed on the port would loop an authed client on SASL retry), `local_lease.rs` (dev mode), and `handlers/` (one module per API: `produce.rs`, `fetch.rs` (stateless `SessionID=0`, gh #4; read-committed isolation, gh #31), `metadata.rs` (per-listener port advertisement gh #125; TopicID gh #105), `describe_cluster.rs` (key 60, KIP-700, v0–v2 — same catalog as Metadata; broker endpoints only, so KIP-919's controller endpoint type answers `MISMATCHED_ENDPOINT_TYPE`; v2 reports fenced brokers, gh #249), the group APIs (incl. DeleteGroups gh #89), `list_offsets.rs` (earliest/latest sentinels; timestamp→offset resolution still stubbed to `(-1,-1)` in `kaas-storage/src/disk.rs`), admin surfaces, `create_partitions.rs` (key 37, gh #52), `incremental_alter_configs.rs` (key 44, gh #9), `sasl.rs` (per-listener engine selection, gh #124), `api_versions.rs`, `init_producer_id.rs` (gh #12), the txn handlers).
 - `crates/kaas-controller` — controller-side logic: `election.rs` / `kube_election.rs`, `balancer.rs`, `assignment_writer.rs`, `heartbeat_server.rs`, `k8s_mirror.rs`. Integration tests: `controller_failover.rs`, `stale_controller_race.rs`.
 - `crates/kaas-auth` — SCRAM-SHA-512 + SASL PLAIN (`scram.rs`, `plain.rs`, `credentials.rs`; no SCRAM-SHA-256), ACL evaluation (`acls.rs`), quotas (`quota.rs`, debt-carry), mTLS principal extraction + `principal_mapping.rs` (gh #43). Loads from `/data/__cluster/credentials.json` and `acls.json` (written by the operator) with hot-reload. Toggle off with `KAAS_AUTH_DISABLED=true`.
-- `crates/kaas-k8s` — broker-side K8s helpers: `endpoints.rs` (watches the headless service for peer endpoints; **not-ready endpoints are dropped from the registry**, which is what couples the controller's alive set to pod readiness — see gh #208), `identity.rs` (parses the ordinal out of the StatefulSet pod name), `topic_watcher.rs` (pure-state `KafkaTopic` cache with deletionTimestamp-immediate delete events and `topic_id` stashing — currently **un-wired**; production uses `kube_watchers::run_topic_watch`, see "KafkaTopic delete on NFS"), `kube_watchers.rs` (the production pumps: lease watch, endpoint watch, self-restarting + relist-reconciling topic watch, readiness patching), `readiness.rs` (satisfies the `kaas.rs/PartitionsReady` readiness gate once partition directories have been created on the PVC).
+- `crates/kaas-k8s` — broker-side K8s helpers: `endpoints.rs` (watches the headless service for peer endpoints; **not-ready endpoints are KEPT and flagged — that is the fenced state (gh #249)**; an ordinal absent from its owning slice is deregistered instead, and self is pinned against both), `identity.rs` (parses the ordinal out of the StatefulSet pod name), `topic_watcher.rs` (pure-state `KafkaTopic` cache with deletionTimestamp-immediate delete events and `topic_id` stashing — currently **un-wired**; production uses `kube_watchers::run_topic_watch`, see "KafkaTopic delete on NFS"), `kube_watchers.rs` (the production pumps: lease watch, endpoint watch, self-restarting + relist-reconciling topic watch, readiness patching), `readiness.rs` (satisfies the `kaas.rs/PartitionsReady` readiness gate once partition directories have been created on the PVC).
 - `crates/kaas-observability` — OTLP metrics + tracing bootstrap (`bootstrap.rs`, push-mode to Prometheus's native OTLP receiver; `KAAS_METRIC_EXPORT_INTERVAL` accepts duration strings like `30s`), `/healthz` HTTP handler with rich runtime state (`health.rs`), `byteopacity.rs` tripwire counters.
 - `crates/kaas-operator-api` — CRD types (kube-derive); `cargo xtask gen-crds` regenerates `deploy/crds/*.yaml` and mirrors them to the Helm chart.
 - `crates/kaas-operator-controllers` — one reconciler per CRD; topic/user reconcilers materialize state to files in `/data/__cluster/` on the shared PVC; leader-elected startup sweeps for orphans.

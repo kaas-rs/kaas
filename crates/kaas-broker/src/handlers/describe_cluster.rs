@@ -14,6 +14,15 @@
 //! listener must not be handed the anonymous port by the other
 //! (gh #125).
 //!
+//! ## Fenced brokers (KIP-1073, v2)
+//!
+//! A fenced broker is registered but not serving — its pod exists and
+//! its EndpointSlice entry is still there, but it is not Ready. Those
+//! rows are omitted unless a v2 request asks for them, matching
+//! Apache and matching Metadata, which never advertises them. Asking
+//! for them is the only way to tell a degraded cluster from a smaller
+//! one. Self is never reported fenced: this broker is answering.
+//!
 //! ## Endpoint type (KIP-919)
 //!
 //! v1 requests name the endpoint type they want: `1` = brokers,
@@ -140,11 +149,16 @@ impl Handler for DescribeClusterHandler {
                     controller_id: controller_id(&self.broker),
                     brokers: advertised_brokers(&self.broker, &advert)
                         .into_iter()
+                        // KIP-1073: fenced rows only when asked for.
+                        // The flag is v2-only, so a v0/v1 client
+                        // decodes `false` and gets Apache's default.
+                        .filter(|b| req.include_fenced_brokers || !b.fenced)
                         .map(|b| describe_cluster::Broker {
                             broker_id: b.node_id,
                             host: b.host,
                             port: b.port,
                             rack: None,
+                            is_fenced: b.fenced,
                         })
                         .collect(),
                     cluster_authorized_operations: self.authorized_operations(
@@ -240,12 +254,17 @@ mod tests {
     }
 
     fn request(include_ops: bool, ep: i8, version: i16) -> Bytes {
+        request_full(include_ops, ep, false, version)
+    }
+
+    fn request_full(include_ops: bool, ep: i8, fenced: bool, version: i16) -> Bytes {
         let mut w = BytesMut::new();
         describe_cluster::encode_request(
             &mut w,
             &describe_cluster::Request {
                 include_cluster_authorized_operations: include_ops,
                 endpoint_type: ep,
+                include_fenced_brokers: fenced,
             },
             version,
         )
@@ -297,11 +316,13 @@ mod tests {
                 node_id: 0,
                 host: "kaas-0.internal".to_owned(),
                 port: 9092,
+                fenced: false,
             },
             BrokerNode {
                 node_id: 1,
                 host: "kaas-1.kaas-brokers".to_owned(),
                 port: 9092,
+                fenced: false,
             },
         ])));
         let h = DescribeClusterHandler::new(b, &listeners());
@@ -394,5 +415,104 @@ mod tests {
         let h = DescribeClusterHandler::new(broker_with_auth(Arc::new(DescribeOnly)), &listeners());
         let resp = describe(&h, "internal", true, endpoint_type::BROKER, 1).await;
         assert_eq!(resp.cluster_authorized_operations, 1 << acl_op::DESCRIBE);
+    }
+
+    // --- gh #249: fenced brokers -----------------------------------
+
+    fn broker_with_fenced_peer() -> Arc<Broker> {
+        let b = broker();
+        b.install_broker_view(Arc::new(StaticView(vec![
+            BrokerNode {
+                node_id: 0,
+                host: "kaas-0.internal".to_owned(),
+                port: 9092,
+                fenced: false,
+            },
+            BrokerNode {
+                node_id: 1,
+                host: "kaas-1.kaas-brokers".to_owned(),
+                port: 9092,
+                fenced: true,
+            },
+        ])));
+        b
+    }
+
+    #[tokio::test]
+    async fn fenced_brokers_are_omitted_unless_asked_for() {
+        let h = DescribeClusterHandler::new(broker_with_fenced_peer(), &listeners());
+
+        // v2 without the flag: Apache's default, fenced row dropped.
+        let out = h
+            .handle(
+                &conn("internal"),
+                2,
+                request_full(false, endpoint_type::BROKER, false, 2),
+            )
+            .await
+            .unwrap();
+        let resp = describe_cluster::decode_response(&mut out.freeze(), 2).unwrap();
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.brokers[0].broker_id, 0);
+
+        // v2 with the flag: the fenced broker appears, flagged. This
+        // is the whole point — without it a degraded cluster is
+        // indistinguishable from a smaller one.
+        let out = h
+            .handle(
+                &conn("internal"),
+                2,
+                request_full(false, endpoint_type::BROKER, true, 2),
+            )
+            .await
+            .unwrap();
+        let resp = describe_cluster::decode_response(&mut out.freeze(), 2).unwrap();
+        assert_eq!(resp.brokers.len(), 2);
+        let fenced = resp.brokers.iter().find(|b| b.broker_id == 1).unwrap();
+        assert!(fenced.is_fenced);
+        assert!(
+            !resp
+                .brokers
+                .iter()
+                .find(|b| b.broker_id == 0)
+                .unwrap()
+                .is_fenced
+        );
+    }
+
+    /// A v1 client cannot ask for fenced brokers — the field doesn't
+    /// exist in its request — so it must never be handed one.
+    #[tokio::test]
+    async fn v1_never_sees_a_fenced_broker() {
+        let h = DescribeClusterHandler::new(broker_with_fenced_peer(), &listeners());
+        let resp = describe(&h, "internal", false, endpoint_type::BROKER, 1).await;
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.brokers[0].broker_id, 0);
+    }
+
+    /// Self answers the request, so it is never fenced — even if the
+    /// endpoint view says this pod is not ready (a readiness blip, or
+    /// the boot window before takeover completes).
+    #[tokio::test]
+    async fn self_is_never_reported_fenced() {
+        let b = broker();
+        b.install_broker_view(Arc::new(StaticView(vec![BrokerNode {
+            node_id: 0,
+            host: "kaas-0.internal".to_owned(),
+            port: 9092,
+            fenced: true,
+        }])));
+        let h = DescribeClusterHandler::new(b, &listeners());
+        let out = h
+            .handle(
+                &conn("internal"),
+                2,
+                request_full(false, endpoint_type::BROKER, true, 2),
+            )
+            .await
+            .unwrap();
+        let resp = describe_cluster::decode_response(&mut out.freeze(), 2).unwrap();
+        assert_eq!(resp.brokers.len(), 1);
+        assert!(!resp.brokers[0].is_fenced);
     }
 }

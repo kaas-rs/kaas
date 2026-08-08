@@ -236,6 +236,7 @@ impl HeartbeatClient {
             // from the FIRST message, so carry it here rather than
             // wait for the pump's first tick.
             healthy: kaas_observability::main_alive(),
+            draining: kaas_observability::is_draining(),
         };
         let _ = tx.try_send(initial);
         *self.outbox.lock() = Some(tx);
@@ -336,6 +337,7 @@ mod tests {
             partitions: Vec::new(),
             active_groups: Vec::new(),
             healthy: false,
+            draining: false,
         });
         assert!(r.is_err());
     }

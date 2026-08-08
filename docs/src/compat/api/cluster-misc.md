@@ -57,9 +57,14 @@ What `AdminClient.describeCluster()` calls: cluster id, controller, and the
 live broker set — the same three facts Metadata carries, without the per-topic
 payload. `kafka-cluster.sh cluster-id` and most UIs' cluster panes land here.
 
-**Versions**: v0–v1 (flexible from v0 — this API postdates
-[KIP-482](../kip/kip-482.md), so there is no legacy encoding). Apache 3.7 stops
-at v1; v2 (`IncludeFencedBrokers`, KIP-1073) is 4.x.
+**Versions**: v0–v2 (flexible from v0 — this API postdates
+[KIP-482](../kip/kip-482.md), so there is no legacy encoding). **v2 is a
+deliberate exception to the Apache 3.7 parity target**: `IncludeFencedBrokers` /
+`IsFenced` are KIP-1073, which is Kafka 4.0 surface. kaas serves it because it
+has a real fenced state to report — see
+[broker fencing](../../architecture/broker-fencing.md) — and because clients
+that ask for fenced brokers unconditionally cannot otherwise negotiate a
+version where the field is legal.
 
 **Handling**: broker rows come from the same catalog Metadata advertises, so
 both APIs answer with the port of the listener the request arrived on, peers at
@@ -67,6 +72,13 @@ their stable per-broker DNS name, and self at its own advertised host. A client
 that reached one API on the authed listener is never handed the anonymous port
 by the other. The controller is the broker holding the `kaas-controller` Lease,
 read from the applied `assignment.json`.
+
+**Fenced brokers**: a fenced broker is registered but not serving — its pod
+exists and its EndpointSlice entry is still there, but it is not Ready. Those
+rows are omitted unless a v2 request sets `IncludeFencedBrokers`, matching
+Apache and matching Metadata, which never advertises them. Asking for them is
+the only way to tell a degraded cluster from a smaller one. The broker
+answering the request never reports *itself* as fenced.
 
 The API itself is not authorization-gated — Apache answers the broker list to
 any authenticated principal. The optional `ClusterAuthorizedOperations`
@@ -91,6 +103,11 @@ carries no endpoint-type field, so neither error can reach a v0 client.
   Reporting a bit the authorizer cannot evaluate would be a guess.
 - `Rack` is always null — kaas has no rack awareness (it has no replicas to
   place).
+- `IsFenced` is derived from EndpointSlice readiness, not from a KRaft-style
+  broker registration + session timeout. The practical difference: a broker
+  that is booting (registered, not yet finished takeover) reads as fenced,
+  which is the same answer Apache gives for a broker that has registered but
+  not yet caught up.
 - `ControllerId` falls back to *this* broker when no assignment has been
   applied yet, where Apache would answer `-1`. Every kaas broker serves the same
   admin surface, so a client that dials the answer always reaches something
@@ -102,9 +119,9 @@ carries no endpoint-type field, so neither error can reach a v0 client.
 
 **Verified by**: `scripts/kafka-cluster.sh` (cluster-id round trip plus an
 `AdminClient.describeCluster()` call through `kafka-broker-api-versions`);
-handler tests in the source file above; the DescribeCluster leg of
-`bins/kaas/tests/smoke.rs`, which drives the flexible-from-v0 header path
-through the real dispatcher.
+handler tests in the source file above, covering fenced-row filtering at v1 and
+v2 in both directions; the DescribeCluster leg of `bins/kaas/tests/smoke.rs`,
+which drives the flexible-from-v0 header path through the real dispatcher.
 
 ## DescribeLogDirs
 

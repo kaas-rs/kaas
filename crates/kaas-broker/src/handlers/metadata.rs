@@ -175,6 +175,11 @@ impl Handler for MetadataHandler {
         // follow-up — the external listener ships disabled.)
         let brokers: Vec<metadata::Broker> = advertised_brokers(&self.broker, &advert)
             .into_iter()
+            // gh #249: fenced brokers are registered but not serving.
+            // Apache omits them from Metadata for the same reason —
+            // advertising one sends clients to a broker that cannot
+            // answer. DescribeCluster v2 is where they surface.
+            .filter(|b| !b.fenced)
             .map(|b| metadata::Broker {
                 node_id: b.node_id,
                 host: b.host,

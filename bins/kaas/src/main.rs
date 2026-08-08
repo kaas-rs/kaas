@@ -608,6 +608,13 @@ async fn main() -> Result<()> {
     kaas_observability::set_ready(true);
 
     wait_for_shutdown_signal().await?;
+    // gh #249: announce the drain BEFORE anything is torn down. The
+    // heartbeat carries it on its next tick (~1 s), so the controller
+    // moves this broker's partitions and group coordinatorships off
+    // proactively instead of waiting out a heartbeat timeout after
+    // the process is already gone. The broker keeps serving normally
+    // meanwhile — draining is "I am leaving", not "I am unhealthy".
+    kaas_observability::mark_draining();
     info!("shutdown signal received; cancelling listeners");
     cancel.cancel();
     match serve.await {
@@ -872,7 +879,7 @@ fn build_dispatcher(
     d.register(
         60,
         0,
-        1,
+        2,
         Arc::new(DescribeClusterHandler::new(broker.clone(), listeners)),
     );
     d.register(17, 0, 1, Arc::new(SaslHandshakeHandler::new()));

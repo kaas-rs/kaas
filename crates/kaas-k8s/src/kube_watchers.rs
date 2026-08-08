@@ -218,6 +218,11 @@ fn convert_slice(slice: &EndpointSlice) -> EndpointSliceData {
         })
         .collect();
     EndpointSliceData {
+        // gh #249: the registry deregisters ordinals that vanish from
+        // the slice that owned them, so it needs to know which slice
+        // this is. A nameless object can't own anything, and an empty
+        // name simply never matches a recorded owner.
+        name: slice.metadata.name.clone().unwrap_or_default(),
         entries,
         kafka_port,
     }

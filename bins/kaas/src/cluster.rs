@@ -768,15 +768,18 @@ struct RegistryBrokerView {
 }
 
 impl kaas_broker::ClusterBrokerView for RegistryBrokerView {
+    /// gh #249: every REGISTERED broker, fenced ones included and
+    /// flagged. Callers decide: Metadata drops fenced rows (Apache
+    /// omits fenced brokers too), DescribeCluster v2 reports them.
     fn brokers(&self) -> Vec<kaas_broker::BrokerNode> {
         self.registry
             .all()
             .into_iter()
-            .filter(|b| b.ready)
             .map(|b| kaas_broker::BrokerNode {
                 node_id: b.node_id,
                 host: b.host,
                 port: b.port,
+                fenced: !b.ready,
             })
             .collect()
     }
@@ -820,6 +823,35 @@ impl kaas_controller::BrokerSource for ClusterBrokerSource {
         };
         decide_alive(live, registered_ready, &self.self_id)
     }
+
+    /// gh #249: the registered set is the EndpointSlice registry —
+    /// every broker whose pod exists, ready or not. Readiness is what
+    /// separates alive from fenced; presence in the slice is what
+    /// separates fenced from gone.
+    fn registered_brokers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .registry
+            .all()
+            .into_iter()
+            .map(|b| format!("kaas-{}", b.node_id))
+            .collect();
+        if !ids.contains(&self.self_id) {
+            ids.push(self.self_id.clone());
+        }
+        ids
+    }
+
+    /// Brokers that told us over the heartbeat that they are shutting
+    /// down. They are already out of `alive_brokers` (see
+    /// `decide_alive`), so this only decides how they are *reported*.
+    fn draining_brokers(&self) -> Vec<String> {
+        self.heart
+            .broker_liveness()
+            .into_iter()
+            .filter(|b| b.draining)
+            .map(|b| b.id)
+            .collect()
+    }
 }
 
 /// Pure alive-set policy (gh #208), split out for testing.
@@ -843,7 +875,11 @@ fn decide_alive(
         registered_ready()
     } else {
         live.into_iter()
-            .filter(|b| b.healthy)
+            // gh #249: a draining broker is healthy — it is serving
+            // right up until it exits — but it has announced that it
+            // is leaving, so stop assigning to it now instead of
+            // waiting out a heartbeat timeout after it's gone.
+            .filter(|b| b.healthy && !b.draining)
             .map(|b| b.id)
             .collect()
     };
@@ -1087,6 +1123,7 @@ async fn control_plane(
                             // the main runtime wedges, so the controller
                             // reassigns our partitions.
                             healthy: kaas_observability::main_alive(),
+                            draining: kaas_observability::is_draining(),
                         });
                     }
                 }
@@ -1431,6 +1468,15 @@ mod alive_tests {
         BrokerLiveness {
             id: id.to_owned(),
             healthy,
+            draining: false,
+        }
+    }
+
+    fn bl_draining(id: &str) -> BrokerLiveness {
+        BrokerLiveness {
+            id: id.to_owned(),
+            healthy: true,
+            draining: true,
         }
     }
 
@@ -1459,6 +1505,33 @@ mod alive_tests {
             "kaas-0",
         );
         assert_eq!(sorted(alive), vec!["kaas-0", "kaas-1"]);
+    }
+
+    /// gh #249: a draining broker is healthy — it serves right up
+    /// until it exits — but it has announced that it is leaving, so
+    /// it must stop receiving assignments immediately rather than
+    /// after a heartbeat timeout has expired on a process that is
+    /// already gone.
+    #[test]
+    fn draining_broker_leaves_the_alive_set_while_still_healthy() {
+        let alive = decide_alive(
+            vec![
+                bl("kaas-0", true),
+                bl_draining("kaas-1"),
+                bl("kaas-2", true),
+            ],
+            Vec::new,
+            "kaas-0",
+        );
+        assert_eq!(sorted(alive), vec!["kaas-0", "kaas-2"]);
+    }
+
+    /// The self-pin outranks draining: the controller holds the
+    /// Lease, and an empty alive set would unassign the cluster.
+    #[test]
+    fn draining_self_is_still_kept_in_the_alive_set() {
+        let alive = decide_alive(vec![bl_draining("kaas-0")], Vec::new, "kaas-0");
+        assert_eq!(alive, vec!["kaas-0"]);
     }
 
     #[test]

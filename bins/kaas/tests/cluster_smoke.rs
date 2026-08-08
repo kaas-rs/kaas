@@ -236,6 +236,7 @@ async fn three_broker_controller_balances_and_reassigns() {
         test_dns(),
     ));
     registry.apply_slice(&EndpointSliceData {
+        name: "kaas-headless-test".to_owned(),
         entries: vec![
             slice_entry(0, true),
             slice_entry(1, true),
@@ -309,8 +310,17 @@ async fn three_broker_controller_balances_and_reassigns() {
 
     // 3. Broker loss: kaas-2 goes NotReady → the 2 s broker-set
     //    watcher recomputes → nothing stays assigned to kaas-2.
+    // A real EndpointSlice update carries the slice's whole
+    // membership, not a delta — and since gh #249 the registry uses
+    // that: an ordinal absent from its own slice is deregistered
+    // rather than fenced. So send all three, with kaas-2 NotReady.
     registry.apply_slice(&EndpointSliceData {
-        entries: vec![slice_entry(2, false)],
+        name: "kaas-headless-test".to_owned(),
+        entries: vec![
+            slice_entry(0, true),
+            slice_entry(1, true),
+            slice_entry(2, false),
+        ],
         kafka_port: Some(9092),
     });
     wait_until("kaas-2 drained", Duration::from_secs(10), || {

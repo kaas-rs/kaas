@@ -23,7 +23,13 @@ use parking_lot::RwLock;
 
 use crate::identity::{parse_ordinal, DnsConfig};
 
-/// One broker's endpoint as advertised in the Metadata response.
+/// One broker's endpoint.
+///
+/// `ready == false` is the **fenced** state (gh #249): the broker is
+/// registered — its pod exists and the EndpointSlice still lists it —
+/// but it is not serving. Metadata omits these rows (Apache omits
+/// fenced brokers too); DescribeCluster v2 reports them with
+/// `IsFenced = true`, which is the whole point of keeping them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerEndpoint {
     pub node_id: i32,
@@ -52,6 +58,12 @@ pub struct EndpointSliceEntry {
 /// advertises. Mirrors the kube `EndpointSlice` shape one-to-one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EndpointSliceData {
+    /// `metadata.name` of the slice. A Service's endpoints may be
+    /// sharded across several slices, so deregistration
+    /// ([`BrokerRegistry::apply_slice`]) is scoped to the slice that
+    /// owns the ordinal — otherwise one slice's update would evict
+    /// every broker listed in the others.
+    pub name: String,
     pub entries: Vec<EndpointSliceEntry>,
     pub kafka_port: Option<i32>,
 }
@@ -59,6 +71,9 @@ pub struct EndpointSliceData {
 #[derive(Debug, Default)]
 struct Inner {
     brokers: HashMap<i32, BrokerEndpoint>,
+    /// Which slice each ordinal was last seen in. See
+    /// [`EndpointSliceData::name`].
+    slice_of: HashMap<i32, String>,
 }
 
 /// Callback type fired on every registry change. Receives a fresh
@@ -93,7 +108,10 @@ impl BrokerRegistry {
             self_endpoint,
             dns,
             on_change: parking_lot::Mutex::new(None),
-            inner: RwLock::new(Inner { brokers }),
+            inner: RwLock::new(Inner {
+                brokers,
+                slice_of: HashMap::new(),
+            }),
         }
     }
 
@@ -112,7 +130,9 @@ impl BrokerRegistry {
         self.self_endpoint.clone()
     }
 
-    /// All known endpoints sorted by `node_id`.
+    /// All **registered** endpoints sorted by `node_id`, ready and
+    /// fenced alike. Callers that want only servable brokers filter
+    /// on `ready` — Metadata does, DescribeCluster v2 does not.
     pub fn all(&self) -> Vec<BrokerEndpoint> {
         let inner = self.inner.read();
         let mut out: Vec<BrokerEndpoint> = inner.brokers.values().cloned().collect();
@@ -120,9 +140,19 @@ impl BrokerRegistry {
         out
     }
 
-    /// Number of known ready brokers.
+    /// Number of registered brokers (ready + fenced).
     pub fn count(&self) -> usize {
         self.inner.read().brokers.len()
+    }
+
+    /// Number of registered brokers currently ready to serve.
+    pub fn ready_count(&self) -> usize {
+        self.inner
+            .read()
+            .brokers
+            .values()
+            .filter(|b| b.ready)
+            .count()
     }
 
     /// Manual upsert — used by tests + local-dev binaries that
@@ -135,28 +165,40 @@ impl BrokerRegistry {
         self.fire_on_change();
     }
 
-    /// Apply an `Added` / `Modified` `EndpointSlice` event. Ready
-    /// entries land in the map keyed on their ordinal (extracted
-    /// from `hostname`); not-ready entries are removed — except
-    /// SELF, which is pinned: a readiness-probe blip on this pod
-    /// must not make it forget its own existence. (Observed live:
-    /// self-eviction → controller balanced over an empty set →
-    /// unassigned all partitions → the takeover storm failed the
-    /// next probe too — a self-sustaining death spiral.)
+    /// Apply an `Added` / `Modified` `EndpointSlice` event.
+    ///
+    /// Every entry lands in the map keyed on its ordinal (extracted
+    /// from `hostname`), **carrying its readiness rather than being
+    /// filtered on it** (gh #249). A not-ready endpoint is a broker
+    /// that exists but isn't serving — fenced — and dropping it is
+    /// what made a degraded cluster look like a smaller one. Callers
+    /// that need only servable brokers filter on `ready`.
+    ///
+    /// Ordinals this slice used to list and no longer does **are**
+    /// removed: that is deregistration (scale-down, pod deleted), as
+    /// distinct from fencing. The removal is scoped to the slice that
+    /// owns the ordinal, so a sharded Service can't have one slice's
+    /// update evict brokers listed in another.
+    ///
+    /// SELF is never touched: not inserted, not downgraded, not
+    /// removed. A readiness-probe blip on this pod must not make it
+    /// forget its own existence. (Observed live: self-eviction →
+    /// controller balanced over an empty set → unassigned all
+    /// partitions → the takeover storm failed the next probe too — a
+    /// self-sustaining death spiral.)
     pub fn apply_slice(&self, slice: &EndpointSliceData) {
         let port = slice.kafka_port.unwrap_or(self.self_endpoint.port);
         {
             let mut inner = self.inner.write();
+            let mut seen: Vec<i32> = Vec::with_capacity(slice.entries.len());
             for ep in &slice.entries {
                 let Some(ordinal) = parse_ordinal(&ep.hostname) else {
                     continue;
                 };
-                if !ep.ready {
-                    if ordinal != self.self_endpoint.node_id {
-                        inner.brokers.remove(&ordinal);
-                    }
+                if ordinal == self.self_endpoint.node_id {
                     continue;
                 }
+                seen.push(ordinal);
                 // gh #128: advertise the headless-DNS FQDN when
                 // available; fall back to the raw address for
                 // tests / dev where `DnsConfig` is empty.
@@ -173,16 +215,30 @@ impl BrokerRegistry {
                         node_id: ordinal,
                         host,
                         port,
-                        ready: true,
+                        ready: ep.ready,
                     },
                 );
+                inner.slice_of.insert(ordinal, slice.name.clone());
+            }
+            // Deregister ordinals this slice owned but no longer
+            // lists. Scoped by owning slice — see `slice_of`.
+            let dropped: Vec<i32> = inner
+                .slice_of
+                .iter()
+                .filter(|(ordinal, owner)| owner.as_str() == slice.name && !seen.contains(ordinal))
+                .map(|(ordinal, _)| *ordinal)
+                .collect();
+            for ordinal in dropped {
+                inner.brokers.remove(&ordinal);
+                inner.slice_of.remove(&ordinal);
             }
         }
         self.fire_on_change();
     }
 
     /// Apply a `Deleted` `EndpointSlice` event. Every entry's
-    /// ordinal is removed from the map.
+    /// ordinal is deregistered — a deleted slice means those
+    /// endpoints are gone, not fenced.
     pub fn delete_slice(&self, slice: &EndpointSliceData) {
         {
             let mut inner = self.inner.write();
@@ -191,6 +247,7 @@ impl BrokerRegistry {
                     // Same self-pin as apply_slice.
                     if ordinal != self.self_endpoint.node_id {
                         inner.brokers.remove(&ordinal);
+                        inner.slice_of.remove(&ordinal);
                     }
                 }
             }
@@ -229,9 +286,22 @@ mod tests {
     }
 
     fn slice_with(entries: Vec<EndpointSliceEntry>) -> EndpointSliceData {
+        named_slice("kaas-headless-abc", entries)
+    }
+
+    fn named_slice(name: &str, entries: Vec<EndpointSliceEntry>) -> EndpointSliceData {
         EndpointSliceData {
+            name: name.to_owned(),
             entries,
             kafka_port: Some(9092),
+        }
+    }
+
+    fn entry(hostname: &str, address: &str, ready: bool) -> EndpointSliceEntry {
+        EndpointSliceEntry {
+            hostname: hostname.to_owned(),
+            address: address.to_owned(),
+            ready,
         }
     }
 
@@ -264,21 +334,90 @@ mod tests {
         assert_eq!(all[2].host, "kaas-2.kaas-headless.kaas.svc.cluster.local");
     }
 
+    /// gh #249: a not-ready endpoint is FENCED, not gone. Dropping
+    /// it is what made a degraded cluster look like a smaller one.
     #[test]
-    fn not_ready_entries_are_removed() {
+    fn not_ready_entries_are_kept_as_fenced() {
         let r = BrokerRegistry::new(self_ep(), dns());
-        r.apply_slice(&slice_with(vec![EndpointSliceEntry {
-            hostname: "kaas-1".to_owned(),
-            address: "10.0.0.5".to_owned(),
-            ready: true,
-        }]));
+        r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
+        assert_eq!((r.count(), r.ready_count()), (2, 2));
+
+        r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", false)]));
+        assert_eq!(
+            (r.count(), r.ready_count()),
+            (2, 1),
+            "still registered, no longer ready"
+        );
+        let peer = r.all().into_iter().find(|e| e.node_id == 1).unwrap();
+        assert!(!peer.ready);
+        // The host survives the transition, so a fenced broker is
+        // still addressable in a DescribeCluster row.
+        assert_eq!(peer.host, "kaas-1.kaas-headless.kaas.svc.cluster.local");
+
+        // ...and it comes back ready without a re-add.
+        r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
+        assert_eq!((r.count(), r.ready_count()), (2, 2));
+    }
+
+    /// The other half of the same contract: an ordinal that vanishes
+    /// from its slice is DEREGISTERED (scale-down), not fenced
+    /// forever. Without this, keeping not-ready entries would leak a
+    /// scaled-away broker into every response for the process's life.
+    #[test]
+    fn entry_absent_from_its_slice_is_deregistered() {
+        let r = BrokerRegistry::new(self_ep(), dns());
+        r.apply_slice(&slice_with(vec![
+            entry("kaas-1", "10.0.0.5", true),
+            entry("kaas-2", "10.0.0.6", true),
+        ]));
+        assert_eq!(r.count(), 3);
+
+        // Scale 3 -> 2: kaas-2 leaves the slice entirely.
+        r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
         assert_eq!(r.count(), 2);
-        r.apply_slice(&slice_with(vec![EndpointSliceEntry {
-            hostname: "kaas-1".to_owned(),
-            address: "10.0.0.5".to_owned(),
-            ready: false,
-        }]));
-        assert_eq!(r.count(), 1);
+        assert!(r.all().iter().all(|e| e.node_id != 2));
+    }
+
+    /// Deregistration is scoped to the slice that owns the ordinal.
+    /// A Service's endpoints may be sharded across slices, and a
+    /// naive "absent means gone" sweep would have each slice evict
+    /// the others' brokers on every update.
+    #[test]
+    fn sharded_slices_do_not_evict_each_other() {
+        let r = BrokerRegistry::new(self_ep(), dns());
+        r.apply_slice(&named_slice(
+            "shard-a",
+            vec![entry("kaas-1", "10.0.0.5", true)],
+        ));
+        r.apply_slice(&named_slice(
+            "shard-b",
+            vec![entry("kaas-2", "10.0.0.6", true)],
+        ));
+        assert_eq!(r.count(), 3);
+
+        // An unrelated update to shard-a must not touch kaas-2.
+        r.apply_slice(&named_slice(
+            "shard-a",
+            vec![entry("kaas-1", "10.0.0.5", false)],
+        ));
+        assert_eq!(r.count(), 3);
+        assert!(r.all().iter().any(|e| e.node_id == 2 && e.ready));
+    }
+
+    /// Self is pinned through every path: a probe blip on this pod
+    /// must not fence or evict it (the gh #208 death spiral).
+    #[test]
+    fn self_is_never_fenced_or_deregistered() {
+        let r = BrokerRegistry::new(self_ep(), dns());
+        r.apply_slice(&slice_with(vec![entry("kaas-0", "10.0.0.4", false)]));
+        let me = r.all().into_iter().find(|e| e.node_id == 0).unwrap();
+        assert!(me.ready, "self must stay ready");
+
+        // Absent from its own slice, and even an explicit delete.
+        r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
+        assert!(r.all().iter().any(|e| e.node_id == 0 && e.ready));
+        r.delete_slice(&slice_with(vec![entry("kaas-0", "10.0.0.4", true)]));
+        assert!(r.all().iter().any(|e| e.node_id == 0 && e.ready));
     }
 
     #[test]

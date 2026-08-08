@@ -53,6 +53,12 @@ pub struct BrokerLiveness {
     /// field (the pre-field-image guard was dropped under the pre-v1
     /// no-backcompat policy, docs/RELEASING.md).
     pub healthy: bool,
+    /// gh #249: latest reported `draining` — has the broker begun a
+    /// graceful shutdown? A draining broker leaves the alive set (so
+    /// its work moves now) but stays in the assignment's broker list,
+    /// marked `draining`. Orthogonal to `healthy`: a draining broker
+    /// is healthy right up until it exits.
+    pub draining: bool,
 }
 
 /// State the server keeps per connected broker.
@@ -67,6 +73,8 @@ struct ClientState {
     /// first status message, so there is no connected-but-unreported
     /// window.
     healthy: bool,
+    /// gh #249: latest `BrokerStatus.draining`. Same seeding rule.
+    draining: bool,
 }
 
 impl std::fmt::Debug for ClientState {
@@ -174,6 +182,7 @@ impl HeartbeatServer {
                 BrokerLiveness {
                     id: id.clone(),
                     healthy: s.healthy,
+                    draining: s.draining,
                 }
             })
             .collect()
@@ -256,6 +265,7 @@ impl ControllerHeartbeat for HeartbeatService {
             active_groups: first.active_groups.clone(),
             last_broker_ts_ms: first.timestamp_ms,
             healthy: first.healthy,
+            draining: first.draining,
         }));
         // Replace any prior stream for the same broker — reconnect
         // wins.
@@ -288,6 +298,7 @@ impl ControllerHeartbeat for HeartbeatService {
                 s.active_groups = msg.active_groups;
                 s.last_broker_ts_ms = msg.timestamp_ms;
                 s.healthy = msg.healthy;
+                s.draining = msg.draining;
             }
             // Remove this client on stream end, but only if we're
             // still the registered state — a reconnect during this

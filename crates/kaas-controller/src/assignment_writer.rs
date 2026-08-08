@@ -71,7 +71,35 @@ pub trait TopicSource: Send + Sync + 'static {
 
 /// Broker liveness — the alive subset the controller sees.
 pub trait BrokerSource: Send + Sync + 'static {
+    /// Brokers eligible to be assigned partitions and groups.
     fn alive_brokers(&self) -> Vec<String>;
+
+    /// Every broker the cluster knows about, alive or not (gh #249):
+    /// the registered set. A registered-but-not-alive broker is
+    /// *fenced* — it keeps a row in `assignment.json` marked `dead`
+    /// or `draining` instead of vanishing from it.
+    ///
+    /// Two things depend on the distinction. Fenced brokers are
+    /// reportable (DescribeCluster v2 `IsFenced`, the CR mirror,
+    /// `kubectl`), and — the load-bearing one — the coordinator hash
+    /// divisor is the **full** set, so `hash(group) % n` doesn't
+    /// reshuffle every group the moment one broker dies. See
+    /// `kaas_broker::group_hash`.
+    ///
+    /// Defaults to [`Self::alive_brokers`], which is the pre-gh #249
+    /// behaviour and the right answer for single-broker and test
+    /// sources that have no separate notion of registration.
+    fn registered_brokers(&self) -> Vec<String> {
+        self.alive_brokers()
+    }
+
+    /// Registered brokers that have announced a graceful shutdown.
+    /// Reported as `draining` rather than `dead`; they are expected
+    /// to be excluded from [`Self::alive_brokers`] by the same
+    /// source, so their work moves before they exit.
+    fn draining_brokers(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Consumer groups currently active in the cluster.
@@ -253,6 +281,11 @@ where
         // Snapshot inputs outside the lock so the source traits'
         // own locking doesn't intersect with our `state` lock.
         let brokers = self.brokers.alive_brokers();
+        // gh #249: the balancer only ever places work on ALIVE
+        // brokers; `registered` widens only the reported broker list
+        // (and with it the coordinator-hash divisor).
+        let registered = self.brokers.registered_brokers();
+        let draining = self.brokers.draining_brokers();
         let topics = self.topics.topics();
         let group_specs = self
             .groups
@@ -311,7 +344,13 @@ where
                 assignment_version: version,
                 generated_at: now.clone(),
                 controller: self.controller_id.clone(),
-                brokers: build_broker_entries(&brokers, &now),
+                brokers: build_broker_entries(
+                    &registered,
+                    &brokers,
+                    &draining,
+                    &now,
+                    s.current.as_ref().map(|a| a.brokers.as_slice()),
+                ),
                 partitions: parts,
                 consumer_groups: groups,
             };
@@ -392,15 +431,66 @@ fn compute_epoch_floor(
     floor
 }
 
-fn build_broker_entries(brokers: &[String], now: &str) -> Vec<BrokerAssignment> {
-    brokers
+/// Build the assignment's broker list: every **registered** broker,
+/// each carrying the health the controller currently sees (gh #249).
+///
+/// Before this, the list was the alive set with every entry stamped
+/// `Alive`, so a dead broker simply disappeared. Two consequences,
+/// both fixed here: nothing could report a broker as fenced, and the
+/// coordinator-hash divisor — documented in `kaas_broker::group_hash`
+/// as "MUST be the full broker set size (including draining / dead)"
+/// — silently shrank on every broker loss, reshuffling ~(N-1)/N of
+/// all group and txn coordinators exactly when the cluster was
+/// already degraded.
+///
+/// `last_seen` only advances for brokers actually seen this pass, so
+/// a fenced broker's timestamp says when it was last alive rather
+/// than when the controller last recomputed.
+fn build_broker_entries(
+    registered: &[String],
+    alive: &[String],
+    draining: &[String],
+    now: &str,
+    prev: Option<&[BrokerAssignment]>,
+) -> Vec<BrokerAssignment> {
+    let mut out: Vec<BrokerAssignment> = registered
         .iter()
-        .map(|b| BrokerAssignment {
-            id: b.clone(),
-            health: BrokerHealth::Alive,
-            last_seen: now.to_owned(),
+        .map(|b| {
+            let health = if draining.iter().any(|d| d == b) {
+                BrokerHealth::Draining
+            } else if alive.iter().any(|a| a == b) {
+                BrokerHealth::Alive
+            } else {
+                BrokerHealth::Dead
+            };
+            let last_seen = if matches!(health, BrokerHealth::Dead) {
+                prev.and_then(|p| p.iter().find(|e| e.id == *b))
+                    .map_or_else(|| now.to_owned(), |e| e.last_seen.clone())
+            } else {
+                now.to_owned()
+            };
+            BrokerAssignment {
+                id: b.clone(),
+                health,
+                last_seen,
+            }
         })
-        .collect()
+        .collect();
+    // An alive broker missing from the registered set would otherwise
+    // be dropped from the list it is being assigned partitions in.
+    // Can happen transiently: heartbeat-connected before its
+    // EndpointSlice entry lands.
+    for b in alive {
+        if !out.iter().any(|e| e.id == *b) {
+            out.push(BrokerAssignment {
+                id: b.clone(),
+                health: BrokerHealth::Alive,
+                last_seen: now.to_owned(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// `tmp + rename` write of `<cluster_dir>/assignment.json`.
@@ -453,6 +543,124 @@ mod tests {
 
     fn brokers(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("kaas-{i}")).collect()
+    }
+
+    // --- gh #249: registered vs alive vs draining ------------------
+
+    fn health_of(entries: &[BrokerAssignment], id: &str) -> BrokerHealth {
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.health)
+            .expect("broker present in the reported list")
+    }
+
+    #[test]
+    fn registered_but_not_alive_is_reported_dead_not_dropped() {
+        let entries = build_broker_entries(
+            &brokers(3),
+            &["kaas-0".to_owned(), "kaas-1".to_owned()],
+            &[],
+            "now",
+            None,
+        );
+        assert_eq!(entries.len(), 3, "a dead broker keeps its row");
+        assert_eq!(health_of(&entries, "kaas-0"), BrokerHealth::Alive);
+        assert_eq!(health_of(&entries, "kaas-1"), BrokerHealth::Alive);
+        assert_eq!(health_of(&entries, "kaas-2"), BrokerHealth::Dead);
+    }
+
+    #[test]
+    fn draining_outranks_alive_in_the_reported_health() {
+        // The source is expected to have already dropped kaas-1 from
+        // the alive set; if it hasn't, `draining` still wins, because
+        // that is the more specific statement.
+        let entries = build_broker_entries(
+            &brokers(2),
+            &["kaas-0".to_owned(), "kaas-1".to_owned()],
+            &["kaas-1".to_owned()],
+            "now",
+            None,
+        );
+        assert_eq!(health_of(&entries, "kaas-1"), BrokerHealth::Draining);
+    }
+
+    /// The reason this matters beyond reporting: `group_hash` documents
+    /// that the coordinator divisor MUST be the full broker set,
+    /// "including draining / dead". Before gh #249 the list was the
+    /// alive set, so losing one broker of three silently changed the
+    /// divisor 3 → 2 and rehashed ~2/3 of all group and txn
+    /// coordinators — at exactly the moment the cluster was degraded.
+    #[test]
+    fn broker_loss_does_not_shrink_the_coordinator_divisor() {
+        let all = brokers(3);
+        let healthy = build_broker_entries(&all, &all, &[], "now", None);
+        let degraded = build_broker_entries(
+            &all,
+            &["kaas-0".to_owned(), "kaas-1".to_owned()],
+            &[],
+            "now",
+            None,
+        );
+        assert_eq!(healthy.len(), degraded.len());
+
+        // And the hash routing agrees: same preferred slot either way.
+        let (names_h, alive_h) = Assignment {
+            controller_epoch: 0,
+            assignment_version: 1,
+            generated_at: String::new(),
+            controller: "kaas-0".to_owned(),
+            brokers: healthy,
+            partitions: vec![],
+            consumer_groups: vec![],
+        }
+        .broker_sets();
+        let (names_d, alive_d) = Assignment {
+            controller_epoch: 0,
+            assignment_version: 1,
+            generated_at: String::new(),
+            controller: "kaas-0".to_owned(),
+            brokers: degraded,
+            partitions: vec![],
+            consumer_groups: vec![],
+        }
+        .broker_sets();
+        assert_eq!(names_h, names_d, "divisor set is stable across the loss");
+        assert_eq!(alive_h.len(), 3);
+        assert_eq!(alive_d.values().filter(|v| **v).count(), 2);
+    }
+
+    /// A fenced broker's `last_seen` should say when it was last
+    /// alive, not when the controller last recomputed — otherwise the
+    /// field says "seen just now" about a broker that is gone.
+    #[test]
+    fn dead_broker_keeps_its_last_seen() {
+        let prev = build_broker_entries(&brokers(2), &brokers(2), &[], "T1", None);
+        let now = build_broker_entries(&brokers(2), &["kaas-0".to_owned()], &[], "T2", Some(&prev));
+        assert_eq!(
+            now.iter().find(|e| e.id == "kaas-1").unwrap().last_seen,
+            "T1"
+        );
+        assert_eq!(
+            now.iter().find(|e| e.id == "kaas-0").unwrap().last_seen,
+            "T2"
+        );
+    }
+
+    /// Transient: heartbeat-connected before the EndpointSlice entry
+    /// lands. The broker is being assigned partitions, so it must
+    /// appear in the list it is assigned within.
+    #[test]
+    fn alive_but_unregistered_broker_is_still_listed() {
+        let entries = build_broker_entries(
+            &["kaas-0".to_owned()],
+            &["kaas-0".to_owned(), "kaas-1".to_owned()],
+            &[],
+            "now",
+            None,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(health_of(&entries, "kaas-1"), BrokerHealth::Alive);
     }
 
     fn loop_with_brokers(
