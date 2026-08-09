@@ -548,22 +548,41 @@ impl ActiveSegment {
     /// appended to, which is the closest thing on disk. A segment we
     /// can't date at all reports age 0, so an un-stattable file is
     /// never rolled on age (the size arm still applies).
-    pub fn age_ms(&self, fs: &dyn Fs) -> u64 {
-        let now = now_epoch_ms();
+    ///
+    /// **The mtime lookup is memoised, and must stay that way.** This
+    /// runs on the append path — once per produced batch — and every
+    /// partition comes back from a restart or a takeover with an
+    /// adopted segment, so a non-memoised version issues a `stat` per
+    /// batch against the shared volume. Resolving once is also more
+    /// correct: mtime moves with every append, so re-reading it would
+    /// make a busy segment perpetually "just written" and it would
+    /// never roll on age at all.
+    pub fn age_ms(&mut self, fs: &dyn Fs) -> u64 {
         let started = match self.created_at_ms {
             Some(ms) => ms,
-            None => match fs
-                .stat(&self.meta.log_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| i64::try_from(d.as_millis()).ok())
-            {
-                Some(ms) => ms,
-                None => return 0,
-            },
+            None => {
+                let resolved = fs
+                    .stat(&self.meta.log_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_millis()).ok());
+                match resolved {
+                    Some(ms) => {
+                        self.created_at_ms = Some(ms);
+                        ms
+                    }
+                    // Un-stattable: don't retry per batch either.
+                    // Age 0 means "never roll this on time"; the size
+                    // arm still applies.
+                    None => {
+                        self.created_at_ms = Some(now_epoch_ms());
+                        return 0;
+                    }
+                }
+            }
         };
-        u64::try_from(now.saturating_sub(started)).unwrap_or(0)
+        u64::try_from(now_epoch_ms().saturating_sub(started)).unwrap_or(0)
     }
 
     /// Materialise the log + index file handles. Idempotent — safe to

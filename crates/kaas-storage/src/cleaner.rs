@@ -757,6 +757,108 @@ mod tests {
     }
 
     #[test]
+    fn the_age_check_stats_a_segment_at_most_once() {
+        // `age_ms` runs on the append path, once per produced batch,
+        // and every partition comes back from a restart or takeover
+        // with an adopted segment (no in-process creation time). A
+        // non-memoised lookup is therefore a `stat` per batch against
+        // the shared volume — measured as a ~5% produce regression
+        // before this test existed.
+        use crate::fs::{Fs, RealFs};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingFs {
+            inner: RealFs,
+            stats: AtomicUsize,
+        }
+        impl Fs for CountingFs {
+            fn open_read(
+                &self,
+                p: &std::path::Path,
+            ) -> std::io::Result<Box<dyn crate::fs::FileRead>> {
+                self.inner.open_read(p)
+            }
+            fn open_write(
+                &self,
+                p: &std::path::Path,
+                append: bool,
+            ) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
+                self.inner.open_write(p, append)
+            }
+            fn create(
+                &self,
+                p: &std::path::Path,
+            ) -> std::io::Result<Box<dyn crate::fs::FileWrite>> {
+                self.inner.create(p)
+            }
+            fn fsync(&self, f: &mut dyn crate::fs::FileWrite) -> std::io::Result<()> {
+                self.inner.fsync(f)
+            }
+            fn rename(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+                self.inner.rename(a, b)
+            }
+            fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+                self.inner.remove(p)
+            }
+            fn mkdir_all(&self, p: &std::path::Path) -> std::io::Result<()> {
+                self.inner.mkdir_all(p)
+            }
+            fn readdir(&self, p: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+                self.inner.readdir(p)
+            }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+                if p.extension().is_some_and(|e| e == "log") {
+                    self.stats.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.stat(p)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            // Lay down a segment, then reopen so it is *adopted* —
+            // the arm with no in-process creation time.
+            {
+                let e = engine_at(tmp.path().to_path_buf(), 1 << 30);
+                e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                    .await
+                    .unwrap();
+                e.relinquish_all().await.unwrap();
+            }
+            let fs = Arc::new(CountingFs {
+                inner: RealFs::new(),
+                stats: AtomicUsize::new(0),
+            });
+            let e = Arc::new(DiskStorageEngine::new(
+                fs.clone(),
+                tmp.path().to_path_buf(),
+                crate::partition::PartitionConfig {
+                    segment_bytes: 1 << 30,
+                    ..Default::default()
+                },
+            ));
+            e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            let after_open = fs.stats.load(Ordering::Relaxed);
+
+            for _ in 0..50 {
+                e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                    .await
+                    .unwrap();
+            }
+            let growth = fs.stats.load(Ordering::Relaxed) - after_open;
+            assert_eq!(
+                growth, 0,
+                "50 appends issued {growth} log stats — the age check is \
+                 re-statting per batch instead of memoising"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
     fn segment_ms_minus_one_never_rolls_on_time() {
         let base = crate::partition::PartitionConfig::default();
         assert_eq!(

@@ -777,9 +777,13 @@ impl Partition {
             let batch_len_u64 = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             let projected_size = guard.active.log_size().saturating_add(batch_len_u64);
             let too_big = projected_size > cfg.segment_bytes;
-            let too_old = cfg
-                .segment_ms
-                .is_some_and(|ms| guard.active.age_ms(self.fs.as_ref()) >= ms);
+            // Short-circuit: the age check is the cheap-but-not-free
+            // arm (a clock read, and one memoised stat per segment), so
+            // skip it entirely when the size arm already decided.
+            let too_old = !too_big
+                && cfg
+                    .segment_ms
+                    .is_some_and(|ms| guard.active.age_ms(self.fs.as_ref()) >= ms);
             if (too_big || too_old) && guard.active.log_size() > 0 {
                 let new_base = guard.high_water;
                 let new_epoch = guard.epoch;
