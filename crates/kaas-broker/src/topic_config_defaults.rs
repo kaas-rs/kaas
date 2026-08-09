@@ -57,6 +57,12 @@ pub const ALL_KEYS: &[Entry] = &[
         documentation: "Bytes at which the active segment rolls.",
     },
     Entry {
+        dotted_name: "segment.ms",
+        default_value: Some("604800000"), // 7 days
+        config_type: config_type::LONG,
+        documentation: "Time after which the active segment rolls, even if it is under segment.bytes. -1 = never roll on time.",
+    },
+    Entry {
         dotted_name: "cleanup.policy",
         default_value: Some("delete"),
         config_type: config_type::LIST,
@@ -78,6 +84,21 @@ pub const ALL_KEYS: &[Entry] = &[
             "Tombstone retention for compacted topics (KIP-354). 0 = tombstones live forever.",
     },
 ];
+
+/// The `retention.ms` default, parsed from the same table
+/// DescribeConfigs answers from.
+///
+/// Read through this rather than hard-coding 7 days at the call site:
+/// the advertised default and the enforced default drifting apart is
+/// exactly the bug this fixes (kaas advertised 604800000 and enforced
+/// nothing). Falls back to Apache's 7 days if the row ever goes
+/// missing.
+pub fn default_retention_ms() -> u64 {
+    lookup("retention.ms")
+        .and_then(|e| e.default_value)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(7 * 24 * 60 * 60 * 1000)
+}
 
 /// Convenience: lookup by dotted wire name. Returns `None` for
 /// unknown keys; the handler surfaces those as

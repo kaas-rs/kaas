@@ -114,6 +114,18 @@ pub struct KafkaTopicConfig {
     #[schemars(range(min = 1))]
     pub segment_bytes: Option<i64>,
 
+    /// Rolls the active segment once it has been open this long, even
+    /// if it never reaches `segmentBytes`. Apache's `segment.ms`, same
+    /// 7-day default. `-1` = never roll on time.
+    ///
+    /// This is what makes `retentionMs` work on a low-volume topic:
+    /// retention only ever deletes *closed* segments, so a topic that
+    /// never fills a segment keeps everything regardless of its
+    /// retention setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = -1))]
+    pub segment_ms: Option<i64>,
+
     /// `delete`, `compact`, or `compact,delete`. Empty → broker
     /// default (`delete`). Validation is operator-side via the regex.
     #[serde(default, skip_serializing_if = "String::is_empty")]

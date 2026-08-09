@@ -616,15 +616,26 @@ async fn main() -> Result<()> {
         if interval_secs == 0 {
             info!("KAAS_RETENTION_CHECK_INTERVAL=0 — retention sweep disabled");
         } else {
+            // The cluster default a topic falls back to, and it must
+            // equal what DescribeConfigs advertises as DEFAULT_CONFIG —
+            // Apache enforces its 7-day `retention.ms` default, so a
+            // topic with no explicit setting ages out there. kaas
+            // advertised the same number and enforced nothing, which is
+            // the same class of lie gh #250 was about, one level up.
+            let defaults = kaas_storage::RetentionPolicy {
+                retention_ms: Some(kaas_broker::topic_config_defaults::default_retention_ms()),
+                retention_bytes: None, // Apache: -1, unlimited
+            };
             let policy = Arc::new(kaas_storage::TopicConfigPolicySource::new(
                 disk.clone(),
-                // No engine-wide default: absent per-topic config means
-                // retain forever, which is what a broker with no
-                // `.config.json` did before this existed.
-                kaas_storage::RetentionPolicy::default(),
+                defaults,
             ));
-            let cleaner = kaas_storage::RetentionCleaner::with_policy_source(disk, policy)
-                .with_ownership(Arc::new(CoordinatorOwnership(broker.clone())));
+            let policy_for_cfg = policy.clone();
+            let cleaner = kaas_storage::RetentionCleaner::with_policy_source(disk.clone(), policy)
+                .with_ownership(Arc::new(CoordinatorOwnership(broker.clone())))
+                .with_partition_config(Arc::new(move |topic, partition, base| {
+                    policy_for_cfg.partition_config_for(topic, partition, base)
+                }));
             let cleaner_cancel = cancel.clone();
             info!(interval_secs, "retention cleaner started");
             tokio::spawn(async move {

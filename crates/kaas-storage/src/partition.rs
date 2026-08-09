@@ -63,11 +63,20 @@ use crate::txn_index::{AbortedTxn, AbortedTxnIndex, OpenTxnIndex};
 const CHECKPOINT_INTERVAL_BYTES: i64 = 64 * 1024 * 1024;
 
 /// Per-partition tuning knobs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionConfig {
     /// Roll the active segment at this size. Default 1 GiB matches
     /// Apache's `segment.bytes`.
     pub segment_bytes: u64,
+    /// Roll the active segment once it has been open this long, even
+    /// if it never reaches `segment_bytes`. Apache's `segment.ms`,
+    /// same 7-day default. `None` = size-driven rolls only.
+    ///
+    /// This is what makes time-based retention work on a low-volume
+    /// topic: retention only ever deletes *closed* segments, so
+    /// without a time-driven roll a topic that never fills 1 GiB
+    /// keeps everything forever no matter what `retention.ms` says.
+    pub segment_ms: Option<u64>,
     /// Emit one sparse index entry per N bytes of log. Default 4 KiB
     /// matches Apache's `index.interval.bytes`.
     pub index_interval_bytes: u64,
@@ -82,6 +91,7 @@ impl Default for PartitionConfig {
     fn default() -> Self {
         Self {
             segment_bytes: 1 << 30,
+            segment_ms: Some(7 * 24 * 60 * 60 * 1000),
             index_interval_bytes: 4096,
             flush_interval_messages: 1,
             fsync_max_latency: Duration::from_secs(30),
@@ -432,7 +442,11 @@ pub struct Partition {
     snapshot: ArcSwap<ReadSnapshot>,
     flush: FlushCoord,
     committer: Mutex<Option<JoinHandle<()>>>,
-    cfg: PartitionConfig,
+    /// Swappable so a `kafka-configs.sh --alter` on `segment.bytes` /
+    /// `segment.ms` takes effect on a live partition, as it does in
+    /// Apache. The retention sweep re-resolves it from the topic's
+    /// `.config.json` each pass.
+    cfg: ArcSwap<PartitionConfig>,
     fs: Arc<dyn Fs>,
     topic: String,
     partition: i32,
@@ -517,7 +531,7 @@ impl Partition {
             snapshot: ArcSwap::from(Arc::new(initial_snapshot)),
             flush: FlushCoord { req_tx, cond },
             committer: Mutex::new(Some(committer_handle)),
-            cfg,
+            cfg: ArcSwap::from_pointee(cfg),
             fs,
             topic,
             partition,
@@ -755,10 +769,18 @@ impl Partition {
                 }
             }
 
-            // Roll if the next append would exceed segment_bytes.
+            // Roll if the next append would exceed segment_bytes, or
+            // if the active segment has been open longer than
+            // segment_ms. The age arm is what lets a low-volume topic
+            // age out at all: retention only deletes closed segments.
+            let cfg = self.cfg.load();
             let batch_len_u64 = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             let projected_size = guard.active.log_size().saturating_add(batch_len_u64);
-            if projected_size > self.cfg.segment_bytes && guard.active.log_size() > 0 {
+            let too_big = projected_size > cfg.segment_bytes;
+            let too_old = cfg
+                .segment_ms
+                .is_some_and(|ms| guard.active.age_ms(self.fs.as_ref()) >= ms);
+            if (too_big || too_old) && guard.active.log_size() > 0 {
                 let new_base = guard.high_water;
                 let new_epoch = guard.epoch;
                 let dir = guard.dir.clone();
@@ -800,7 +822,7 @@ impl Partition {
             // Append the bytes to the active log.
             guard
                 .active
-                .append_batch(&owned, self.cfg.index_interval_bytes)
+                .append_batch(&owned, cfg.index_interval_bytes)
                 .map_err(StorageError::Io)?;
 
             // Advance accounting.
@@ -847,8 +869,8 @@ impl Partition {
             }
 
             // Decide whether to fire a flush request.
-            let trigger = self.cfg.flush_interval_messages > 0
-                && guard.pending_flush_records >= self.cfg.flush_interval_messages;
+            let trigger = cfg.flush_interval_messages > 0
+                && guard.pending_flush_records >= cfg.flush_interval_messages;
             let my_seq;
             if trigger {
                 guard.requested_flush_seq += 1;
@@ -1045,6 +1067,21 @@ impl Partition {
             .chain(std::iter::once(snap.active_meta.size))
             .sum();
         i64::try_from(total).unwrap_or(i64::MAX)
+    }
+
+    /// Replace the tuning knobs on a live partition. The retention
+    /// sweep calls this each pass with the topic's current
+    /// `.config.json`, so `kafka-configs.sh --alter segment.bytes`
+    /// takes effect without a restart — as it does in Apache. The
+    /// append path reads the config per batch, so the next append
+    /// after this call already sees it.
+    pub fn set_config(&self, cfg: PartitionConfig) {
+        self.cfg.store(Arc::new(cfg));
+    }
+
+    /// Current tuning knobs.
+    pub fn config(&self) -> Arc<PartitionConfig> {
+        self.cfg.load_full()
     }
 
     /// Recorded largest timestamp of each closed segment, oldest

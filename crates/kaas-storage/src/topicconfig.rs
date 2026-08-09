@@ -37,6 +37,13 @@ pub struct TopicConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_bytes: Option<i64>,
 
+    /// `segment.ms` — roll the active segment once it has been open
+    /// this long, whatever its size. Apache's default is 7 days, and
+    /// it is what makes `retention.ms` work on a low-volume topic:
+    /// retention only ever deletes closed segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_ms: Option<i64>,
+
     /// `cleanup.policy` — `"delete"`, `"compact"`, or `"compact,delete"`.
     /// Empty string omitted from the JSON (v0.1 `omitempty` compatibility).
     #[serde(skip_serializing_if = "String::is_empty", default)]
@@ -49,6 +56,40 @@ pub struct TopicConfigFile {
     /// `delete.retention.ms` (KIP-354, gh #116).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_retention_ms: Option<i64>,
+}
+
+/// Kafka's "unlimited / never" sentinel is `-1`; `0` reaches us as an
+/// unset field far more often than as a deliberate "immediately", so
+/// both map to `None`.
+pub fn sentinel_to_option(v: i64) -> Option<u64> {
+    if v <= 0 {
+        None
+    } else {
+        u64::try_from(v).ok()
+    }
+}
+
+/// Layer a topic's `segment.bytes` / `segment.ms` over `base`.
+///
+/// Kept here rather than in the engine so the partition-open path and
+/// the retention sweep resolve a topic's tuning the same way — they
+/// disagreed for the life of the project, in the sense that only one of
+/// them existed: every partition rolled at the global default and a
+/// topic's `segmentBytes` was written to disk and read by nobody.
+pub fn apply_to_partition_config(
+    cfg: &TopicConfigFile,
+    base: &crate::partition::PartitionConfig,
+) -> crate::partition::PartitionConfig {
+    let mut out = base.clone();
+    if let Some(b) = cfg.segment_bytes.and_then(sentinel_to_option) {
+        out.segment_bytes = b;
+    }
+    // `-1` is a real Apache setting here ("never roll on time"), so an
+    // explicit value always wins — including when it disables the roll.
+    if let Some(raw) = cfg.segment_ms {
+        out.segment_ms = sentinel_to_option(raw);
+    }
+    out
 }
 
 /// Read the per-topic config file. Returns `Ok(None)` when the file
@@ -118,6 +159,7 @@ mod tests {
             retention_ms: Some(0),
             retention_bytes: None,
             segment_bytes: Some(1 << 30),
+            segment_ms: None,
             cleanup_policy: "compact".into(),
             min_compaction_lag_ms: None,
             delete_retention_ms: Some(86_400_000),

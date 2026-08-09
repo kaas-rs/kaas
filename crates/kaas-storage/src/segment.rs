@@ -43,6 +43,15 @@ const SEALED_EXT: &str = ".log.sealed";
 /// Wire size of one sparse-index entry: `(rel_offset:i32, file_pos:i32)`.
 pub const INDEX_ENTRY_SIZE: usize = 8;
 
+/// Wall clock as epoch milliseconds, saturating at 0 below the epoch.
+pub(crate) fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// Bufio window size for [`scan_high_watermark`]. 4 MiB lets one NFS
 /// READ RPC carry many batches of work — without this, startup
 /// becomes thousands of round-trips per partition.
@@ -455,6 +464,12 @@ pub struct ActiveSegment {
     /// the cleaner's retention.ms check and reported in
     /// [`SegmentMeta`] when this segment is closed.
     max_timestamp: i64,
+    /// Wall clock (epoch ms) when this segment was created in *this*
+    /// process, for the `segment.ms` age roll. `None` for a segment
+    /// adopted from disk, where [`Self::age_ms`] falls back to the log
+    /// file's mtime — the same substitute time-based retention uses
+    /// for an inherited segment.
+    created_at_ms: Option<i64>,
 }
 
 impl std::fmt::Debug for ActiveSegment {
@@ -501,6 +516,7 @@ impl ActiveSegment {
             last_offset: base_offset - 1,
             last_indexed_log_pos: 0,
             max_timestamp: 0,
+            created_at_ms: Some(now_epoch_ms()),
         })
     }
 
@@ -518,7 +534,36 @@ impl ActiveSegment {
             last_offset: 0,
             last_indexed_log_pos: 0,
             max_timestamp: 0,
+            // Adopted from disk — this process didn't create it, so
+            // `age_ms` dates it by the file instead.
+            created_at_ms: None,
         }
+    }
+
+    /// How long this segment has been open, in milliseconds.
+    ///
+    /// Uses the in-process creation time when we have one, and the log
+    /// file's mtime otherwise — a segment adopted at partition open has
+    /// no creation time here, and its mtime is when it was last
+    /// appended to, which is the closest thing on disk. A segment we
+    /// can't date at all reports age 0, so an un-stattable file is
+    /// never rolled on age (the size arm still applies).
+    pub fn age_ms(&self, fs: &dyn Fs) -> u64 {
+        let now = now_epoch_ms();
+        let started = match self.created_at_ms {
+            Some(ms) => ms,
+            None => match fs
+                .stat(&self.meta.log_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_millis()).ok())
+            {
+                Some(ms) => ms,
+                None => return 0,
+            },
+        };
+        u64::try_from(now.saturating_sub(started)).unwrap_or(0)
     }
 
     /// Materialise the log + index file handles. Idempotent — safe to

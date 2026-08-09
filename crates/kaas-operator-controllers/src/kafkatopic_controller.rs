@@ -229,6 +229,7 @@ impl KafkaTopicReconciler {
             retention_ms: topic.spec.config.retention_ms,
             retention_bytes: topic.spec.config.retention_bytes,
             segment_bytes: topic.spec.config.segment_bytes,
+            segment_ms: topic.spec.config.segment_ms,
             cleanup_policy: topic.spec.config.cleanup_policy.clone(),
             min_compaction_lag_ms: topic.spec.config.min_compaction_lag_ms,
             delete_retention_ms: topic.spec.config.delete_retention_ms,

@@ -60,6 +60,15 @@ spec:
                     minimum: 1.0
                     nullable: true
                     type: integer
+                  segmentMs:
+                    description: |-
+                      Rolls the active segment once it has been open this long, even if it never reaches `segmentBytes`. Apache's `segment.ms`, same 7-day default. `-1` = never roll on time.
+
+                      This is what makes `retentionMs` work on a low-volume topic: retention only ever deletes *closed* segments, so a topic that never fills a segment keeps everything regardless of its retention setting.
+                    format: int64
+                    minimum: -1.0
+                    nullable: true
+                    type: integer
                 type: object
               partitions:
                 description: Partition count. Cannot be decreased once set (the reconciler rejects with `InvalidPartitionCount`).

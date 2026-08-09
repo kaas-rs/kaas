@@ -175,7 +175,9 @@ pub fn config_value_to_json(key: &str, value: &str) -> Value {
     match key {
         // Integer fields: parse as i64; fall back to string on parse failure
         // so the operator-side schema validation produces a clean error.
-        "retention.ms"
+        "segment.ms"
+        | "segmentMs"
+        | "retention.ms"
         | "retentionMs"
         | "retention.bytes"
         | "retentionBytes"
@@ -203,6 +205,7 @@ pub fn config_value_to_json(key: &str, value: &str) -> Value {
 pub fn config_key_to_json_field(key: &str) -> Option<&'static str> {
     match key {
         "retention.ms" | "retentionMs" => Some("retentionMs"),
+        "segment.ms" | "segmentMs" => Some("segmentMs"),
         "retention.bytes" | "retentionBytes" => Some("retentionBytes"),
         "segment.bytes" | "segmentBytes" => Some("segmentBytes"),
         "cleanup.policy" | "cleanupPolicy" => Some("cleanupPolicy"),

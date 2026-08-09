@@ -275,8 +275,14 @@ cleaner enforces it:
   cadence and meaning as Apache's `log.retention.check.interval.ms`).
   Each pass drops closed segments that have aged past `retention.ms` or
   pushed the partition over `retention.bytes`, whichever reaps more.
-  `-1` on either knob — or no config at all — means retain forever. The
+  A topic that sets neither gets the cluster default — seven days,
+  as in Apache. `-1` on either knob opts out and retains forever. The
   active segment is never reclaimed.
+- **Segment rolls** happen at `segment.bytes` (1 GiB) or `segment.ms`
+  (seven days), whichever comes first, per topic. The time-based roll
+  is not a detail: retention only ever deletes *closed* segments, so a
+  topic that never fills a segment would otherwise keep everything
+  regardless of its retention setting.
 - **`DeleteRecords`** (API key 21) reclaims on demand rather than on a
   timer: it advances `logStartOffset` to a caller-chosen point and
   unlinks the closed segments that point fully covers. Topic deletion
@@ -288,6 +294,25 @@ cleaner enforces it:
   deliberate consequence of never opening batches. Status is tracked
   honestly on the [KIP-58](../compat/kip/kip-58.md) and
   [KIP-354](../compat/kip/kip-354.md) pages.
+
+### Why a quiet topic used to keep everything
+
+A subtlety worth stating plainly, because it makes retention look
+broken when it isn't: **retention can only delete closed segments.**
+The segment currently being written is off limits — Kafka works the
+same way — so a topic only starts reclaiming space once it has rolled
+at least one segment behind it.
+
+That is why `segment.ms` matters as much as `retention.ms`. A topic
+producing a few KB a minute will not reach a 1 GiB segment this decade.
+Without a time-based roll it has exactly one segment, that segment is
+the active one, and no retention setting can touch it — the topic grows
+forever while `kafka-configs.sh` cheerfully reports a 24-hour
+retention. With `segment.ms` at seven days, the same topic rolls weekly
+and its retention applies from then on.
+
+Both knobs are per topic and both apply to a live log: changing them
+takes effect within one sweep, without restarting a broker.
 
 ### How old is a segment?
 

@@ -111,11 +111,62 @@ async fn retention_ms_from_topic_config_reclaims_the_log() {
     engine.relinquish_all().await.unwrap();
 }
 
+#[test]
+fn the_enforced_default_is_the_one_describeconfigs_advertises() {
+    // Apache enforces its 7-day `retention.ms` default, so a topic with
+    // no explicit setting ages out. kaas advertised 604800000 through
+    // DescribeConfigs and enforced nothing — the same shape of lie that
+    // gh #250 was about, one level up. Both numbers now come from one
+    // table, and this is the guard that keeps them together.
+    let advertised = kaas_broker::topic_config_defaults::lookup("retention.ms")
+        .and_then(|e| e.default_value)
+        .expect("retention.ms has an advertised default");
+    assert_eq!(
+        kaas_broker::topic_config_defaults::default_retention_ms().to_string(),
+        advertised,
+        "the enforced default drifted from the advertised one"
+    );
+    assert_eq!(advertised, "604800000", "Apache's default is 7 days");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_topic_with_no_config_is_retained_forever() {
-    // The pre-gh #250 behaviour for every topic, and still the right
-    // answer for a topic whose CR sets no retention: absent config must
-    // never mean "reap it".
+async fn a_topic_with_no_config_ages_out_at_the_cluster_default() {
+    // Apache behaviour: no per-topic retention means the cluster
+    // default applies, not "keep forever".
+    let tmp = tempfile::tempdir().unwrap();
+    let one = u64::try_from(build_batch(0).len()).unwrap();
+    let engine = engine_at(tmp.path().to_path_buf(), one);
+    let stamped_at = 1_700_000_000_000i64;
+    for _ in 0..6 {
+        engine
+            .append("nocfg", 0, 0, -1, build_batch(stamped_at))
+            .await
+            .unwrap();
+    }
+
+    // The defaults `main.rs` installs.
+    let defaults = RetentionPolicy {
+        retention_ms: Some(kaas_broker::topic_config_defaults::default_retention_ms()),
+        retention_bytes: None,
+    };
+    let cleaner = RetentionCleaner::with_policy_source(
+        engine.clone(),
+        Arc::new(TopicConfigPolicySource::new(engine.clone(), defaults)),
+    )
+    .with_clock(Arc::new(move || stamped_at + 8 * 86_400_000)); // 8 days on
+
+    assert_eq!(cleaner.run_once().await.unwrap(), 1);
+    assert!(
+        engine.log_start_offset("nocfg", 0).unwrap() > 0,
+        "a topic with no config must age out at the cluster default"
+    );
+    engine.relinquish_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_minus_one_still_keeps_everything() {
+    // The escape hatch that must keep working now that the default
+    // deletes: `retention.ms=-1` is Apache's retain-forever.
     let tmp = tempfile::tempdir().unwrap();
     let one = u64::try_from(build_batch(0).len()).unwrap();
     let engine = engine_at(tmp.path().to_path_buf(), one);
@@ -125,13 +176,22 @@ async fn a_topic_with_no_config_is_retained_forever() {
             .await
             .unwrap();
     }
+    write_config(
+        &engine,
+        "keepme",
+        TopicConfigFile {
+            retention_ms: Some(-1),
+            ..Default::default()
+        },
+    );
 
+    let defaults = RetentionPolicy {
+        retention_ms: Some(kaas_broker::topic_config_defaults::default_retention_ms()),
+        retention_bytes: None,
+    };
     let cleaner = RetentionCleaner::with_policy_source(
         engine.clone(),
-        Arc::new(TopicConfigPolicySource::new(
-            engine.clone(),
-            RetentionPolicy::default(),
-        )),
+        Arc::new(TopicConfigPolicySource::new(engine.clone(), defaults)),
     )
     .with_clock(Arc::new(|| i64::MAX / 2));
 

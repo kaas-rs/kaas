@@ -178,6 +178,27 @@ impl DiskStorageEngine {
         self.fs.as_ref()
     }
 
+    /// Engine defaults with `(topic, partition)`'s `.config.json`
+    /// layered on top.
+    ///
+    /// Called on every partition open so a topic's `segment.bytes` /
+    /// `segment.ms` actually reach the log. Before this, the engine
+    /// built one `PartitionConfig` at boot and handed the same copy to
+    /// every partition: a topic could ask for 16 MiB segments, have it
+    /// written to `.config.json` and echoed back by DescribeConfigs,
+    /// and still roll at the global 1 GiB — which in turn meant a
+    /// low-volume topic had no closed segments and `retention.ms`
+    /// could never delete anything.
+    pub fn partition_config_for(&self, topic: &str, partition: i32) -> PartitionConfig {
+        let dir = self.topic_dir(topic, partition);
+        match crate::topicconfig::read_topic_config(self.fs(), &dir) {
+            Ok(Some(c)) => crate::topicconfig::apply_to_partition_config(&c, &self.cfg),
+            // Absent or unreadable — engine defaults, which is what
+            // every partition got before this existed.
+            _ => self.cfg.clone(),
+        }
+    }
+
     /// Get-or-open the partition. The race window between "no entry"
     /// and "insert" is resolved by re-checking after the open — the
     /// loser drops its partition (the active-segment FDs close in
@@ -209,7 +230,7 @@ impl DiskStorageEngine {
                 topic.to_owned(),
                 partition,
                 dir,
-                self.cfg.clone(),
+                self.partition_config_for(topic, partition),
             )
             .await?,
         );

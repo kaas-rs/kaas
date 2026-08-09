@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use crate::disk::DiskStorageEngine;
 use crate::errors::StorageError;
+use crate::topicconfig::sentinel_to_option;
 
 /// Per-topic retention policy under `cleanup.policy=delete`. The
 /// compactor's knobs (`min.compaction.lag.ms`, `delete.retention.ms`)
@@ -127,25 +128,52 @@ impl TopicConfigPolicySource {
     }
 }
 
-impl PolicySource for TopicConfigPolicySource {
-    fn policy_for(&self, topic: &str, partition: i32) -> RetentionPolicy {
+impl TopicConfigPolicySource {
+    /// Read `(topic, partition)`'s `.config.json`, or `None` when it is
+    /// absent or unreadable. An unreadable file is treated as absent on
+    /// purpose: the fallback is the engine default, and defaulting is
+    /// the safe direction for every knob here.
+    fn read(&self, topic: &str, partition: i32) -> Option<crate::topicconfig::TopicConfigFile> {
         let dir = self.engine.topic_dir(topic, partition);
-        let cfg = match crate::topicconfig::read_topic_config(self.engine.fs(), &dir) {
-            Ok(Some(c)) => c,
-            // No file, or an unreadable one. Falling back to the
-            // defaults is the safe direction: the worst case is that
-            // we retain more than asked, never that we delete data
-            // the operator meant to keep.
-            Ok(None) => return self.defaults,
+        match crate::topicconfig::read_topic_config(self.engine.fs(), &dir) {
+            Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
                     topic,
                     partition,
                     error = %e,
-                    "unreadable .config.json; using default retention"
+                    "unreadable .config.json; using default topic config"
                 );
-                return self.defaults;
+                None
             }
+        }
+    }
+
+    /// The topic's partition tuning — `segment.bytes` and
+    /// `segment.ms` layered over `base`.
+    ///
+    /// This is the other half of honouring a topic's config, and the
+    /// half whose absence made `retention.ms` look broken: without a
+    /// per-topic `segment.bytes` every partition rolled at the global
+    /// 1 GiB, so a low-volume topic had exactly one segment — the
+    /// active one, which retention may never delete.
+    pub fn partition_config_for(
+        &self,
+        topic: &str,
+        partition: i32,
+        base: &crate::partition::PartitionConfig,
+    ) -> crate::partition::PartitionConfig {
+        match self.read(topic, partition) {
+            Some(cfg) => crate::topicconfig::apply_to_partition_config(&cfg, base),
+            None => base.clone(),
+        }
+    }
+}
+
+impl PolicySource for TopicConfigPolicySource {
+    fn policy_for(&self, topic: &str, partition: i32) -> RetentionPolicy {
+        let Some(cfg) = self.read(topic, partition) else {
+            return self.defaults;
         };
         RetentionPolicy {
             retention_bytes: cfg
@@ -169,18 +197,6 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Kafka's retain-forever sentinel is `-1`; `0` would mean "reap
-/// everything immediately", which is a legal setting but is far more
-/// often an unset field, so it is also treated as unlimited (this
-/// mirrors `topicconfig`'s "zero means engine default").
-fn sentinel_to_option(v: i64) -> Option<u64> {
-    if v <= 0 {
-        None
-    } else {
-        u64::try_from(v).ok()
-    }
-}
-
 pub struct RetentionCleaner {
     engine: Arc<DiskStorageEngine>,
     policy_source: Arc<dyn PolicySource>,
@@ -188,6 +204,21 @@ pub struct RetentionCleaner {
     /// Injectable clock (epoch ms) so tests can advance time past a
     /// retention window without sleeping.
     now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// Optional per-topic tuning resolver. When set, each sweep
+    /// re-resolves every owned partition's `segment.bytes` /
+    /// `segment.ms` and applies any change to the live partition.
+    #[allow(clippy::type_complexity)]
+    partition_config: Option<
+        Arc<
+            dyn Fn(
+                    &str,
+                    i32,
+                    &crate::partition::PartitionConfig,
+                ) -> crate::partition::PartitionConfig
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for RetentionCleaner {
@@ -214,7 +245,27 @@ impl RetentionCleaner {
             policy_source,
             ownership: Arc::new(OwnsEverything),
             now_ms: Arc::new(now_epoch_ms),
+            partition_config: None,
         }
+    }
+
+    /// Also carry `.config.json` tuning changes onto live partitions
+    /// each pass (see the call site for why the sweep owns this).
+    #[allow(clippy::type_complexity)]
+    pub fn with_partition_config(
+        mut self,
+        f: Arc<
+            dyn Fn(
+                    &str,
+                    i32,
+                    &crate::partition::PartitionConfig,
+                ) -> crate::partition::PartitionConfig
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        self.partition_config = Some(f);
+        self
     }
 
     /// Install the leadership gate. Without one the cleaner assumes it
@@ -260,6 +311,25 @@ impl RetentionCleaner {
             let Some(p) = self.engine.partition(&topic, partition) else {
                 continue;
             };
+            // Re-resolve the topic's tuning while we're here. In Apache
+            // a `kafka-configs.sh --alter` on segment.bytes / segment.ms
+            // applies to the live log; here the sweep is what carries a
+            // `.config.json` edit onto an already-open partition, so the
+            // lag is one interval instead of a broker restart.
+            if let Some(cfg) = self.partition_config.as_ref() {
+                let next = cfg(&topic, partition, &p.config());
+                if next != *p.config() {
+                    tracing::info!(
+                        topic,
+                        partition,
+                        segment_bytes = next.segment_bytes,
+                        segment_ms = ?next.segment_ms,
+                        "topic config changed; applying to open partition"
+                    );
+                    p.set_config(next);
+                }
+            }
+
             let policy = self.policy_source.policy_for(&topic, partition);
             if policy.is_unlimited() {
                 continue;
@@ -600,6 +670,155 @@ mod tests {
             assert!(
                 e.log_start_offset("t", 0).unwrap() > 0,
                 "mtime fallback did not reap anything"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_topics_segment_bytes_reaches_the_partition() {
+        // Apache applies a topic's segment.bytes to its log. kaas wrote
+        // the value to .config.json, echoed it back through
+        // DescribeConfigs, and handed every partition the engine-wide
+        // default instead — so a topic asking for small segments never
+        // rolled, never had a closed segment, and could not age out
+        // however its retention was set.
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            // Engine default is huge; the topic asks for one batch.
+            let e = engine_at(tmp.path().to_path_buf(), 1 << 30);
+            let dir = e.topic_dir("t", 0);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::topicconfig::write_topic_config(
+                e.fs(),
+                &dir,
+                &crate::topicconfig::TopicConfigFile {
+                    segment_bytes: Some(i64::try_from(one_len).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            seed_segments(&e, 5, 1_000_000).await;
+            let p = e.partition("t", 0).unwrap();
+            assert_eq!(p.config().segment_bytes, one_len, "topic override ignored");
+            assert!(
+                !p.closed_segment_max_timestamps().is_empty(),
+                "the topic's segment.bytes should have rolled segments"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn segment_ms_rolls_a_segment_that_never_fills() {
+        // The other half of making retention work on a low-volume
+        // topic: without a time-driven roll the only segment is the
+        // active one, which retention may never delete.
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let e = engine_at(tmp.path().to_path_buf(), 1 << 30);
+            let dir = e.topic_dir("t", 0);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::topicconfig::write_topic_config(
+                e.fs(),
+                &dir,
+                &crate::topicconfig::TopicConfigFile {
+                    // Roll on any append at least 1 ms after creation.
+                    segment_ms: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            let p = e.partition("t", 0).unwrap();
+            assert_eq!(p.config().segment_ms, Some(1));
+            assert!(
+                p.closed_segment_max_timestamps().is_empty(),
+                "nothing closed yet — one append, one active segment"
+            );
+
+            // Far below segment_bytes, so only the age arm can roll it.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            assert_eq!(
+                p.closed_segment_max_timestamps().len(),
+                1,
+                "segment.ms did not roll a segment far below segment.bytes"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn segment_ms_minus_one_never_rolls_on_time() {
+        let base = crate::partition::PartitionConfig::default();
+        assert_eq!(
+            base.segment_ms,
+            Some(7 * 24 * 60 * 60 * 1000),
+            "default must match Apache's 7-day segment.ms"
+        );
+        let disabled = crate::topicconfig::apply_to_partition_config(
+            &crate::topicconfig::TopicConfigFile {
+                segment_ms: Some(-1),
+                ..Default::default()
+            },
+            &base,
+        );
+        assert_eq!(disabled.segment_ms, None, "-1 must disable the time roll");
+        // An absent key leaves the engine default alone.
+        let untouched = crate::topicconfig::apply_to_partition_config(
+            &crate::topicconfig::TopicConfigFile::default(),
+            &base,
+        );
+        assert_eq!(untouched.segment_ms, base.segment_ms);
+    }
+
+    #[test]
+    fn a_config_change_reaches_an_already_open_partition() {
+        // `kafka-configs.sh --alter segment.bytes` applies to the live
+        // log in Apache. Here the sweep carries it.
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let e = engine_at(tmp.path().to_path_buf(), 1 << 30);
+            e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            let p = e.partition("t", 0).unwrap();
+            assert_eq!(p.config().segment_bytes, 1 << 30);
+
+            let dir = e.topic_dir("t", 0);
+            crate::topicconfig::write_topic_config(
+                e.fs(),
+                &dir,
+                &crate::topicconfig::TopicConfigFile {
+                    segment_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let src = Arc::new(TopicConfigPolicySource::new(
+                e.clone(),
+                RetentionPolicy::default(),
+            ));
+            let src2 = src.clone();
+            let cleaner = RetentionCleaner::with_policy_source(e.clone(), src)
+                .with_partition_config(Arc::new(move |t, part, base| {
+                    src2.partition_config_for(t, part, base)
+                }));
+            cleaner.run_once().await.unwrap();
+
+            assert_eq!(
+                p.config().segment_bytes,
+                4096,
+                "sweep did not carry the config change onto the open partition"
             );
             e.relinquish_all().await.unwrap();
         });
