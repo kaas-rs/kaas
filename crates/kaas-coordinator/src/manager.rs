@@ -209,6 +209,18 @@ impl Manager {
             .collect()
     }
 
+    /// Every group materialised in memory here, coordinated by this
+    /// broker or not. Order unspecified.
+    ///
+    /// [`Self::local_groups`] answers "what should I report upstream";
+    /// this answers "what am I holding". `GroupTakeoverDriver`'s
+    /// orphan sweep needs the second question: a group this broker no
+    /// longer coordinates is exactly the one to drop, and filtering by
+    /// [`Self::is_coordinator`] first hides it from the sweep.
+    pub fn resident_groups(&self) -> Vec<String> {
+        self.groups.iter().map(|kv| kv.key().clone()).collect()
+    }
+
     /// Drop in-memory state for a group. Called by
     /// `GroupTakeoverDriver` when the cluster controller reassigns
     /// the group to another broker. Pending offset commits remain

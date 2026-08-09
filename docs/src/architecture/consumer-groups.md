@@ -55,24 +55,52 @@ A broker answers "do I coordinate group G?" in two tiers:
 For stable broker sets the two tiers converge, so the hash is the
 load-bearing path in steady state.
 
+They can still disagree, though, and the disagreement is the reason
+both tiers need care. An explicit entry sticks to its broker across
+alive-set changes, so over time it can name a broker the hash would
+not. That makes *losing* an entry a real event: the group silently
+falls through to the hash, and if the hash says someone else, the
+group's clients get `NOT_COORDINATOR` and rebuild from scratch — on a
+perfectly healthy group, with no broker having restarted.
+
+So an entry is retired only when its broker leaves the cluster, never
+because the group went quiet. The controller learns which groups are
+active from what brokers report, and a group drops out of that report
+for reasons that have nothing to do with coordination: its members all
+left for a moment, a heartbeat window went stale, an idle group was
+swept from memory. None of those mean the coordinator should move.
+
+The same rule binds every component that asks the question. Anything
+deciding "do I still coordinate this group?" — including the takeover
+pass below — has to consult *both* tiers, because a group living on
+the hash tier alone (any brand-new group, for one) otherwise looks
+unowned to whoever reads only the explicit list.
+
 ## Group takeover and the orphan sweep
 
 When the assignment changes — a broker joins, leaves, or dies — every
-broker reconciles the set of groups it coordinates in two passes:
+broker sweeps the groups it holds in memory and drops the ones the
+*current* assignment no longer routes to it. Groups it gains are not
+eagerly migrated: the new coordinator's first `JoinGroup` creates the
+group lazily and loads its persisted offsets from the group's file on
+the shared volume.
 
-1. **prev→next diff** — groups this broker *lost* are dropped from
-   memory. Gained groups are not eagerly migrated: the new
-   coordinator's first `JoinGroup` creates the group lazily and loads
-   its persisted offsets from the group's file on the shared volume.
-2. **Orphan sweep** — any group still held in memory that the *current*
-   assignment doesn't route here is evicted, regardless of what the
-   diff said.
+Note which set the sweep walks: **every** group resident in memory, not
+the groups this broker believes it coordinates. Those are different
+sets, and the second one is precisely the wrong one — filtering by
+ownership before sweeping hides the disowned groups the sweep exists to
+evict.
 
 The sweep is what keeps memory bounded across alive-set churn, and it
 is what keeps `kafka-consumer-groups.sh --list` honest: the AdminClient
 unions `ListGroups` across all brokers, so a single broker holding one
 forgotten in-memory group would make a deleted group reappear
 cluster-wide.
+
+Coordinator changes are logged on both brokers involved — the one
+losing the group and the one gaining it — with the assignment version
+that caused the move, so a client-visible rebalance can be traced back
+to the recompute that triggered it.
 
 Ownership also filters the read side: `ListGroups` on a broker only
 returns groups it currently coordinates, and `DescribeGroups` for a

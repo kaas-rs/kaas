@@ -3,18 +3,30 @@
 //! Pure functions
 //! over `(prev assignment, alive brokers, inputs)`; no state, no
 //! I/O. Both shapes — partition placement and group placement —
-//! follow the same three-step recipe:
+//! follow the same recipe:
 //!
 //! 1. **Preserve** any prior assignment whose broker is still in
 //!    the alive set. Stable assignments minimise log migration on
 //!    the shared PVC.
-//! 2. **Rendezvous-pick** the rest. Highest-random-weight hashing
-//!    keyed on `(topic, partition, broker_id)` (or `(group_id,
-//!    broker_id)` for groups) gives a deterministic, evenly-
-//!    distributed placement without coordination.
-//! 3. **Smooth** the partition layer with a deterministic pass to
-//!    enforce `max(per-broker count) - min ≤ 1`. Group placement
-//!    skips smoothing because each group is a single unit.
+//! 2. **Place** the rest, levelling each topic over the alive set.
+//!    Highest-random-weight hashing keyed on `(topic, partition,
+//!    broker_id)` (or `(group_id, broker_id)` for groups) breaks
+//!    ties, so placement is deterministic and needs no coordination.
+//! 3. **Smooth** the partition layer with two deterministic passes:
+//!    cluster-wide to `max(per-broker count) - min ≤ 1`, then
+//!    per-topic without disturbing that. Group placement skips
+//!    smoothing because each group is a single unit.
+//!
+//! **Order matters.** Preserve runs *first*, before anything else
+//! looks at the layout, which is what keeps the recipe incremental:
+//! a recompute only decides the partitions that actually need a
+//! decision. Deriving the layout up front and reconciling with `prev`
+//! afterwards computes the same thing in steady state but re-derives
+//! it from `(topics, alive)` alone — so creating or deleting one
+//! topic could migrate partitions of every *other* topic, and each
+//! such move costs a real open/recover/close cycle on NFS plus a
+//! window where the outgoing leader is still acking writes (gh #206,
+//! and the dual-writer window in gh #227).
 //!
 //! Hash: XXH64 via `twox-hash`, byte-for-byte stable so an
 //! assignment written by any release matches a v0.1-written
@@ -104,6 +116,11 @@ struct PartitionSlot {
     topic: String,
     partition: i32,
     broker: String,
+    /// Was this slot inherited from `prev` (its broker still alive)?
+    /// Moving a sticky slot costs a real open/recover/close cycle on
+    /// the shared volume, so both smoothing passes exhaust the
+    /// non-sticky candidates before touching one.
+    sticky: bool,
 }
 
 /// Returns `topic/partition` keyed prior partition assignments —
@@ -155,23 +172,51 @@ pub fn balance(
     let alive_set: HashSet<String> = alive.iter().cloned().collect();
     let prev_map = prev_partitions(prev);
 
-    // Phase 1: raw rendezvous pick per partition.
+    // Phase 1: pin every partition whose previous leader is still
+    // alive; place the rest. Pinning FIRST is what makes the whole
+    // pass `prev`-aware (gh #206): placement and smoothing only ever
+    // see partitions that genuinely need a decision, so adding or
+    // removing a topic can no longer re-derive the layout of every
+    // other topic.
     let mut slots: Vec<PartitionSlot> = Vec::new();
     for t in topics {
         for partition in 0..t.partition_count {
-            let broker = rendezvous_pick(&t.name, partition, &alive).unwrap_or_default();
-            slots.push(PartitionSlot {
-                topic: t.name.clone(),
-                partition,
-                broker,
+            let key = partition_key(&t.name, partition);
+            let pinned = prev_map
+                .get(&key)
+                .map(|pa| pa.broker.clone())
+                .filter(|b| alive_set.contains(b));
+            slots.push(match pinned {
+                Some(broker) => PartitionSlot {
+                    topic: t.name.clone(),
+                    partition,
+                    broker,
+                    sticky: true,
+                },
+                None => PartitionSlot {
+                    topic: t.name.clone(),
+                    partition,
+                    broker: String::new(),
+                    sticky: false,
+                },
             });
         }
     }
 
-    // Phase 2: deterministic smoothing pass.
-    smooth_partitions(&mut slots, &alive);
+    // Phase 2: place the unpinned slots, levelling each topic over
+    // the alive set as we go (gh #247 — a per-partition hash alone
+    // lands all 3 partitions of a 3-partition topic on one broker
+    // 1 time in 9). Rendezvous only breaks ties between equally
+    // loaded brokers, so placement stays deterministic.
+    place_unpinned(&mut slots, &alive);
 
-    // Phase 3: reconcile with prev for stable epochs, never dropping
+    // Phase 3: smoothing. Cluster-wide first (the gh #99 invariant:
+    // `max - min <= 1` over all partitions), then a per-topic pass
+    // that trades partitions between brokers without disturbing it.
+    smooth_partitions(&mut slots, &alive);
+    smooth_partitions_per_topic(&mut slots, &alive);
+
+    // Phase 4: reconcile with prev for stable epochs, never dropping
     // below the on-disk floor (gh #216 — see the fn doc).
     let mut out = Vec::with_capacity(slots.len());
     for s in slots {
@@ -219,8 +264,12 @@ pub fn balance_groups(
         .unwrap_or_default();
 
     let mut out = Vec::with_capacity(groups.len());
+    let mut placed: HashSet<&str> = HashSet::new();
     for g in groups {
         let prev_entry = prev_map.get(&g.group_id);
+        if !placed.insert(g.group_id.as_str()) {
+            continue;
+        }
         if let Some(ga) = prev_entry {
             if alive_set.contains(&ga.broker) {
                 out.push(ga.clone());
@@ -235,7 +284,113 @@ pub fn balance_groups(
             epoch,
         });
     }
+
+    // gh #248: carry forward every prior entry whose broker is still
+    // alive, even when the group is absent from `groups`.
+    //
+    // `groups` is the union of what each *connected* broker reports,
+    // so a group drops out of it for reasons that have nothing to do
+    // with coordination: its members all left for a moment, its
+    // coordinator's heartbeat was briefly stale, or it was swept out
+    // of memory. Without this, absence retires the explicit entry,
+    // `Coordinator::owns_group` falls through to the hash — which can
+    // legitimately name a *different* broker than the sticky entry
+    // did — and the group's clients get NOT_COORDINATOR followed by a
+    // full rebuild. It is not self-healing either: the next
+    // recompute's `prev` no longer has the entry, so the coordinator
+    // has moved permanently on the strength of one missed report.
+    //
+    // Retirement is by broker death, not by absence: an entry whose
+    // broker has left is simply dropped (a still-live group is in
+    // `groups` and was re-picked above). So a deleted group's entry
+    // outlives it until its coordinator restarts — a few dozen bytes
+    // of assignment.json, against a client-visible group rebuild.
+    let mut carried: Vec<ConsumerGroupAssignment> = prev_map
+        .values()
+        .filter(|ga| !placed.contains(ga.group_id.as_str()) && alive_set.contains(&ga.broker))
+        .cloned()
+        .collect();
+    carried.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+    out.extend(carried);
     out
+}
+
+/// Give every slot Phase 1 left unpinned a broker.
+///
+/// Each one lands on the alive broker holding the fewest partitions
+/// **of its own topic**, ties broken by fewest partitions overall and
+/// then by rendezvous score. The topic dimension is what Apache gets
+/// for free by assigning each topic round-robin from its own starting
+/// offset (`AdminUtils.assignReplicasToBrokers`, KRaft's
+/// `StripedReplicaPlacer`): a per-partition hash alone has no memory
+/// of a partition's siblings, so 3 partitions over 3 brokers pile onto
+/// one broker 1 time in 9 (gh #247).
+///
+/// Rendezvous survives as the tiebreak rather than the mechanism, so
+/// placement stays a deterministic function of the inputs — any
+/// controller replaying the same recompute picks the same brokers.
+fn place_unpinned(slots: &mut [PartitionSlot], alive: &[String]) {
+    if alive.is_empty() {
+        return;
+    }
+    let mut total: HashMap<String, i32> = alive.iter().map(|b| (b.clone(), 0)).collect();
+    let mut per_topic: HashMap<(String, String), i32> = HashMap::new();
+    for s in slots.iter() {
+        if s.broker.is_empty() {
+            continue;
+        }
+        *total.entry(s.broker.clone()).or_insert(0) += 1;
+        *per_topic
+            .entry((s.topic.clone(), s.broker.clone()))
+            .or_insert(0) += 1;
+    }
+
+    for slot in slots.iter_mut() {
+        if !slot.broker.is_empty() {
+            continue;
+        }
+        let topic = slot.topic.clone();
+        let partition = slot.partition;
+        let mut best: Option<(i32, i32, u64, String)> = None;
+        for b in alive {
+            let cand = (
+                *per_topic.get(&(topic.clone(), b.clone())).unwrap_or(&0),
+                *total.get(b).unwrap_or(&0),
+                rendezvous_hash(&topic, partition, b),
+                b.clone(),
+            );
+            let better = match &best {
+                None => true,
+                // Fewest of this topic, then fewest overall, then the
+                // highest rendezvous score. `alive` is sorted, so the
+                // strict `>` on the score leaves the lexicographically
+                // first broker winning a total tie.
+                Some((bt, ball, bscore, _)) => {
+                    (cand.0, cand.1) < (*bt, *ball)
+                        || ((cand.0, cand.1) == (*bt, *ball) && cand.2 > *bscore)
+                }
+            };
+            if better {
+                best = Some(cand);
+            }
+        }
+        if let Some((_, _, _, broker)) = best {
+            *total.entry(broker.clone()).or_insert(0) += 1;
+            *per_topic.entry((topic, broker.clone())).or_insert(0) += 1;
+            slot.broker = broker;
+        }
+    }
+}
+
+/// Count of `topic`'s partitions currently sitting on `broker`.
+fn topic_count_on(slots: &[PartitionSlot], topic: &str, broker: &str) -> i32 {
+    i32::try_from(
+        slots
+            .iter()
+            .filter(|s| s.topic == topic && s.broker == broker)
+            .count(),
+    )
+    .unwrap_or(i32::MAX)
 }
 
 /// Move partitions from the most-loaded broker to the least-loaded
@@ -244,6 +399,13 @@ pub fn balance_groups(
 /// rendezvous score for the recipient (= the move closest to a
 /// no-op from rendezvous's perspective). Owned `String` keys throughout so the
 /// counts map doesn't tangle with the `alive` slice's lifetime.
+///
+/// Victim preference is ordered so the cheapest move wins: a slot the
+/// caller just placed before one inherited from `prev` (moving a
+/// sticky slot is a real open/recover/close cycle on the shared
+/// volume), and among equals one whose topic is over-represented on
+/// the donor, so cluster smoothing pulls in the same direction as
+/// [`smooth_partitions_per_topic`] instead of against it.
 fn smooth_partitions(slots: &mut [PartitionSlot], alive: &[String]) {
     if alive.len() < 2 || slots.is_empty() {
         return;
@@ -271,31 +433,40 @@ fn smooth_partitions(slots: &mut [PartitionSlot], alive: &[String]) {
         if hi_count - lo_count <= 1 {
             return;
         }
-        // Pick victim partition on `hi` with the highest rendezvous
-        // score for `lo`.
+        // Pick the victim on `hi`: freshly placed before inherited,
+        // then a topic over-represented on `hi` relative to `lo`,
+        // then the highest rendezvous score for `lo`, then
+        // lexicographic `(topic, partition)`.
         let mut victim_idx: Option<usize> = None;
-        let mut victim_score: u64 = 0;
+        let mut victim_key: (u8, u8, u64) = (0, 0, 0);
         for (i, s) in slots.iter().enumerate() {
             if s.broker != hi {
                 continue;
             }
-            let score = rendezvous_hash(&s.topic, s.partition, &lo);
-            match victim_idx {
-                None => {
-                    victim_idx = Some(i);
-                    victim_score = score;
-                }
-                Some(_) if score > victim_score => {
-                    victim_idx = Some(i);
-                    victim_score = score;
-                }
-                Some(prev) if score == victim_score => {
-                    let (vt, vp) = (&slots[prev].topic, slots[prev].partition);
-                    if &s.topic < vt || (&s.topic == vt && s.partition < vp) {
-                        victim_idx = Some(i);
+            let helps_topic =
+                topic_count_on(slots, &s.topic, &hi) > topic_count_on(slots, &s.topic, &lo);
+            let key = (
+                u8::from(s.sticky),
+                u8::from(!helps_topic),
+                rendezvous_hash(&s.topic, s.partition, &lo),
+            );
+            let better = match victim_idx {
+                None => true,
+                Some(prev) => {
+                    // First two components sort ascending (0 = the
+                    // preferred class), the score descending.
+                    if (key.0, key.1) != (victim_key.0, victim_key.1) {
+                        (key.0, key.1) < (victim_key.0, victim_key.1)
+                    } else if key.2 != victim_key.2 {
+                        key.2 > victim_key.2
+                    } else {
+                        (&s.topic, s.partition) < (&slots[prev].topic, slots[prev].partition)
                     }
                 }
-                _ => {}
+            };
+            if better {
+                victim_idx = Some(i);
+                victim_key = key;
             }
         }
         match victim_idx {
@@ -309,12 +480,160 @@ fn smooth_partitions(slots: &mut [PartitionSlot], alive: &[String]) {
     }
 }
 
+/// Level each topic across the alive set *without* disturbing the
+/// cluster-wide balance [`smooth_partitions`] just established
+/// (gh #247).
+///
+/// Two shapes of repair, cheapest first:
+///
+/// - a **move**, when the donor also has at least as many partitions
+///   overall as the recipient — the cluster invariant survives
+///   because the gap merely changes sign;
+/// - a **swap** with a partition of another topic that is itself
+///   over-represented on the recipient. Cluster counts are untouched
+///   by construction, and the other topic never gets worse.
+///
+/// Termination: both shapes strictly lower `Σ count²` over
+/// `(topic, broker)` — a move by ≥ 2, a swap by ≥ 2 net (the topic
+/// being repaired gives up ≥ 2 and its partner costs ≤ 0). The
+/// potential is a bounded non-negative integer, so the loop converges;
+/// the iteration cap is a backstop against a future edit breaking that
+/// argument, not the mechanism.
+fn smooth_partitions_per_topic(slots: &mut [PartitionSlot], alive: &[String]) {
+    if alive.len() < 2 || slots.is_empty() {
+        return;
+    }
+    let mut topics: Vec<String> = slots.iter().map(|s| s.topic.clone()).collect();
+    topics.sort();
+    topics.dedup();
+
+    let cap = slots.len() * alive.len() + 16;
+    for _ in 0..cap {
+        if !improve_one_topic(slots, alive, &topics) {
+            return;
+        }
+    }
+    tracing::warn!(
+        partitions = slots.len(),
+        "per-topic smoothing hit its iteration cap; layout is cluster-balanced but may be uneven within a topic"
+    );
+}
+
+/// One repair step for [`smooth_partitions_per_topic`]. Returns
+/// `false` when no topic can be improved — the pass is done.
+fn improve_one_topic(slots: &mut [PartitionSlot], alive: &[String], topics: &[String]) -> bool {
+    let mut totals: HashMap<String, i32> = alive.iter().map(|b| (b.clone(), 0)).collect();
+    for s in slots.iter() {
+        *totals.entry(s.broker.clone()).or_insert(0) += 1;
+    }
+
+    for topic in topics {
+        // `alive` is sorted, and both comparisons are strict, so the
+        // lexicographically first broker wins a tie on either end.
+        let mut hi = &alive[0];
+        let mut lo = &alive[0];
+        let mut hi_count = topic_count_on(slots, topic, hi);
+        let mut lo_count = hi_count;
+        for b in &alive[1..] {
+            let c = topic_count_on(slots, topic, b);
+            if c > hi_count {
+                hi = b;
+                hi_count = c;
+            }
+            if c < lo_count {
+                lo = b;
+                lo_count = c;
+            }
+        }
+        if hi_count - lo_count <= 1 {
+            continue;
+        }
+
+        // A plain move keeps `max - min <= 1` cluster-wide exactly
+        // when the donor is not already the lighter of the two.
+        let move_ok = totals.get(hi).copied().unwrap_or(0) >= totals.get(lo).copied().unwrap_or(0);
+        let Some(donor) = pick_slot(slots, topic, hi) else {
+            continue;
+        };
+        if move_ok {
+            slots[donor].broker = lo.clone();
+            return true;
+        }
+
+        // Otherwise swap with a partition of a topic that is itself
+        // over-represented on `lo`, which keeps both cluster counts
+        // and that topic's spread no worse than they were.
+        let partner = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                &s.broker == lo
+                    && &s.topic != topic
+                    && topic_count_on(slots, &s.topic, lo) > topic_count_on(slots, &s.topic, hi)
+            })
+            .min_by(|(_, a), (_, b)| {
+                (a.sticky, &a.topic, a.partition).cmp(&(b.sticky, &b.topic, b.partition))
+            })
+            .map(|(i, _)| i);
+        if let Some(partner) = partner {
+            slots[donor].broker = lo.clone();
+            slots[partner].broker = hi.clone();
+            return true;
+        }
+    }
+    false
+}
+
+/// Lowest `(sticky, topic, partition)` slot of `topic` on `broker` —
+/// the deterministic donor, preferring one that isn't inherited.
+fn pick_slot(slots: &[PartitionSlot], topic: &str, broker: &str) -> Option<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.topic == topic && s.broker == broker)
+        .min_by_key(|(_, s)| (s.sticky, s.partition))
+        .map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn brokers(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("kaas-{i}")).collect()
+    }
+
+    fn topic(name: &str, partition_count: i32) -> TopicSpec {
+        TopicSpec {
+            name: name.to_owned(),
+            partition_count,
+        }
+    }
+
+    /// `(broker → partition count)` over the whole assignment, or
+    /// over one topic when `only` is set.
+    fn counts(parts: &[PartitionAssignment], only: Option<&str>) -> HashMap<String, i32> {
+        let mut out: HashMap<String, i32> = HashMap::new();
+        for p in parts.iter().filter(|p| only.is_none_or(|t| p.topic == t)) {
+            *out.entry(p.broker.clone()).or_insert(0) += 1;
+        }
+        out
+    }
+
+    fn skew(parts: &[PartitionAssignment], only: Option<&str>, brokers: &[String]) -> i32 {
+        let c = counts(parts, only);
+        let vals: Vec<i32> = brokers
+            .iter()
+            .map(|b| c.get(b).copied().unwrap_or(0))
+            .collect();
+        vals.iter().max().copied().unwrap_or(0) - vals.iter().min().copied().unwrap_or(0)
+    }
+
+    fn find<'a>(parts: &'a [PartitionAssignment], topic: &str, p: i32) -> &'a PartitionAssignment {
+        parts
+            .iter()
+            .find(|q| q.topic == topic && q.partition == p)
+            .expect("partition present")
     }
 
     #[test]
@@ -516,6 +835,207 @@ mod tests {
         for g in &second {
             assert!(g.broker == "kaas-0" || g.broker == "kaas-1");
         }
+    }
+
+    #[test]
+    fn creating_a_topic_moves_no_existing_partition() {
+        // gh #206: the smoother used to be a pure function of
+        // `(topics, alive)`, so any topic CR change re-derived the
+        // whole layout and migrated partitions of unrelated topics.
+        let b = brokers(3);
+        let before = vec![topic("t1", 6), topic("t2", 3), topic("t3", 4)];
+        let first = balance(None, &b, &before, &HashMap::new());
+
+        let mut after = before.clone();
+        after.push(topic("newcomer", 5));
+        let second = balance(Some(&first), &b, &after, &HashMap::new());
+
+        for p in &first {
+            let q = find(&second, &p.topic, p.partition);
+            assert_eq!(
+                (&q.broker, q.epoch),
+                (&p.broker, p.epoch),
+                "{}/{} moved {} → {} on an unrelated topic create",
+                p.topic,
+                p.partition,
+                p.broker,
+                q.broker
+            );
+        }
+        assert!(skew(&second, None, &b) <= 1, "cluster balance preserved");
+    }
+
+    #[test]
+    fn deleting_a_topic_moves_no_surviving_partition() {
+        let b = brokers(3);
+        let before = vec![topic("t1", 6), topic("doomed", 3), topic("t3", 4)];
+        let first = balance(None, &b, &before, &HashMap::new());
+
+        let after = vec![topic("t1", 6), topic("t3", 4)];
+        let second = balance(Some(&first), &b, &after, &HashMap::new());
+
+        assert_eq!(second.len(), 10, "only the deleted topic's slots are gone");
+        for p in first.iter().filter(|p| p.topic != "doomed") {
+            let q = find(&second, &p.topic, p.partition);
+            assert_eq!(
+                (&q.broker, q.epoch),
+                (&p.broker, p.epoch),
+                "{}/{} moved on an unrelated topic delete",
+                p.topic,
+                p.partition
+            );
+        }
+    }
+
+    #[test]
+    fn every_topic_is_spread_across_the_alive_set() {
+        // gh #247: cluster-wide counts can be perfectly even while a
+        // single topic sits entirely on one broker. Small topics are
+        // where a per-partition hash collides: 3 over 3 lands on one
+        // broker 1 time in 9.
+        let b = brokers(3);
+        let topics: Vec<TopicSpec> = (0..12).map(|i| topic(&format!("t{i}"), 3)).collect();
+        let parts = balance(None, &b, &topics, &HashMap::new());
+
+        for t in &topics {
+            assert!(
+                skew(&parts, Some(&t.name), &b) <= 1,
+                "{} is lopsided: {:?}",
+                t.name,
+                counts(&parts, Some(&t.name))
+            );
+        }
+        assert!(skew(&parts, None, &b) <= 1);
+    }
+
+    #[test]
+    fn a_lopsided_topic_is_repaired_without_breaking_cluster_balance() {
+        // The live shape from gh #247: `kaas-canary-v1` had all three
+        // partitions on kaas-2 at epoch 1 — never moved since first
+        // assignment — while the cluster totals were 24/24/25.
+        let b = brokers(3);
+        let topics = vec![topic("big", 9), topic("canary", 3)];
+        // 4/4/1 for `big` plus 0/0/3 for `canary` is 4/4/4 overall —
+        // cluster-wide perfect, so the cluster smoother's predicate is
+        // false on its first iteration and it returns having touched
+        // nothing. Only a per-topic pass can see the problem.
+        let prev: Vec<PartitionAssignment> = (0..9)
+            .map(|p| PartitionAssignment {
+                topic: "big".to_owned(),
+                partition: p,
+                broker: format!(
+                    "kaas-{}",
+                    if p < 4 {
+                        0
+                    } else if p < 8 {
+                        1
+                    } else {
+                        2
+                    }
+                ),
+                epoch: 1,
+                role: PartitionRole::Leader,
+            })
+            .chain((0..3).map(|p| PartitionAssignment {
+                topic: "canary".to_owned(),
+                partition: p,
+                broker: "kaas-2".to_owned(),
+                epoch: 1,
+                role: PartitionRole::Leader,
+            }))
+            .collect();
+
+        let out = balance(Some(&prev), &b, &topics, &HashMap::new());
+        assert!(
+            skew(&out, Some("canary"), &b) <= 1,
+            "canary still lopsided: {:?}",
+            counts(&out, Some("canary"))
+        );
+        assert!(
+            skew(&out, None, &b) <= 1,
+            "repair broke the cluster-wide balance: {:?}",
+            counts(&out, None)
+        );
+        // Repairing one topic must not rewrite the other.
+        assert!(skew(&out, Some("big"), &b) <= 1);
+    }
+
+    #[test]
+    fn balance_is_idempotent_once_settled() {
+        // A settled layout must be a fixed point — otherwise every
+        // recompute bumps epochs and drives a takeover.
+        let b = brokers(3);
+        let topics = vec![topic("t1", 7), topic("t2", 3), topic("t3", 4)];
+        let first = balance(None, &b, &topics, &HashMap::new());
+        let second = balance(Some(&first), &b, &topics, &HashMap::new());
+        assert_eq!(first, second);
+        let third = balance(Some(&second), &b, &topics, &HashMap::new());
+        assert_eq!(second, third);
+    }
+
+    #[test]
+    fn balance_groups_keeps_a_group_that_stopped_being_reported() {
+        // gh #248: `active_groups()` is the union over *connected*
+        // brokers, so a group drops out of it for reasons unrelated to
+        // coordination. Retiring its entry on absence hands the group
+        // to the hash fallthrough, which can name a different broker —
+        // NOT_COORDINATOR, then a full group rebuild.
+        let b = brokers(3);
+        let groups = vec![
+            GroupSpec {
+                group_id: "streams-app".to_owned(),
+            },
+            GroupSpec {
+                group_id: "other".to_owned(),
+            },
+        ];
+        let first = balance_groups(None, &b, &groups);
+
+        // Same alive set, but the group missed one reporting window.
+        let quiet = vec![GroupSpec {
+            group_id: "other".to_owned(),
+        }];
+        let second = balance_groups(Some(&first), &b, &quiet);
+
+        let before = first.iter().find(|g| g.group_id == "streams-app").unwrap();
+        let after = second
+            .iter()
+            .find(|g| g.group_id == "streams-app")
+            .expect("an unreported group keeps its coordinator");
+        assert_eq!(before, after, "coordinator moved on a missed report");
+
+        // And it is still there once the group reports again.
+        let third = balance_groups(Some(&second), &b, &groups);
+        assert_eq!(
+            third.iter().find(|g| g.group_id == "streams-app").unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn balance_groups_retires_an_unreported_group_when_its_broker_dies() {
+        // The other half of the carry-forward rule: retirement is by
+        // broker death, not by absence, so the list can't grow without
+        // bound.
+        let b = brokers(3);
+        let groups = vec![GroupSpec {
+            group_id: "g".to_owned(),
+        }];
+        let first = balance_groups(None, &b, &groups);
+        let host = first[0].broker.clone();
+        let survivors: Vec<String> = b.iter().filter(|x| **x != host).cloned().collect();
+
+        let second = balance_groups(Some(&first), &survivors, &[]);
+        assert!(
+            second.is_empty(),
+            "an unreported group on a dead broker is dropped, not re-picked"
+        );
+
+        // Still reported → re-picked onto a survivor, epoch bumped.
+        let third = balance_groups(Some(&first), &survivors, &groups);
+        assert_eq!(third.len(), 1);
+        assert!(survivors.contains(&third[0].broker));
+        assert_eq!(third[0].epoch, first[0].epoch + 1);
     }
 
     #[test]

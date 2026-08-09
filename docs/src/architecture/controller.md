@@ -77,6 +77,49 @@ compute an empty assignment. How a broker earns — and loses — its
 place in the alive set is the subject of [Honest readiness & rollout
 pacing](./readiness-rollout.md).
 
+## How partitions get placed
+
+Apache Kafka decides placement once, when a topic is created, and the
+answer lives in the metadata log forever. kaas has no such log: the
+assignment is recomputed from scratch every time an input changes. That
+buys self-healing — a partition on a departed broker is simply somewhere
+else in the next file — but it means the balancer has to *choose* to be
+stable, because nothing outside it remembers the last answer.
+
+It does that by deciding as little as possible:
+
+1. **Keep** every partition whose current leader is still alive.
+2. **Place** only what's left, giving each new partition to the broker
+   holding the fewest partitions *of that topic*.
+3. **Even out** the brokers, cluster-wide, until no broker leads more
+   than one partition more than any other.
+4. **Even out** each topic across brokers, by trading partitions
+   between brokers rather than moving them one way — so the balance
+   from step 3 survives untouched.
+
+Step 1 comes first for a reason. Deriving the whole layout and *then*
+noticing what didn't change gets the same answer in a steady state, but
+it makes every recompute a fresh opinion about every partition — so
+creating one topic could hand a dozen unrelated partitions to different
+brokers. Each of those is a genuine cost here: the new leader opens the
+log, replays the tail, and the old leader keeps acknowledging writes
+until it notices it's been replaced.
+
+Step 4 is separate from step 3 because an even cluster and an even
+topic are different properties. Three brokers each leading 25
+partitions look perfectly balanced, and a 3-partition topic can still
+have all three of its partitions on one of them — every producer and
+consumer for that topic talking to one broker while the other two sit
+idle. Apache gets this for free by assigning each topic round-robin
+from its own starting offset; kaas has to ask for it explicitly.
+
+Two rules keep the moves cheap. Partitions that were just placed move
+before partitions inherited from the previous assignment, since the
+first cost nothing and the second cost a takeover. And the per-topic
+pass swaps rather than moves — one partition each way between two
+brokers — so it can never disturb the cluster-wide balance it runs
+after.
+
 ## How peers follow
 
 Non-controller brokers watch `assignment.json` via file notification
