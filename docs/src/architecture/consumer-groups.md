@@ -76,6 +76,18 @@ pass below — has to consult *both* tiers, because a group living on
 the hash tier alone (any brand-new group, for one) otherwise looks
 unowned to whoever reads only the explicit list.
 
+And it binds the controller hardest of all, in a way that is easy to
+miss: **the entry it writes has to agree with the hash it is
+replacing.** A brand-new group has no entry, so brokers serve it from
+the hash. The moment the controller writes the group's first entry,
+that entry becomes the answer. If the controller picked the
+coordinator with a different function than the hash tier uses — even a
+perfectly good one — then writing it *moves the group*, and the group's
+clients see `NOT_COORDINATOR` and rebuild, once, shortly after they
+start, for no reason a user could ever diagnose. Both sides resolve
+through the same function over the same broker list, so the first entry
+confirms rather than relocates.
+
 ## Group takeover and the orphan sweep
 
 When the assignment changes — a broker joins, leaves, or dies — every

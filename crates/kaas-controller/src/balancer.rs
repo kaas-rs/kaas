@@ -38,7 +38,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 
-use kaas_broker::{ConsumerGroupAssignment, PartitionAssignment, PartitionRole};
+use kaas_broker::{
+    BrokerAssignment, BrokerHealth, ConsumerGroupAssignment, PartitionAssignment, PartitionRole,
+};
 
 /// Per-topic catalog entry the balancer consumes. The KafkaTopic CR
 /// watcher (Phase 7) is the production source; tests pass a literal
@@ -248,17 +250,49 @@ pub fn balance(
 
 /// Same recipe for consumer groups: keep a still-alive assignment;
 /// otherwise hash-pick. No smoothing — each group is a single unit.
+///
+/// **The hash must be the one the brokers use** (gh #248).
+/// `assignment.json.consumerGroups[]` is only the *first* tier of
+/// `Coordinator::owns_group`; absent an entry a broker falls through to
+/// `group_hash::pick_group_coordinator`. If this function mints entries
+/// with a different function, then the moment the controller first
+/// writes an entry for a group, the group moves — from wherever the
+/// fallthrough had been serving it to wherever this function decided —
+/// and its clients get `NOT_COORDINATOR` followed by a full rebuild.
+/// That is one guaranteed disruption per group, shortly after it
+/// starts, on a healthy cluster with nothing wrong.
+///
+/// It used to mint with `rendezvous_pick_group` (highest-random-weight)
+/// while brokers resolved with `pick_coordinator` (`hash % n` plus a
+/// deterministic alternate). Those agree only by coincidence: on the
+/// live 3-broker cluster they disagreed for every group id tried.
+///
+/// So this takes the **broker rows** rather than a list of alive ids —
+/// `pick_coordinator` divides by the full registered set (gh #249), and
+/// handing it anything narrower reintroduces the divisor bug. Taking the
+/// rows the writer is about to serialise means the balancer and every
+/// broker reading the file resolve from byte-identical input.
 pub fn balance_groups(
     prev: Option<&[ConsumerGroupAssignment]>,
-    brokers: &[String],
+    brokers: &[BrokerAssignment],
     groups: &[GroupSpec],
 ) -> Vec<ConsumerGroupAssignment> {
     if brokers.is_empty() {
         return Vec::new();
     }
-    let mut alive = brokers.to_vec();
-    alive.sort();
-    let alive_set: HashSet<String> = alive.iter().cloned().collect();
+    // Derived exactly as `Assignment::broker_sets` does on the read
+    // side — same set, same aliveness rule.
+    let mut ids: Vec<String> = Vec::with_capacity(brokers.len());
+    let mut alive_map: HashMap<String, bool> = HashMap::with_capacity(brokers.len());
+    for b in brokers {
+        ids.push(b.id.clone());
+        alive_map.insert(b.id.clone(), matches!(b.health, BrokerHealth::Alive));
+    }
+    let alive_set: HashSet<String> = ids
+        .iter()
+        .filter(|id| alive_map.get(*id).copied().unwrap_or(false))
+        .cloned()
+        .collect();
     let prev_map: HashMap<String, ConsumerGroupAssignment> = prev
         .map(|ps| ps.iter().map(|g| (g.group_id.clone(), g.clone())).collect())
         .unwrap_or_default();
@@ -276,7 +310,11 @@ pub fn balance_groups(
                 continue;
             }
         }
-        let broker = rendezvous_pick_group(&g.group_id, &alive).unwrap_or_default();
+        // Same function `Coordinator::owns_group` falls through to, so
+        // the entry we write CONFIRMS where the group already is
+        // instead of moving it.
+        let broker = kaas_broker::group_hash::pick_group_coordinator(&g.group_id, &ids, &alive_map)
+            .unwrap_or_default();
         let epoch = prev_entry.map(|ga| ga.epoch + 1).unwrap_or(1);
         out.push(ConsumerGroupAssignment {
             group_id: g.group_id.clone(),
@@ -603,6 +641,34 @@ mod tests {
         (0..n).map(|i| format!("kaas-{i}")).collect()
     }
 
+    /// Broker rows for `n` brokers, all alive — what the writer hands
+    /// `balance_groups`.
+    fn rows(n: usize) -> Vec<BrokerAssignment> {
+        brokers(n)
+            .into_iter()
+            .map(|id| BrokerAssignment {
+                id,
+                health: BrokerHealth::Alive,
+                last_seen: "2026-08-09T00:00:00Z".to_owned(),
+            })
+            .collect()
+    }
+
+    /// Same, but only `alive` are Alive; the rest stay registered and
+    /// Dead, which is what keeps the coordinator-hash divisor stable
+    /// (gh #249).
+    fn rows_with_alive(n: usize, alive: &[&str]) -> Vec<BrokerAssignment> {
+        rows(n)
+            .into_iter()
+            .map(|mut r| {
+                if !alive.contains(&r.id.as_str()) {
+                    r.health = BrokerHealth::Dead;
+                }
+                r
+            })
+            .collect()
+    }
+
     fn topic(name: &str, partition_count: i32) -> TopicSpec {
         TopicSpec {
             name: name.to_owned(),
@@ -801,7 +867,6 @@ mod tests {
 
     #[test]
     fn balance_groups_stable_on_alive_set_unchanged() {
-        let b = brokers(3);
         let groups = vec![
             GroupSpec {
                 group_id: "g1".to_owned(),
@@ -810,14 +875,14 @@ mod tests {
                 group_id: "g2".to_owned(),
             },
         ];
-        let first = balance_groups(None, &b, &groups);
-        let second = balance_groups(Some(&first), &b, &groups);
+        let r = rows(3);
+        let first = balance_groups(None, &r, &groups);
+        let second = balance_groups(Some(&first), &r, &groups);
         assert_eq!(first, second);
     }
 
     #[test]
     fn balance_groups_reassigns_only_dead_broker_groups() {
-        let three = brokers(3);
         let groups = vec![
             GroupSpec {
                 group_id: "ga".to_owned(),
@@ -829,8 +894,9 @@ mod tests {
                 group_id: "gc".to_owned(),
             },
         ];
-        let first = balance_groups(None, &three, &groups);
-        let two = vec!["kaas-0".to_owned(), "kaas-1".to_owned()];
+        let first = balance_groups(None, &rows(3), &groups);
+        // kaas-2 dies but stays registered — the divisor holds.
+        let two = rows_with_alive(3, &["kaas-0", "kaas-1"]);
         let second = balance_groups(Some(&first), &two, &groups);
         for g in &second {
             assert!(g.broker == "kaas-0" || g.broker == "kaas-1");
@@ -980,7 +1046,7 @@ mod tests {
         // coordination. Retiring its entry on absence hands the group
         // to the hash fallthrough, which can name a different broker —
         // NOT_COORDINATOR, then a full group rebuild.
-        let b = brokers(3);
+        let r = rows(3);
         let groups = vec![
             GroupSpec {
                 group_id: "streams-app".to_owned(),
@@ -989,13 +1055,13 @@ mod tests {
                 group_id: "other".to_owned(),
             },
         ];
-        let first = balance_groups(None, &b, &groups);
+        let first = balance_groups(None, &r, &groups);
 
         // Same alive set, but the group missed one reporting window.
         let quiet = vec![GroupSpec {
             group_id: "other".to_owned(),
         }];
-        let second = balance_groups(Some(&first), &b, &quiet);
+        let second = balance_groups(Some(&first), &r, &quiet);
 
         let before = first.iter().find(|g| g.group_id == "streams-app").unwrap();
         let after = second
@@ -1005,7 +1071,7 @@ mod tests {
         assert_eq!(before, after, "coordinator moved on a missed report");
 
         // And it is still there once the group reports again.
-        let third = balance_groups(Some(&second), &b, &groups);
+        let third = balance_groups(Some(&second), &r, &groups);
         assert_eq!(
             third.iter().find(|g| g.group_id == "streams-app").unwrap(),
             before
@@ -1017,13 +1083,16 @@ mod tests {
         // The other half of the carry-forward rule: retirement is by
         // broker death, not by absence, so the list can't grow without
         // bound.
-        let b = brokers(3);
         let groups = vec![GroupSpec {
             group_id: "g".to_owned(),
         }];
-        let first = balance_groups(None, &b, &groups);
+        let first = balance_groups(None, &rows(3), &groups);
         let host = first[0].broker.clone();
-        let survivors: Vec<String> = b.iter().filter(|x| **x != host).cloned().collect();
+        let alive: Vec<&str> = ["kaas-0", "kaas-1", "kaas-2"]
+            .into_iter()
+            .filter(|x| *x != host)
+            .collect();
+        let survivors = rows_with_alive(3, &alive);
 
         let second = balance_groups(Some(&first), &survivors, &[]);
         assert!(
@@ -1034,8 +1103,88 @@ mod tests {
         // Still reported → re-picked onto a survivor, epoch bumped.
         let third = balance_groups(Some(&first), &survivors, &groups);
         assert_eq!(third.len(), 1);
-        assert!(survivors.contains(&third[0].broker));
+        assert!(alive.contains(&third[0].broker.as_str()));
         assert_eq!(third[0].epoch, first[0].epoch + 1);
+    }
+
+    #[test]
+    fn a_minted_entry_confirms_where_the_hash_already_put_the_group() {
+        // gh #248, the structural half. `consumerGroups[]` is only the
+        // first tier of `Coordinator::owns_group`; without an entry a
+        // broker falls through to `pick_group_coordinator`. If the
+        // controller mints entries with a *different* function, the
+        // first entry it ever writes for a group moves that group —
+        // NOT_COORDINATOR, then a full rebuild — once per group, on a
+        // healthy cluster.
+        //
+        // The old code used `rendezvous_pick_group` (highest-random-
+        // weight) here while brokers used `pick_coordinator`
+        // (`hash % n`). On the live 3-broker cluster those disagreed
+        // for every group id tried, so every new group was guaranteed
+        // one move.
+        let r = rows(3);
+        let (ids, alive) = broker_sets_of(&r);
+        for id in [
+            "kaas-streams-wordcount",
+            "g1",
+            "my-group",
+            "console-consumer-1",
+            "connect-cluster",
+        ] {
+            let minted = balance_groups(
+                None,
+                &r,
+                &[GroupSpec {
+                    group_id: id.to_owned(),
+                }],
+            );
+            let broker_side = kaas_broker::group_hash::pick_group_coordinator(id, &ids, &alive)
+                .expect("a broker is alive");
+            assert_eq!(
+                minted[0].broker, broker_side,
+                "the entry minted for {id} disagrees with the hash \
+                 fallthrough, so writing it would move the group"
+            );
+        }
+    }
+
+    #[test]
+    fn a_minted_entry_divides_by_the_full_registered_set() {
+        // The gh #249 divisor rule reaches the mint path too: a dead
+        // broker keeps its row, so losing one must not rehash the
+        // groups that lived on the survivors.
+        let all_alive = rows(3);
+        let one_dead = rows_with_alive(3, &["kaas-0", "kaas-1"]);
+        let specs: Vec<GroupSpec> = (0..40)
+            .map(|i| GroupSpec {
+                group_id: format!("group-{i}"),
+            })
+            .collect();
+
+        let before = balance_groups(None, &all_alive, &specs);
+        let after = balance_groups(None, &one_dead, &specs);
+
+        // Every group NOT hosted on the dead broker keeps its
+        // coordinator. With a shrinking divisor this would rehash ~2/3
+        // of them.
+        let moved = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(b, a)| b.broker != "kaas-2" && b.broker != a.broker)
+            .count();
+        assert_eq!(moved, 0, "a broker loss rehashed groups it wasn't hosting");
+        assert!(after.iter().all(|g| g.broker != "kaas-2"));
+    }
+
+    /// `(ids, alive)` exactly as `Assignment::broker_sets` derives them.
+    fn broker_sets_of(rows: &[BrokerAssignment]) -> (Vec<String>, HashMap<String, bool>) {
+        let mut ids = Vec::new();
+        let mut alive = HashMap::new();
+        for r in rows {
+            ids.push(r.id.clone());
+            alive.insert(r.id.clone(), matches!(r.health, BrokerHealth::Alive));
+        }
+        (ids, alive)
     }
 
     #[test]

@@ -334,23 +334,28 @@ where
                 s.current.as_ref().map(|a| a.partitions.clone());
             let prev_groups: Option<Vec<ConsumerGroupAssignment>> =
                 s.current.as_ref().map(|a| a.consumer_groups.clone());
-            let parts = balance(prev_parts.as_deref(), &brokers, &topics, &epoch_floor);
-            let groups = balance_groups(prev_groups.as_deref(), &brokers, &group_specs);
             s.version_counter += 1;
             let version = s.version_counter;
             let now = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+            // Broker rows FIRST: `balance_groups` resolves through the
+            // same rows every broker will read back, so the entry it
+            // mints agrees with the hash fallthrough by construction
+            // (gh #248).
+            let broker_entries = build_broker_entries(
+                &registered,
+                &brokers,
+                &draining,
+                &now,
+                s.current.as_ref().map(|a| a.brokers.as_slice()),
+            );
+            let parts = balance(prev_parts.as_deref(), &brokers, &topics, &epoch_floor);
+            let groups = balance_groups(prev_groups.as_deref(), &broker_entries, &group_specs);
             let a = Assignment {
                 controller_epoch: self.controller_epoch.load(Ordering::Relaxed),
                 assignment_version: version,
                 generated_at: now.clone(),
                 controller: self.controller_id.clone(),
-                brokers: build_broker_entries(
-                    &registered,
-                    &brokers,
-                    &draining,
-                    &now,
-                    s.current.as_ref().map(|a| a.brokers.as_slice()),
-                ),
+                brokers: broker_entries,
                 partitions: parts,
                 consumer_groups: groups,
             };
