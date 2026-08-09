@@ -133,6 +133,17 @@ broker:
   #               at segment roll. Maximum throughput, weakest durability.
   flushIntervalMessages: 1
 
+  # gh #250: how often the retention cleaner sweeps owned partitions and
+  # drops closed segments that have aged past the topic's `retention.ms`
+  # or pushed it over `retention.bytes`. Mirrors Apache's
+  # `log.retention.check.interval.ms` (same 5-minute default).
+  #
+  # Only the partition's leader reaps, and the active segment is never
+  # reclaimed — that stays DeleteRecords' job. `0` disables the sweep,
+  # which means nothing reclaims disk except DeleteRecords and topic
+  # deletion.
+  retentionCheckIntervalSeconds: 300
+
   # gh #108: TxnStateStore slot count. Pinned to a cluster-wide
   # constant independent of replicaCount — mirrors Apache's
   # transaction.state.log.num.partitions=50 default. Scale ops change

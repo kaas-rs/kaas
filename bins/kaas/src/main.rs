@@ -205,7 +205,7 @@ async fn main() -> Result<()> {
     // Registry before engine: it doubles as the placement resolver
     // (gh #221 phase 2) — the engine resolves partition roots through
     // the volume assignments the topic watch stashes into it.
-    let engine = build_engine(
+    let (engine, disk_engine) = build_engine(
         cli.data_dir.clone(),
         cli.flush_interval_messages,
         cli.log_dirs.clone(),
@@ -601,6 +601,57 @@ async fn main() -> Result<()> {
         });
     }
 
+    // gh #250: retention. The cleaner existed, was unit-tested, and was
+    // never constructed — so `retention.ms` / `retention.bytes` were
+    // accepted by the CRD, echoed back by DescribeConfigs, and enforced
+    // by nothing. Only DeleteRecords and topic deletion reclaimed disk.
+    //
+    // Disk engines only (there is nothing to reclaim in the dev-mode
+    // in-memory engine), and leader-gated: a pass unlinks segment files
+    // on the shared volume, so a non-leader running it is an NFS
+    // substrate rule 3 violation and would silly-rename files the real
+    // leader holds open (gh #76).
+    if let Some(disk) = disk_engine.clone() {
+        let interval_secs = cli.retention_check_interval_secs;
+        if interval_secs == 0 {
+            info!("KAAS_RETENTION_CHECK_INTERVAL=0 — retention sweep disabled");
+        } else {
+            let policy = Arc::new(kaas_storage::TopicConfigPolicySource::new(
+                disk.clone(),
+                // No engine-wide default: absent per-topic config means
+                // retain forever, which is what a broker with no
+                // `.config.json` did before this existed.
+                kaas_storage::RetentionPolicy::default(),
+            ));
+            let cleaner = kaas_storage::RetentionCleaner::with_policy_source(disk, policy)
+                .with_ownership(Arc::new(CoordinatorOwnership(broker.clone())));
+            let cleaner_cancel = cancel.clone();
+            info!(interval_secs, "retention cleaner started");
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The first tick fires immediately; skip it so a
+                // rolling restart doesn't have every broker sweep
+                // while it is still taking over partitions.
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        () = cleaner_cancel.cancelled() => break,
+                        _ = tick.tick() => match cleaner.run_once().await {
+                            Ok(0) => {}
+                            Ok(n) => info!(partitions = n, "retention pass reclaimed"),
+                            // Never fatal: a failed pass retries on the
+                            // next tick, and the alternative is a broker
+                            // that dies because a disk got full.
+                            Err(err) => warn!(%err, "retention pass failed"),
+                        },
+                    }
+                }
+                info!("retention cleaner stopped");
+            });
+        }
+    }
+
     // Flip the base /readyz gate once the accept loop is up. Readiness
     // now ALSO requires main-runtime liveness and (in cluster mode)
     // takeover completion — see health::compute_ready. If a listener
@@ -773,12 +824,19 @@ fn spawn_reloader(
     }))
 }
 
+/// The engine plus, when it is disk-backed, the concrete handle.
+type BuiltEngine = (Arc<dyn StorageEngine>, Option<Arc<DiskStorageEngine>>);
+
+/// Returns the engine plus, when it is disk-backed, the concrete
+/// handle. The retention cleaner needs the concrete type (it walks
+/// partitions and reads topic config off the volume) and there is
+/// nothing to clean in the dev-mode in-memory engine.
 fn build_engine(
     data_dir: Option<PathBuf>,
     flush_interval_messages: i64,
     log_dirs: Vec<kaas_storage::LogDirInfo>,
     placement: Arc<TopicRegistry>,
-) -> Result<Arc<dyn StorageEngine>> {
+) -> Result<BuiltEngine> {
     match data_dir {
         Some(dir) => {
             std::fs::create_dir_all(&dir).context("creating KAAS_DATA_DIR")?;
@@ -804,9 +862,10 @@ fn build_engine(
             // gh #241: same registry, second role — the incarnation
             // source for the identity gate on partition open.
             engine.set_identity_resolver(placement);
-            Ok(Arc::new(engine))
+            let disk = Arc::new(engine);
+            Ok((disk.clone(), Some(disk)))
         }
-        None => Ok(Arc::new(MemoryStorage::new())),
+        None => Ok((Arc::new(MemoryStorage::new()), None)),
     }
 }
 
@@ -1066,6 +1125,30 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[allow(dead_code)]
 fn _silence_unused_hashmap() -> HashMap<u8, u8> {
     HashMap::new()
+}
+
+/// Leadership gate for the retention cleaner (gh #250).
+///
+/// Re-reads `broker.coordinator()` on every call for the same reason
+/// [`BrokerRuntimeState`] does: the cleaner is spawned before the
+/// cluster runtime installs a coordinator. No coordinator means dev
+/// mode or single-broker, where this broker leads everything it has
+/// open — so the answer is `true` and retention keeps working.
+///
+/// In cluster mode the gate answers `false` for everything until the
+/// first `assignment.json` load, which delays the first sweep by one
+/// poll rather than skipping it. That is the safe direction: the cost
+/// of waiting is disk, the cost of guessing wrong is deleting a
+/// partition another broker leads.
+struct CoordinatorOwnership(Arc<Broker>);
+
+impl kaas_storage::OwnershipSource for CoordinatorOwnership {
+    fn owns_partition(&self, topic: &str, partition: i32) -> bool {
+        match self.0.coordinator() {
+            Some(c) => c.owns(topic, partition),
+            None => true,
+        }
+    }
 }
 
 /// `/healthz` runtime-state adapter over the broker's cluster

@@ -8,6 +8,11 @@ rust-version.workspace = true
 publish      = false
 description  = "DiskStorageEngine: segments, manifest, idempotence, producer snapshot."
 
+[features]
+# Exposes synthetic-batch helpers (`segment::stamp_crc`) to other
+# crates' tests. Never enabled for the shipped binaries.
+test-helpers = []
+
 [dependencies]
 async-trait  = { workspace = true }
 bytes        = { workspace = true }
@@ -21,6 +26,7 @@ nix              = { workspace = true }
 arc-swap         = { workspace = true }
 crc32c           = { workspace = true }
 kaas-observability = { workspace = true }
+tracing          = { workspace = true }
 
 [dev-dependencies]
 proptest     = { workspace = true }

@@ -268,20 +268,20 @@ coalescing are the two levers that matter (see
 ## Retention, DeleteRecords, and compaction — the honest state
 
 Per-topic policy flows from `KafkaTopic.spec.config` through the
-operator-written `.config.json` into the broker — but as of today **no
-background cleaner runs in production**:
+operator-written `.config.json` into the broker, where a background
+cleaner enforces it:
 
-- **`DeleteRecords`** (API key 21) is one of the two working
-  reclamation paths: it advances `logStartOffset` and unlinks closed
-  segments the purge fully covers (the active segment is never
-  reclaimed). Being a leader-side unlink, it actually frees disk per
-  the [file-handle ownership rule](./file-handles.md). Topic deletion
-  is the other.
-- **Size-based retention** exists as code, exercised by its unit tests,
-  but is **not instantiated by the broker** — the interval loop its
-  docstring promises is an open follow-up, as are time-based retention
-  and the compactor.
-- **Compaction knobs** `min.compaction.lag.ms` (KIP-58) and
+- **Retention** runs on a timer (five minutes by default, the same
+  cadence and meaning as Apache's `log.retention.check.interval.ms`).
+  Each pass drops closed segments that have aged past `retention.ms` or
+  pushed the partition over `retention.bytes`, whichever reaps more.
+  `-1` on either knob — or no config at all — means retain forever. The
+  active segment is never reclaimed.
+- **`DeleteRecords`** (API key 21) reclaims on demand rather than on a
+  timer: it advances `logStartOffset` to a caller-chosen point and
+  unlinks the closed segments that point fully covers. Topic deletion
+  is the third path.
+- **Compaction** is still missing. Its knobs `min.compaction.lag.ms` (KIP-58) and
   `delete.retention.ms` (KIP-354) round-trip through CRs and
   DescribeConfigs but gate nothing yet. When the compactor lands,
   tombstone expiry will be **per-batch** (Apache is per-record) — a
@@ -289,21 +289,58 @@ background cleaner runs in production**:
   honestly on the [KIP-58](../compat/kip/kip-58.md) and
   [KIP-354](../compat/kip/kip-354.md) pages.
 
+### How old is a segment?
+
+Time-based retention has to answer that per segment, and the answer is
+less obvious than it looks. Apache keeps a *time index* alongside each
+segment and reads the largest record timestamp out of it. kaas has no
+time index, and its manifest — the small JSON file beside a partition's
+segments — records the epoch, high watermark and log start offset, but
+no per-segment list. So there is nowhere on disk for a segment's
+largest timestamp to live.
+
+kaas therefore uses the timestamp it *does* know for free. While a
+segment is being written, the broker tracks the largest record
+timestamp it has seen, and stamps that onto the segment when it rolls
+closed. A segment closed by this broker, in this process, is dated by
+its records — exactly like Apache.
+
+Everything else is dated by the log file's **modification time**. That
+covers every segment a broker inherits when it restarts or takes a
+partition over from a peer. It is the same fallback Apache uses when a
+segment has no usable timestamp, and it is well-behaved here: a closed
+segment is never written again, so its mtime stops moving the moment it
+rolls.
+
+The practical difference is small but worth knowing: a producer that
+back-dates its records — setting timestamps far in the past — will see
+them aged out promptly by the broker that wrote them, and aged by
+wall-clock arrival time by a broker that inherited them.
+
+Retention only ever runs on the broker that **leads** the partition.
+This is not an optimisation: on a shared volume, a second broker
+deleting the same segments is a data race, and deleting a file another
+broker still holds open doesn't free the space at all — the filesystem
+just renames it out of the way. See [file-handle
+ownership](./file-handles.md).
+
 ## Implementation notes (for contributors)
 
 - Issue trail: the group-commit Produce path is gh #80/#81/#82; the
   lock-free ArcSwap read path is gh #134; the 30 s fsync watchdog is
   gh #95; stateless fetch sessions are gh #4; wiring the retention
-  cleaner's interval loop is gh #158.
+  cleaner's interval loop was gh #250, and the compactor is still open
+  on gh #158.
 - Byte-opacity peeks: `kaas-storage/src/idempotence.rs` (PID / epoch /
   sequence) and `kaas-storage/src/segment.rs` (offsets / timestamp);
   the codec side is `kaas-codec` decoding
   `records: Option<bytes::Bytes>` as a zero-copy slice. Enforced by the
   tripwire counters and the `bins/kaas/tests/byte_opacity.rs`
   integration test.
-- Topic-config plumbing: `crates/kaas-storage/src/topicconfig.rs`. The
-  never-instantiated `RetentionCleaner`:
-  `crates/kaas-storage/src/cleaner.rs`.
+- Topic-config plumbing: `crates/kaas-storage/src/topicconfig.rs`;
+  `RetentionCleaner` and its policy sources:
+  `crates/kaas-storage/src/cleaner.rs`; the interval loop and the
+  leadership gate: `bins/kaas/src/main.rs`.
 - The producer-fence files and marker queue in the layout above belong
   to the transaction machinery (gh #108 phase 2, gh #175) — see
   [Transactions & idempotence](./transactions.md).

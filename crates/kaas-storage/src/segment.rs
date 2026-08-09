@@ -59,7 +59,23 @@ pub struct SegmentMeta {
     pub size: u64,
     pub log_path: PathBuf,
     pub index_path: PathBuf,
+    /// Largest record timestamp this segment is known to hold, or
+    /// `-1` when unknown. Set when the segment is rolled closed (the
+    /// active segment tracked it across its appends); `-1` for
+    /// segments discovered by [`list_segments`], since nothing
+    /// persists it — the manifest carries no segment list.
+    ///
+    /// Time-based retention treats `-1` as "fall back to file mtime",
+    /// which is what Apache does when a segment has no usable
+    /// timestamp (`LogSegment.largestTimestamp` → `lastModified`).
+    /// A restarted broker therefore ages its inherited segments by
+    /// mtime and its own by record timestamp. See
+    /// [`crate::partition::Partition::cleanup_target_for_time`].
+    pub max_timestamp: i64,
 }
+
+/// `max_timestamp` value meaning "not known for this segment".
+pub const UNKNOWN_MAX_TIMESTAMP: i64 = -1;
 
 /// Construct the `.log` path for `(dir, base_offset, epoch)`.
 pub fn segment_log_path(dir: &Path, base_offset: i64, epoch: i64) -> PathBuf {
@@ -154,6 +170,10 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
             size,
             log_path: path.clone(),
             index_path: dir.join(format!("{stem}{INDEX_EXT}")),
+            // Nothing persists a segment's largest timestamp, so a
+            // segment we didn't roll ourselves is unknown; time-based
+            // retention falls back to mtime for it.
+            max_timestamp: UNKNOWN_MAX_TIMESTAMP,
         });
     }
     // Highest epoch first within a base offset, so the dedup keeps the
@@ -204,8 +224,13 @@ pub fn parse_batch_offsets(raw: &[u8]) -> Result<(i64, i32, i64), io::Error> {
 /// Test-only: real producers compute this client-side, and a synthetic
 /// batch that leaves the field zeroed is byte-for-byte indistinguishable
 /// from bit-rot — which is exactly what the scan now rejects.
-#[cfg(test)]
-pub(crate) fn stamp_crc(buf: &mut [u8]) {
+///
+/// Exposed to other crates' tests behind the `test-helpers` feature
+/// (same pattern as `kaas-auth`), so an integration test can build a
+/// batch the recovery scan will accept without duplicating the CRC
+/// layout — a copy of it would drift from the real one silently.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn stamp_crc(buf: &mut [u8]) {
     let crc = crc32c::crc32c(&buf[21..]);
     buf[17..21].copy_from_slice(&crc.to_be_bytes());
 }
@@ -468,6 +493,7 @@ impl ActiveSegment {
                 size: 0,
                 log_path,
                 index_path,
+                max_timestamp: UNKNOWN_MAX_TIMESTAMP,
             },
             log: Some(log),
             index: Some(index),
@@ -665,6 +691,9 @@ impl ActiveSegment {
         let mut closed_index = self.index.take();
         let closed_meta = SegmentMeta {
             size: self.log_size,
+            // The only place a segment's largest timestamp is known
+            // for free: we tracked it across every append.
+            max_timestamp: self.max_timestamp,
             ..self.meta.clone()
         };
         let tail = RolledTail {

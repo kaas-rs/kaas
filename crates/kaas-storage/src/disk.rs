@@ -165,6 +165,19 @@ impl DiskStorageEngine {
             .join(partition.to_string())
     }
 
+    /// Directory holding `topic`'s topic-level files (`.config.json`,
+    /// `.topic-id.json`) for the root that hosts `partition`. A topic
+    /// spanning several volume-pool roots has one such directory per
+    /// involved root, which is why this takes a partition.
+    pub fn topic_dir(&self, topic: &str, partition: i32) -> PathBuf {
+        self.log_dir_root(topic, partition).join(topic)
+    }
+
+    /// The filesystem this engine reads and writes through.
+    pub fn fs(&self) -> &dyn Fs {
+        self.fs.as_ref()
+    }
+
     /// Get-or-open the partition. The race window between "no entry"
     /// and "insert" is resolved by re-checking after the open — the
     /// loser drops its partition (the active-segment FDs close in

@@ -36,7 +36,10 @@ pub mod topic_identity;
 pub mod topicconfig;
 pub mod txn_index;
 
-pub use cleaner::{FixedPolicySource, PolicySource, RetentionCleaner, RetentionPolicy};
+pub use cleaner::{
+    FixedPolicySource, OwnershipSource, OwnsEverything, PolicySource, RetentionCleaner,
+    RetentionPolicy, TopicConfigPolicySource,
+};
 pub use disk::DiskStorageEngine;
 pub use engine::{
     fs_capacity, parse_log_dirs_json, LogDirInfo, PlacementResolver, StorageEngine,

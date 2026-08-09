@@ -772,6 +772,7 @@ impl Partition {
                         size: 0,
                         log_path: dir.join("_placeholder.log"),
                         index_path: dir.join("_placeholder.index"),
+                        max_timestamp: crate::segment::UNKNOWN_MAX_TIMESTAMP,
                     }),
                 );
                 let (new_active, tail) =
@@ -1046,6 +1047,74 @@ impl Partition {
         i64::try_from(total).unwrap_or(i64::MAX)
     }
 
+    /// Recorded largest timestamp of each closed segment, oldest
+    /// first. `-1` means "not recorded" — see
+    /// [`SegmentMeta::max_timestamp`]. Test/diagnostic accessor for
+    /// telling the two retention arms apart.
+    pub fn closed_segment_max_timestamps(&self) -> Vec<i64> {
+        self.snapshot
+            .load()
+            .closed
+            .iter()
+            .map(|s| s.max_timestamp)
+            .collect()
+    }
+
+    /// Time-based retention (`retention.ms`): return the
+    /// `target_offset` that [`Partition::delete_records`] should
+    /// advance to in order to drop every closed segment whose records
+    /// are all older than `cutoff_ms`. `None` when nothing has aged
+    /// out.
+    ///
+    /// A segment is reapable when its **largest** timestamp is below
+    /// the cutoff — never its smallest, or a segment holding one
+    /// recent record among old ones would be deleted with it. Where
+    /// that timestamp comes from is the interesting part, because
+    /// nothing on disk records it: the manifest carries no segment
+    /// list, so a segment this broker didn't roll itself has none.
+    /// [`SegmentMeta::max_timestamp`] holds it for segments rolled in
+    /// this process; otherwise we fall back to the log file's mtime,
+    /// which is what Apache does in the same situation
+    /// (`LogSegment.largestTimestamp` → `lastModified`). Both are
+    /// wall-clock-comparable, and a closed segment's mtime doesn't
+    /// move, so the fallback is stable across the recovery path.
+    ///
+    /// Walks oldest-first and stops at the first segment that is NOT
+    /// reapable, rather than reaping every old segment it can find —
+    /// retention advances `logStartOffset`, which must stay
+    /// monotonic and contiguous. The active segment is never
+    /// reclaimed here (that's `DeleteRecords`' job), so the target is
+    /// capped at its base offset.
+    ///
+    /// Lock-free apart from the mtime `stat`, which only runs for
+    /// segments whose timestamp is unknown.
+    pub fn cleanup_target_for_time(&self, fs: &dyn Fs, cutoff_ms: i64) -> Option<i64> {
+        let snap = self.snapshot.load();
+        let mut target: Option<i64> = None;
+        for (i, seg) in snap.closed.iter().enumerate() {
+            let largest = if seg.max_timestamp >= 0 {
+                seg.max_timestamp
+            } else {
+                match segment_mtime_ms(fs, &seg.log_path) {
+                    Some(ms) => ms,
+                    // Un-stattable: leave it alone. A segment we can't
+                    // date is not a segment to delete.
+                    None => break,
+                }
+            };
+            if largest >= cutoff_ms {
+                break;
+            }
+            target = Some(
+                snap.closed
+                    .get(i + 1)
+                    .map(|n| n.base_offset)
+                    .unwrap_or(snap.active_meta.base_offset),
+            );
+        }
+        target
+    }
+
     /// Size-based retention: return the `target_offset` that
     /// [`Partition::delete_records`] should advance to in order to
     /// keep the partition under `retention_bytes`. Returns `None`
@@ -1157,6 +1226,10 @@ fn roll_for_epoch_locked(
     let mut outgoing = std::mem::replace(&mut guard.active, new_active);
     let outgoing_meta = SegmentMeta {
         size: outgoing_size,
+        // Same as the size-driven roll: this is the one moment the
+        // outgoing segment's largest timestamp is known without
+        // re-reading it.
+        max_timestamp: outgoing.max_timestamp(),
         ..outgoing.meta.clone()
     };
     outgoing.close_handles();
@@ -1354,6 +1427,15 @@ fn spawn_committer(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Log-file mtime as epoch milliseconds. `None` when the file can't be
+/// stat'ed or its mtime predates the epoch — both mean "don't date this
+/// segment", which time-based retention treats as "don't reap it".
+fn segment_mtime_ms(fs: &dyn Fs, path: &std::path::Path) -> Option<i64> {
+    let modified = fs.stat(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
+}
 
 #[cfg(test)]
 mod tests {

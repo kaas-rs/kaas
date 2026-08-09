@@ -157,6 +157,8 @@ spec:
               value: "{{ .Values.broker.controllerLease.retryPeriodSeconds }}"
             - name: KAAS_FLUSH_INTERVAL_MESSAGES
               value: "{{ .Values.broker.flushIntervalMessages | default 1 }}"
+            - name: KAAS_RETENTION_CHECK_INTERVAL
+              value: "{{ .Values.broker.retentionCheckIntervalSeconds | default 300 }}"
             {{- if .Values.broker.pprof }}
             # gh #132: pprof on the health server's mux at /debug/pprof/.
             # Enables block + mutex profiling at full sample rate — only

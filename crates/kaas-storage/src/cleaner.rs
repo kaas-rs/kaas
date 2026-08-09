@@ -1,41 +1,84 @@
-//! `RetentionCleaner` — size-based log retention.
+//! `RetentionCleaner` — size- and time-based log retention.
 //!
-//! The `delete`-policy cleaner. Walks every owned partition
-//! and asks each Partition for its size-based cleanup target; calls
-//! `delete_records` when the target is non-trivial.
+//! The `delete`-policy cleaner. Walks every partition this broker
+//! leads, asks it for a cleanup target under `retention.bytes` and
+//! `retention.ms`, and calls `delete_records` when either has been
+//! exceeded. The compactor (`cleanup.policy=compact`) and its gh #116
+//! knobs are still open on gh #158; this is the `delete` half only.
 //!
-//! Phase 2 ships size-based retention only. Time-based retention
-//! (`retention.ms`) and the compactor with gh #116 `min.compaction.lag.ms`
-//! + `delete.retention.ms` knobs are follow-up commits on gh #158.
+//! Both knobs are ceilings, so a pass takes whichever target reaps
+//! more. `-1` on either means "retain forever", as in Apache.
 //!
 //! # Threading
 //!
 //! The cleaner does NOT own a background task — it exposes a
-//! [`RetentionCleaner::run_once`] entry point. The broker startup
-//! wraps it in a `tokio::time::interval` loop (Phase 3) with a
-//! cancellation hook for SIGTERM drain.
+//! [`RetentionCleaner::run_once`] entry point, which `bins/kaas`
+//! drives on a `tokio::time::interval` (`KAAS_RETENTION_CHECK_INTERVAL`,
+//! Apache's `log.retention.check.interval.ms`) with a cancellation
+//! token so a SIGTERM drain doesn't race a segment delete.
+//!
+//! # Why it must be leader-gated
+//!
+//! A pass unlinks files on the shared volume. Two brokers reaping the
+//! same partition is the classic NFS substrate rule 3 violation, and
+//! unlinking a file a peer holds open silly-renames it to `.nfsXXXX`
+//! instead of freeing the space (gh #76). [`OwnershipSource`] is the
+//! gate; it degrades to "own everything" so dev mode still cleans.
 
 use std::sync::Arc;
 
 use crate::disk::DiskStorageEngine;
 use crate::errors::StorageError;
 
-/// Per-topic retention policy. For Phase 2 only size-based retention
-/// is honoured; time-based and cleanup-policy (`delete` vs `compact`)
-/// fields land alongside their respective implementations.
+/// Per-topic retention policy under `cleanup.policy=delete`. The
+/// compactor's knobs (`min.compaction.lag.ms`, `delete.retention.ms`)
+/// land with the compactor itself — see gh #158.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionPolicy {
-    /// `retention.bytes`. `None` = no size cap.
+    /// `retention.bytes`. `None` = no size cap (the `-1` sentinel).
     pub retention_bytes: Option<u64>,
+    /// `retention.ms`. `None` = retain forever (the `-1` sentinel).
+    pub retention_ms: Option<u64>,
 }
 
-/// Per-topic policy resolver. The default lookup is a single
-/// engine-wide policy (passed to [`RetentionCleaner::new`]); a
-/// follow-up commit will read `/data/<topic>/.config.json` via
-/// [`crate::topicconfig::read_topic_config`] for per-topic
-/// overrides.
+impl RetentionPolicy {
+    /// Nothing to enforce — skip the partition without touching it.
+    pub fn is_unlimited(&self) -> bool {
+        self.retention_bytes.is_none() && self.retention_ms.is_none()
+    }
+}
+
+/// Per-topic policy resolver.
+///
+/// `partition` is passed because it's what locates the file, not
+/// because policy varies per partition: a topic's partitions can sit
+/// on different volume-pool roots, and `.config.json` is written per
+/// involved root, so resolving the topic dir needs to know which
+/// partition is being asked about.
 pub trait PolicySource: Send + Sync + 'static {
-    fn policy_for(&self, topic: &str) -> RetentionPolicy;
+    fn policy_for(&self, topic: &str, partition: i32) -> RetentionPolicy;
+}
+
+/// "Do I lead this partition?" Retention deletes files, so only the
+/// broker that owns the partition may run it — otherwise two brokers
+/// unlink the same segments on the shared volume (NFS substrate rule
+/// 3, `docs/src/architecture/nfs-substrate.md`).
+///
+/// Same degrade-safe shape as the gh #91 txn gate: the default impl
+/// answers `true`, so dev mode and single-broker deployments (which
+/// install no source) keep cleaning rather than silently stopping.
+pub trait OwnershipSource: Send + Sync + 'static {
+    fn owns_partition(&self, topic: &str, partition: i32) -> bool;
+}
+
+/// Ownership source that owns everything. Dev mode and tests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OwnsEverything;
+
+impl OwnershipSource for OwnsEverything {
+    fn owns_partition(&self, _topic: &str, _partition: i32) -> bool {
+        true
+    }
 }
 
 /// Single-policy source used by the basic `RetentionCleaner::new`
@@ -52,14 +95,99 @@ impl FixedPolicySource {
 }
 
 impl PolicySource for FixedPolicySource {
-    fn policy_for(&self, _topic: &str) -> RetentionPolicy {
+    fn policy_for(&self, _topic: &str, _partition: i32) -> RetentionPolicy {
         self.policy
+    }
+}
+
+/// The production policy source: reads each topic's `.config.json`
+/// off the shared volume on every lookup.
+///
+/// Deliberately uncached. The file is small, a pass runs every few
+/// minutes, and re-reading it *is* the hot-reload path — an operator
+/// editing `retentionMs` on a `KafkaTopic` CR has the change take
+/// effect at the next pass with no broker restart. `defaults` fills in
+/// any key the file omits.
+pub struct TopicConfigPolicySource {
+    engine: Arc<DiskStorageEngine>,
+    defaults: RetentionPolicy,
+}
+
+impl std::fmt::Debug for TopicConfigPolicySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopicConfigPolicySource")
+            .field("defaults", &self.defaults)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TopicConfigPolicySource {
+    pub fn new(engine: Arc<DiskStorageEngine>, defaults: RetentionPolicy) -> Self {
+        Self { engine, defaults }
+    }
+}
+
+impl PolicySource for TopicConfigPolicySource {
+    fn policy_for(&self, topic: &str, partition: i32) -> RetentionPolicy {
+        let dir = self.engine.topic_dir(topic, partition);
+        let cfg = match crate::topicconfig::read_topic_config(self.engine.fs(), &dir) {
+            Ok(Some(c)) => c,
+            // No file, or an unreadable one. Falling back to the
+            // defaults is the safe direction: the worst case is that
+            // we retain more than asked, never that we delete data
+            // the operator meant to keep.
+            Ok(None) => return self.defaults,
+            Err(e) => {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    error = %e,
+                    "unreadable .config.json; using default retention"
+                );
+                return self.defaults;
+            }
+        };
+        RetentionPolicy {
+            retention_bytes: cfg
+                .retention_bytes
+                .map_or(self.defaults.retention_bytes, sentinel_to_option),
+            retention_ms: cfg
+                .retention_ms
+                .map_or(self.defaults.retention_ms, sentinel_to_option),
+        }
+    }
+}
+
+/// Wall clock as epoch milliseconds. Saturates at 0 for a clock set
+/// before 1970, which would otherwise wrap into a huge cutoff and reap
+/// everything.
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Kafka's retain-forever sentinel is `-1`; `0` would mean "reap
+/// everything immediately", which is a legal setting but is far more
+/// often an unset field, so it is also treated as unlimited (this
+/// mirrors `topicconfig`'s "zero means engine default").
+fn sentinel_to_option(v: i64) -> Option<u64> {
+    if v <= 0 {
+        None
+    } else {
+        u64::try_from(v).ok()
     }
 }
 
 pub struct RetentionCleaner {
     engine: Arc<DiskStorageEngine>,
     policy_source: Arc<dyn PolicySource>,
+    ownership: Arc<dyn OwnershipSource>,
+    /// Injectable clock (epoch ms) so tests can advance time past a
+    /// retention window without sleeping.
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl std::fmt::Debug for RetentionCleaner {
@@ -74,10 +202,7 @@ impl RetentionCleaner {
     /// Build a cleaner with a single engine-wide retention policy.
     /// Use [`Self::with_policy_source`] for per-topic policies.
     pub fn new(engine: Arc<DiskStorageEngine>, policy: RetentionPolicy) -> Self {
-        Self {
-            engine,
-            policy_source: Arc::new(FixedPolicySource::new(policy)),
-        }
+        Self::with_policy_source(engine, Arc::new(FixedPolicySource::new(policy)))
     }
 
     pub fn with_policy_source(
@@ -87,7 +212,23 @@ impl RetentionCleaner {
         Self {
             engine,
             policy_source,
+            ownership: Arc::new(OwnsEverything),
+            now_ms: Arc::new(now_epoch_ms),
         }
+    }
+
+    /// Install the leadership gate. Without one the cleaner assumes it
+    /// owns every open partition — right for dev and single-broker,
+    /// wrong for a cluster.
+    pub fn with_ownership(mut self, ownership: Arc<dyn OwnershipSource>) -> Self {
+        self.ownership = ownership;
+        self
+    }
+
+    /// Override the clock (epoch ms). Test hook.
+    pub fn with_clock(mut self, now_ms: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     /// One cleanup pass over every open partition. Returns the count
@@ -111,15 +252,30 @@ impl RetentionCleaner {
 
     async fn run_once_inner(&self) -> Result<u32, StorageError> {
         let mut cleaned = 0u32;
+        let now = (self.now_ms)();
         for (topic, partition) in self.engine.iter_partition_keys() {
+            if !self.ownership.owns_partition(&topic, partition) {
+                continue;
+            }
             let Some(p) = self.engine.partition(&topic, partition) else {
                 continue;
             };
-            let policy = self.policy_source.policy_for(&topic);
-            let Some(retention_bytes) = policy.retention_bytes else {
+            let policy = self.policy_source.policy_for(&topic, partition);
+            if policy.is_unlimited() {
                 continue;
-            };
-            let Some(target) = p.cleanup_target_for_size_bytes(retention_bytes) else {
+            }
+
+            // Both knobs are ceilings on what may be retained, so the
+            // effective target is whichever reaps more. Kafka applies
+            // them independently and the union is what survives.
+            let by_size = policy
+                .retention_bytes
+                .and_then(|b| p.cleanup_target_for_size_bytes(b));
+            let by_time = policy.retention_ms.and_then(|ms| {
+                let cutoff = now.saturating_sub(i64::try_from(ms).unwrap_or(i64::MAX));
+                p.cleanup_target_for_time(self.engine.fs(), cutoff)
+            });
+            let Some(target) = by_size.max(by_time) else {
                 continue;
             };
             // delete_records is idempotent under "target <= log_start".
@@ -127,18 +283,34 @@ impl RetentionCleaner {
             if target <= p.log_start_offset() {
                 continue;
             }
+            // Attribute the reclaim to whichever knob actually drove
+            // the chosen target; a tie is reported as size, matching
+            // the order Kafka evaluates them in.
+            let reason = if Some(target) == by_size {
+                "size"
+            } else {
+                "time"
+            };
             let before = p.partition_size();
             p.delete_records(target).await?;
             let after = p.partition_size();
             let reclaimed = before.saturating_sub(after);
             cleaned += 1;
+            tracing::info!(
+                topic,
+                partition,
+                target,
+                reason,
+                reclaimed_bytes = reclaimed,
+                "retention advanced log start offset"
+            );
             let m = kaas_observability::metrics::global();
             m.cleaner_segments_deleted
-                .add(1, &[kaas_observability::KeyValue::new("reason", "size")]);
+                .add(1, &[kaas_observability::KeyValue::new("reason", reason)]);
             if reclaimed > 0 {
                 m.cleaner_bytes_reclaimed.add(
                     u64::try_from(reclaimed).unwrap_or(0),
-                    &[kaas_observability::KeyValue::new("reason", "size")],
+                    &[kaas_observability::KeyValue::new("reason", reason)],
                 );
             }
         }
@@ -205,6 +377,7 @@ mod tests {
                 e.clone(),
                 RetentionPolicy {
                     retention_bytes: Some(1 << 30),
+                    retention_ms: None,
                 },
             );
             let cleaned = cleaner.run_once().await.unwrap();
@@ -233,6 +406,7 @@ mod tests {
                 e.clone(),
                 RetentionPolicy {
                     retention_bytes: Some(one_len),
+                    retention_ms: None,
                 },
             );
             let cleaned = cleaner.run_once().await.unwrap();
@@ -261,6 +435,7 @@ mod tests {
                 e.clone(),
                 RetentionPolicy {
                     retention_bytes: None,
+                    retention_ms: None,
                 },
             );
             let cleaned = cleaner.run_once().await.unwrap();
@@ -285,6 +460,7 @@ mod tests {
                 e.clone(),
                 RetentionPolicy {
                     retention_bytes: Some(one_len * 2),
+                    retention_ms: None,
                 },
             );
             // First pass cleans; subsequent passes are no-ops.
@@ -294,6 +470,224 @@ mod tests {
             assert_eq!(a, 1);
             assert_eq!(b, 0);
             assert_eq!(c, 0);
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    /// Roll a segment per batch so every batch is its own closed
+    /// segment, with `stamp_ms` as its record timestamp.
+    async fn seed_segments(e: &Arc<DiskStorageEngine>, n: usize, stamp_ms: i64) {
+        for _ in 0..n {
+            e.append("t", 0, 0, -1, build_batch(1, stamp_ms))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn time_only(retention_ms: u64) -> RetentionPolicy {
+        RetentionPolicy {
+            retention_bytes: None,
+            retention_ms: Some(retention_ms),
+        }
+    }
+
+    #[test]
+    fn time_retention_drops_segments_past_the_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            // Records stamped at t=1_000_000; 5 appends → 4 closed
+            // segments carrying a known max_timestamp + 1 active.
+            seed_segments(&e, 5, 1_000_000).await;
+
+            // "Now" is one hour later, retention is one minute — every
+            // closed segment has aged out.
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(60_000))
+                .with_clock(Arc::new(|| 1_000_000 + 3_600_000));
+            let cleaned = cleaner.run_once().await.unwrap();
+            assert_eq!(cleaned, 1, "the partition was cleaned");
+            assert!(
+                e.log_start_offset("t", 0).unwrap() >= 4,
+                "expected log_start past every closed segment, got {}",
+                e.log_start_offset("t", 0).unwrap()
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn time_retention_keeps_records_inside_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            seed_segments(&e, 5, 1_000_000).await;
+
+            // Now is 30 s later against a 1 h retention: nothing is old
+            // enough, and the pass must not touch the log.
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(3_600_000))
+                .with_clock(Arc::new(|| 1_000_000 + 30_000));
+            assert_eq!(cleaner.run_once().await.unwrap(), 0);
+            assert_eq!(e.log_start_offset("t", 0).unwrap(), 0);
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn time_retention_stops_at_the_first_segment_still_in_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            // Two old segments, then two recent ones. Retention must
+            // stop at the first in-window segment rather than reaping
+            // every old segment it can find — log start has to stay
+            // contiguous.
+            seed_segments(&e, 2, 1_000_000).await;
+            seed_segments(&e, 3, 9_000_000).await;
+
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(60_000))
+                .with_clock(Arc::new(|| 9_030_000));
+            assert_eq!(cleaner.run_once().await.unwrap(), 1);
+            assert_eq!(
+                e.log_start_offset("t", 0).unwrap(),
+                2,
+                "exactly the two aged-out segments were dropped"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn segments_inherited_across_a_restart_age_out_by_mtime() {
+        // The production path after ANY restart. Nothing persists a
+        // segment's largest timestamp — the manifest has no segment
+        // list — so a segment this process didn't roll comes back from
+        // `list_segments` with `max_timestamp: -1`, and retention has
+        // to fall back to the log file's mtime (as Apache does). Every
+        // other test here rolls its own segments, so this is the only
+        // one exercising the arm a restarted broker actually uses.
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            {
+                let e = engine_at(tmp.path().to_path_buf(), one_len);
+                seed_segments(&e, 5, 1_000_000).await;
+                e.relinquish_all().await.unwrap();
+            }
+            // Fresh engine over the same directory — the restart.
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            let p = e.partition("t", 0).unwrap();
+            let stamps = p.closed_segment_max_timestamps();
+            assert_eq!(
+                stamps.first().copied(),
+                Some(crate::segment::UNKNOWN_MAX_TIMESTAMP),
+                "the oldest segment is inherited, so its timestamp must be \
+                 unrecorded — otherwise this test isn't exercising the mtime \
+                 arm (stamps: {stamps:?})"
+            );
+
+            // The files were written moments ago, so date them against
+            // a clock far in the future rather than sleeping.
+            let ten_years = 10 * 365 * 24 * 3_600_000i64;
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(60_000))
+                .with_clock(Arc::new(move || now_epoch_ms() + ten_years));
+            assert_eq!(cleaner.run_once().await.unwrap(), 1);
+            assert!(
+                e.log_start_offset("t", 0).unwrap() > 0,
+                "mtime fallback did not reap anything"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn retain_forever_sentinels_disable_both_knobs() {
+        // `-1` on either knob is Kafka's retain-forever. The CRD allows
+        // it (gh #33), and `0` reaches us as an unset field.
+        assert_eq!(sentinel_to_option(-1), None);
+        assert_eq!(sentinel_to_option(0), None);
+        assert_eq!(sentinel_to_option(5), Some(5));
+
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            seed_segments(&e, 5, 1_000_000).await;
+            let cleaner = RetentionCleaner::new(e.clone(), RetentionPolicy::default())
+                .with_clock(Arc::new(|| i64::MAX / 2));
+            assert_eq!(cleaner.run_once().await.unwrap(), 0);
+            assert_eq!(e.log_start_offset("t", 0).unwrap(), 0);
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_partition_this_broker_does_not_lead_is_left_alone() {
+        // Retention unlinks files on a shared volume; a non-leader
+        // reaping is NFS substrate rule 3 (and silly-renames whatever
+        // the real leader holds open, gh #76).
+        struct OwnsNothing;
+        impl OwnershipSource for OwnsNothing {
+            fn owns_partition(&self, _t: &str, _p: i32) -> bool {
+                false
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            seed_segments(&e, 5, 1_000_000).await;
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(1))
+                .with_clock(Arc::new(|| 9_000_000))
+                .with_ownership(Arc::new(OwnsNothing));
+            assert_eq!(cleaner.run_once().await.unwrap(), 0);
+            assert_eq!(e.log_start_offset("t", 0).unwrap(), 0);
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn topic_config_source_reads_the_file_and_honours_sentinels() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let e = engine_at(tmp.path().to_path_buf(), 1 << 20);
+            e.append("t", 0, 0, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            let defaults = RetentionPolicy {
+                retention_bytes: Some(999),
+                retention_ms: Some(888),
+            };
+            let src = TopicConfigPolicySource::new(e.clone(), defaults);
+
+            // No file yet → defaults.
+            assert_eq!(src.policy_for("t", 0), defaults);
+
+            // A file overrides per key, and `-1` means forever.
+            let dir = e.topic_dir("t", 0);
+            crate::topicconfig::write_topic_config(
+                e.fs(),
+                &dir,
+                &crate::topicconfig::TopicConfigFile {
+                    retention_ms: Some(60_000),
+                    retention_bytes: Some(-1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                src.policy_for("t", 0),
+                RetentionPolicy {
+                    retention_bytes: None,
+                    retention_ms: Some(60_000),
+                },
+                "explicit -1 must win over the default, not fall back to it"
+            );
             e.relinquish_all().await.unwrap();
         });
     }

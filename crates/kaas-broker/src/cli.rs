@@ -20,6 +20,8 @@ pub enum ConfigError {
     BrokerId(std::num::ParseIntError),
     #[error("KAAS_FLUSH_INTERVAL_MESSAGES: {0}")]
     FlushInterval(std::num::ParseIntError),
+    #[error("KAAS_RETENTION_CHECK_INTERVAL: {0}")]
+    RetentionCheckInterval(std::num::ParseIntError),
     #[error("{0}")]
     LogDirs(String),
 }
@@ -176,6 +178,11 @@ pub struct Cli {
     /// Empty in the classic single-volume layout.
     pub log_dirs: Vec<kaas_storage::LogDirInfo>,
     pub flush_interval_messages: i64,
+    /// `KAAS_RETENTION_CHECK_INTERVAL` — how often the retention
+    /// cleaner sweeps (gh #250). Mirrors Apache's
+    /// `log.retention.check.interval.ms`, same 5-minute default.
+    /// `0` disables the sweep entirely.
+    pub retention_check_interval_secs: u64,
     pub cluster_id: String,
     pub broker_id: i32,
     pub topics_seed: String,
@@ -253,6 +260,15 @@ impl Cli {
             .map_err(ConfigError::FlushInterval)?
             .unwrap_or(1);
 
+        // Seconds, not a duration string: this is a coarse sweep
+        // cadence and the chart emits a plain integer.
+        let retention_check_interval_secs = env::var("KAAS_RETENTION_CHECK_INTERVAL")
+            .ok()
+            .map(|s| s.parse::<u64>())
+            .transpose()
+            .map_err(ConfigError::RetentionCheckInterval)?
+            .unwrap_or(300);
+
         let cluster_id = env::var("KAAS_CLUSTER_ID").unwrap_or_else(|_| "kaas-rust-dev".to_owned());
 
         // Explicit KAAS_BROKER_ID wins; otherwise derive the
@@ -302,6 +318,7 @@ impl Cli {
             cluster_dir,
             log_dirs,
             flush_interval_messages,
+            retention_check_interval_secs,
             cluster_id,
             broker_id,
             topics_seed,
