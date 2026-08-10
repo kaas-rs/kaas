@@ -432,12 +432,14 @@ mod kube_impl {
     pub struct KubeTopicCRWriter {
         client: kube::Client,
         namespace: String,
+        argocd: crate::argocd::ArgoCdConfig,
     }
 
     impl std::fmt::Debug for KubeTopicCRWriter {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("KubeTopicCRWriter")
                 .field("namespace", &self.namespace)
+                .field("argocd", &self.argocd)
                 .finish_non_exhaustive()
         }
     }
@@ -447,12 +449,73 @@ mod kube_impl {
             Self {
                 client,
                 namespace: namespace.into(),
+                argocd: crate::argocd::ArgoCdConfig::default(),
             }
+        }
+
+        /// Opt broker-minted CRs into the ArgoCD Application tree
+        /// (gh #84 + gh #106, re-ported from the Go broker). The
+        /// default config stamps nothing.
+        pub fn with_argocd(mut self, argocd: crate::argocd::ArgoCdConfig) -> Self {
+            self.argocd = argocd;
+            self
         }
 
         fn api(&self) -> Api<KafkaTopic> {
             Api::namespaced(self.client.clone(), &self.namespace)
         }
+    }
+
+    /// Build the CR `create_topic` will POST. A free function (no
+    /// client) so the annotation/config stamping is testable without
+    /// a cluster.
+    fn build_cr(
+        namespace: &str,
+        argocd: &crate::argocd::ArgoCdConfig,
+        name: &str,
+        num_partitions: i32,
+        configs: &[(String, String)],
+    ) -> Result<KafkaTopic, TopicWriteError> {
+        use kaas_operator_api::{KafkaTopicConfig, KafkaTopicSpec};
+
+        // gh #236: land the wire request's config overrides in the
+        // minted CR so the operator materialises them on first
+        // reconcile. The handler has already validated the pairs;
+        // this re-derivation keeps the writer safe for other
+        // callers.
+        let spec_config = super::create_configs_to_spec(configs)?;
+        let config: KafkaTopicConfig = serde_json::from_value(Value::Object(spec_config))
+            .map_err(|e| TopicWriteError::InvalidConfig(e.to_string()))?;
+
+        // gh #86: non-RFC-1123 Kafka names (Streams internals)
+        // get a deterministic synthetic CR name with the literal
+        // name carried in spec.topicName.
+        let (meta_name, topic_name) = super::name_for_cr(name);
+        // ArgoCD coexistence (see `crate::argocd`): the tracking-id
+        // must carry the CR's metadata.name — the synthesised one
+        // on the gh #86 path — because that is what keys ArgoCD's
+        // resource tree. None (the default) leaves the CR plain.
+        let annotations = argocd.annotations(
+            &<KafkaTopic as kube::Resource>::group(&()),
+            &<KafkaTopic as kube::Resource>::kind(&()),
+            namespace,
+            &meta_name,
+        );
+        Ok(KafkaTopic {
+            metadata: kube::api::ObjectMeta {
+                name: Some(meta_name),
+                namespace: Some(namespace.to_owned()),
+                annotations,
+                ..Default::default()
+            },
+            spec: KafkaTopicSpec {
+                topic_name,
+                partitions: num_partitions,
+                config,
+                storage: None,
+            },
+            status: None,
+        })
     }
 
     #[async_trait::async_trait]
@@ -463,36 +526,9 @@ mod kube_impl {
             num_partitions: i32,
             configs: &[(String, String)],
         ) -> Result<(), TopicWriteError> {
-            use kaas_operator_api::{KafkaTopicConfig, KafkaTopicSpec};
             use kube::api::PostParams;
 
-            // gh #236: land the wire request's config overrides in the
-            // minted CR so the operator materialises them on first
-            // reconcile. The handler has already validated the pairs;
-            // this re-derivation keeps the writer safe for other
-            // callers.
-            let spec_config = super::create_configs_to_spec(configs)?;
-            let config: KafkaTopicConfig = serde_json::from_value(Value::Object(spec_config))
-                .map_err(|e| TopicWriteError::InvalidConfig(e.to_string()))?;
-
-            // gh #86: non-RFC-1123 Kafka names (Streams internals)
-            // get a deterministic synthetic CR name with the literal
-            // name carried in spec.topicName.
-            let (meta_name, topic_name) = super::name_for_cr(name);
-            let cr = KafkaTopic {
-                metadata: kube::api::ObjectMeta {
-                    name: Some(meta_name),
-                    namespace: Some(self.namespace.clone()),
-                    ..Default::default()
-                },
-                spec: KafkaTopicSpec {
-                    topic_name,
-                    partitions: num_partitions,
-                    config,
-                    storage: None,
-                },
-                status: None,
-            };
+            let cr = build_cr(&self.namespace, &self.argocd, name, num_partitions, configs)?;
             // gh #245: name the writer. Without a fieldManager every
             // broker-minted CR shows `manager: unknown` in
             // managedFields, which is exactly what made the 2026-08-02
@@ -612,6 +648,69 @@ mod kube_impl {
                 TopicWriteError::NotFound(api.message.clone())
             }
             _ => TopicWriteError::Other(e.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::argocd::ArgoCdConfig;
+
+        fn argo() -> ArgoCdConfig {
+            ArgoCdConfig {
+                enabled: true,
+                application_name: "kaas".into(),
+                compare_options: "IgnoreExtraneous".into(),
+                sync_options: "Delete=false".into(),
+            }
+        }
+
+        #[test]
+        fn default_config_mints_plain_crs() {
+            let cr = build_cr("kaas", &ArgoCdConfig::default(), "orders", 1, &[]).expect("build");
+            assert_eq!(
+                cr.metadata.annotations, None,
+                "non-ArgoCD installs must see no argocd.argoproj.io/* metadata"
+            );
+        }
+
+        #[test]
+        fn argocd_config_stamps_tracking_and_coexistence_annotations() {
+            let cr = build_cr("kaas", &argo(), "orders", 1, &[]).expect("build");
+            let ann = cr.metadata.annotations.expect("annotations present");
+            assert_eq!(
+                ann.get("argocd.argoproj.io/tracking-id")
+                    .map(String::as_str),
+                Some("kaas:kaas.rs/KafkaTopic:kaas/orders")
+            );
+            assert_eq!(
+                ann.get("argocd.argoproj.io/compare-options")
+                    .map(String::as_str),
+                Some("IgnoreExtraneous")
+            );
+            assert_eq!(
+                ann.get("argocd.argoproj.io/sync-options")
+                    .map(String::as_str),
+                Some("Delete=false")
+            );
+        }
+
+        #[test]
+        fn tracking_id_uses_the_synthesised_meta_name() {
+            // gh #86 names (Streams internals) get a synthetic CR
+            // name, and ArgoCD's tree is keyed by metadata.name — a
+            // tracking-id carrying the Kafka name would point at a
+            // resource that doesn't exist.
+            let kafka_name = "app-KSTREAM-AGGREGATE-STATE-STORE-repartition";
+            let cr = build_cr("kaas", &argo(), kafka_name, 1, &[]).expect("build");
+            let (meta_name, _) = super::super::name_for_cr(kafka_name);
+            assert!(meta_name.starts_with("kaas-topic-"), "precondition");
+            let ann = cr.metadata.annotations.expect("annotations present");
+            assert_eq!(
+                ann.get("argocd.argoproj.io/tracking-id")
+                    .map(String::as_str),
+                Some(format!("kaas:kaas.rs/KafkaTopic:kaas/{meta_name}").as_str())
+            );
         }
     }
 }

@@ -8,6 +8,7 @@
 //! `proto/heartbeat.proto` and is Phase-5-consumer-only for now.
 
 pub mod acl_cr_writer;
+pub mod argocd;
 pub mod assignment;
 pub mod broker;
 pub mod cli;

@@ -40,7 +40,11 @@ checks, then returns the would-be response without minting the CR. Error
 mapping: authorization denial → `TOPIC_AUTHORIZATION_FAILED` (29), bad
 config → `INVALID_CONFIG` (40), existing CR → `TOPIC_ALREADY_EXISTS` (36),
 missing writer or Kubernetes RBAC denial → `CLUSTER_AUTHORIZATION_FAILED`
-(31), other kube errors → `UNKNOWN_SERVER_ERROR` (-1).
+(31), other kube errors → `UNKNOWN_SERVER_ERROR` (-1). On ArgoCD-managed
+clusters, `admin.argocd.enabled` on the Helm chart makes the minted CR
+carry ArgoCD tracking/coexistence annotations so runtime-created topics
+appear in the Application tree without being prune targets — see
+[Kubernetes integration](../../architecture/kubernetes.md).
 
 **Deviations from Apache 3.7**:
 

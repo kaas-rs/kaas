@@ -99,10 +99,45 @@ Reconciler guard rails worth knowing:
 On the broker side, the CRD surface is read-mostly — but not read-only:
 the Kafka admin APIs `CreatePartitions` and `IncrementalAlterConfigs`
 are served by patching the `KafkaTopic` CR (`spec.partitions` /
-`spec.config`), which the operator then materializes as usual. That is
-why broker RBAC carries `update,patch` on `kafkatopics` in addition to
-the read verbs. Why admin writes route through CRs at all is covered in
+`spec.config`), and `CreateTopics` mints a fresh one. The operator then
+materializes the change as usual. That is why broker RBAC carries
+`update,patch` on `kafkatopics` in addition to the read verbs. Why
+admin writes route through CRs at all is covered in
 [Broker/operator runtime independence](./runtime-independence.md).
+
+### ArgoCD and runtime-created topics
+
+A topic created over the Kafka protocol exists as a `KafkaTopic` CR
+that no GitOps tool put there: it has no tracking metadata and no
+owner references, so in an ArgoCD-managed cluster it is invisible in
+the Application tree — and hand-adding ArgoCD's tracking label would
+be worse, because a tracked resource absent from git is exactly what
+sync-with-prune deletes.
+
+Setting `admin.argocd.enabled: true` on the Helm chart opts
+broker-minted CRs into ArgoCD coexistence. Each one is created with:
+
+- `argocd.argoproj.io/tracking-id` naming the Application (defaults
+  to the Helm release name), so the topic renders in the Application
+  tree alongside the git-managed resources;
+- `argocd.argoproj.io/compare-options: IgnoreExtraneous`, so ArgoCD
+  does not diff it against git — no drift, no selfHeal prune;
+- `argocd.argoproj.io/sync-options: Delete=false`, so runtime-created
+  topics survive an Application delete.
+
+The last two are chart values (`admin.argocd.compareOptions` /
+`syncOptions`); setting either to `""` skips that annotation — e.g. an
+empty `compareOptions` deliberately surfaces "this topic is not in
+git" as drift in the ArgoCD UI. Off by default: non-ArgoCD installs
+get plain CRs.
+
+This applies only to CRs the broker **creates** — today, topics.
+`KafkaUser` CRs are never created at runtime: the ACL admin APIs edit
+the `spec.authorization.acls` of a user that must already exist, and
+stamping ArgoCD metadata onto a git-managed resource would *cause* the
+drift the annotations exist to avoid. Runtime ACL edits to git-managed
+users therefore still show as drift until the next sync — the
+intentional trade described in the ACL API notes.
 
 ## Why there are no finalizers
 

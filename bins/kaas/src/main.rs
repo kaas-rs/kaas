@@ -282,8 +282,21 @@ async fn main() -> Result<()> {
     // CLUSTER_AUTHORIZATION_FAILED.
     if let Some(client) = kube_client.clone() {
         let ns = std::env::var("KAAS_NAMESPACE").unwrap_or_else(|_| "default".into());
+        // ArgoCD coexistence (gh #84 + gh #106, re-ported from the Go
+        // broker): when the chart sets admin.argocd.enabled, CRs
+        // minted from the Kafka admin protocol carry a tracking-id
+        // (visible in the Application tree) + compare/sync options
+        // (safe from selfHeal prune). Off by default — plain CRs.
+        let argocd = kaas_broker::argocd::ArgoCdConfig::from_env();
+        if argocd.enabled {
+            info!(
+                application = %argocd.application_name,
+                "ArgoCD annotations enabled for broker-minted CRs"
+            );
+        }
         let writer =
-            kaas_broker::topic_cr_writer::KubeTopicCRWriter::new(client.clone(), ns.clone());
+            kaas_broker::topic_cr_writer::KubeTopicCRWriter::new(client.clone(), ns.clone())
+                .with_argocd(argocd);
         broker.install_cr_writer(Arc::new(writer));
         info!("installed KubeTopicCRWriter for admin handlers");
 
