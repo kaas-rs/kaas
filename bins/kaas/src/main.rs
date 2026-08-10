@@ -36,16 +36,17 @@ use kaas_auth::{
 };
 use kaas_broker::{
     AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, AlterClientQuotasHandler,
-    AlterReplicaLogDirsHandler, ApiVersionsHandler, Broker, Cli, CliTlsConfig, CreateAclsHandler,
-    CreatePartitionsHandler, CreateTopicsHandler, DeleteAclsHandler, DeleteGroupsHandler,
-    DeleteRecordsHandler, DeleteTopicsHandler, DescribeAclsHandler, DescribeClientQuotasHandler,
-    DescribeClusterHandler, DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler,
-    EndTxnHandler, FetchHandler, FindCoordinatorHandler, HeartbeatHandler,
-    IncrementalAlterConfigsHandler, InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler,
-    ListGroupsHandler, ListOffsetsHandler, ListenerEntry, MetadataHandler, OffsetCommitHandler,
-    OffsetDeleteHandler, OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler,
-    SaslHandshakeHandler, SyncGroupHandler, TopicRegistry, TxnOffsetCommitHandler,
-    WriteTxnMarkersHandler,
+    AlterReplicaLogDirsHandler, AlterUserScramCredentialsHandler, ApiVersionsHandler, Broker, Cli,
+    CliTlsConfig, CreateAclsHandler, CreatePartitionsHandler, CreateTopicsHandler,
+    DeleteAclsHandler, DeleteGroupsHandler, DeleteRecordsHandler, DeleteTopicsHandler,
+    DescribeAclsHandler, DescribeClientQuotasHandler, DescribeClusterHandler,
+    DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler,
+    DescribeUserScramCredentialsHandler, EndTxnHandler, FetchHandler, FindCoordinatorHandler,
+    HeartbeatHandler, IncrementalAlterConfigsHandler, InitProducerIdHandler, JoinGroupHandler,
+    LeaveGroupHandler, ListGroupsHandler, ListOffsetsHandler, ListenerEntry, MetadataHandler,
+    OffsetCommitHandler, OffsetDeleteHandler, OffsetFetchHandler, ProduceHandler,
+    SaslAuthenticateHandler, SaslHandshakeHandler, SyncGroupHandler, TopicRegistry,
+    TxnOffsetCommitHandler, WriteTxnMarkersHandler,
 };
 use kaas_protocol::{Dispatcher, ListenerConfig, MtlsConfig, Server, ServerConfigBuilder};
 use kaas_storage::{DiskStorageEngine, MemoryStorage, PartitionConfig, RealFs, StorageEngine};
@@ -208,6 +209,7 @@ async fn main() -> Result<()> {
     let (engine, disk_engine) = build_engine(
         cli.data_dir.clone(),
         cli.flush_interval_messages,
+        cli.fsync_max_latency_ms,
         cli.log_dirs.clone(),
         topics.clone(),
     )?;
@@ -306,6 +308,14 @@ async fn main() -> Result<()> {
             kaas_broker::acl_cr_writer::KubeAclCRWriter::new(client.clone(), ns.clone());
         broker.install_acl_cr_writer(Arc::new(acl_writer));
         info!("installed KubeAclCRWriter for ACL admin handlers");
+
+        // gh #252: SCRAM credential rotation (key 51) patches
+        // KafkaUser.spec.authentication.scram; the operator
+        // materialises credentials.json on reconcile.
+        let user_writer =
+            kaas_broker::user_cr_writer::KubeUserCRWriter::new(client.clone(), ns.clone());
+        broker.install_user_cr_writer(Arc::new(user_writer));
+        info!("installed KubeUserCRWriter for SCRAM credential admin");
 
         // Spawn the KafkaTopic CR watcher: feeds every
         // Apply/InitApply into `topics` so newly-created topics
@@ -516,6 +526,7 @@ async fn main() -> Result<()> {
         kube_client,
         client_port,
         topic_notify,
+        cli.txn_num_slots,
     )?;
 
     // Spawn the credential / ACL reloader before the listeners go up
@@ -528,6 +539,10 @@ async fn main() -> Result<()> {
         auth.engines.clone(),
         cli.auto_create_topics,
         cli.num_partitions,
+        cli.max_message_bytes,
+        auth.creds
+            .clone()
+            .map(|c| -> Arc<dyn kaas_auth::CredentialStore> { c }),
     );
     let listeners = parse_listeners(&cli.listeners, &auth.engines, &auth.principal_mapper)?;
     let server = Server::new(ServerConfigBuilder::new(listeners), Arc::new(dispatcher));
@@ -736,6 +751,12 @@ fn build_auth(cli: &Cli) -> Result<AuthSetup> {
     );
 
     if cli.auth_disabled {
+        if cli.require_sasl {
+            warn!(
+                "KAAS_REQUIRE_SASL=true is ignored because KAAS_AUTH_DISABLED=true — \
+                 the explicit off-switch outranks the requirement (gh #251)"
+            );
+        }
         info!("auth disabled — using AllowAllAuthorizer + NoQuotaChecker on every listener");
         let allow_all: Arc<dyn AuthEngine> = Arc::new(AllowAllAuthEngine);
         let engines = Arc::new(PerListenerAuthEngine::new(allow_all));
@@ -767,22 +788,46 @@ fn build_auth(cli: &Cli) -> Result<AuthSetup> {
     // Per-listener engine map. Anonymous listeners (auth_type unset
     // or "none") use AllowAllAuthEngine; scram/plain/mtls listeners
     // use RealAuthEngine wrapped around the credential store.
+    //
+    // gh #251 (re-port of the Go broker's SKAFKA_REQUIRE_SASL): with
+    // KAAS_REQUIRE_SASL=true, anonymous listeners get the real engine
+    // too — its `requires_pre_auth` arms the dispatch gate (gh #124),
+    // so every connection must finish SASL before any non-handshake
+    // API. This env was chart-emitted and read by nothing from the
+    // Rust cutover until now.
     let allow_all_engine: Arc<dyn AuthEngine> = Arc::new(AllowAllAuthEngine);
     let real_engine: Arc<dyn AuthEngine> =
         Arc::new(RealAuthEngine::new(creds.clone(), mapper.clone()));
-    let mut engines_map = PerListenerAuthEngine::new(allow_all_engine.clone());
+    let anonymous_engine: Arc<dyn AuthEngine> = if cli.require_sasl {
+        real_engine.clone()
+    } else {
+        allow_all_engine.clone()
+    };
+    // The fallback for listeners absent from the map follows the
+    // same rule — a listener the map somehow misses must not dodge
+    // the requirement.
+    let mut engines_map = PerListenerAuthEngine::new(anonymous_engine.clone());
     for lc in &cli.listeners {
         let engine_for_listener: Arc<dyn AuthEngine> =
             match lc.authentication_type.as_deref().unwrap_or("none") {
-                "none" => allow_all_engine.clone(),
+                "none" => {
+                    if cli.require_sasl {
+                        info!(
+                            listener = lc.name.as_str(),
+                            "KAAS_REQUIRE_SASL: anonymous listener now requires SASL"
+                        );
+                    }
+                    anonymous_engine.clone()
+                }
                 "scram-sha-512" | "plain" | "mtls" => real_engine.clone(),
                 other => {
                     warn!(
-                        listener = lc.name.as_str(),
-                        authentication_type = other,
-                        "unknown authentication_type — falling back to AllowAllAuthEngine"
-                    );
-                    allow_all_engine.clone()
+                    listener = lc.name.as_str(),
+                    authentication_type = other,
+                    require_sasl = cli.require_sasl,
+                    "unknown authentication_type — falling back to the anonymous-listener engine"
+                );
+                    anonymous_engine.clone()
                 }
             };
         engines_map.insert(lc.name.clone(), engine_for_listener);
@@ -858,6 +903,7 @@ type BuiltEngine = (Arc<dyn StorageEngine>, Option<Arc<DiskStorageEngine>>);
 fn build_engine(
     data_dir: Option<PathBuf>,
     flush_interval_messages: i64,
+    fsync_max_latency_ms: u64,
     log_dirs: Vec<kaas_storage::LogDirInfo>,
     placement: Arc<TopicRegistry>,
 ) -> Result<BuiltEngine> {
@@ -872,8 +918,18 @@ fn build_engine(
             // flush-per-batch — found in phase 9 A.3 as a 2.8×
             // throughput gap against the v0.1 flavor on identical
             // values (gh #152).
+            // gh #256 (re-port of gh #95): the fsync-watchdog deadline.
+            // 0 disables — an operator on a substrate slower than any
+            // sane deadline turns the watchdog off instead of taking
+            // spurious LEADER_NOT_AVAILABLE on every slow scrub.
+            let fsync_max_latency = if fsync_max_latency_ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(fsync_max_latency_ms))
+            };
             let cfg = PartitionConfig {
                 flush_interval_messages,
+                fsync_max_latency,
                 ..PartitionConfig::default()
             };
             for d in &log_dirs {
@@ -899,9 +955,16 @@ fn build_dispatcher(
     engines: Arc<PerListenerAuthEngine>,
     auto_create_topics: bool,
     num_partitions: i32,
+    max_message_bytes: usize,
+    creds: Option<Arc<dyn kaas_auth::CredentialStore>>,
 ) -> Dispatcher {
     let mut d = Dispatcher::new();
-    d.register(0, 3, 9, Arc::new(ProduceHandler::new(broker.clone())));
+    d.register(
+        0,
+        3,
+        9,
+        Arc::new(ProduceHandler::new(broker.clone()).with_max_message_bytes(max_message_bytes)),
+    );
     d.register(1, 4, 12, Arc::new(FetchHandler::new(broker.clone())));
     d.register(2, 1, 7, Arc::new(ListOffsetsHandler::new(broker.clone())));
     d.register(
@@ -1040,6 +1103,23 @@ fn build_dispatcher(
         0,
         1,
         Arc::new(AlterClientQuotasHandler::new(broker.clone())),
+    );
+    // KIP-554 SCRAM credential admin (gh #252): describe answers from
+    // the live credential store; alter rotates via the KafkaUser CR.
+    d.register(
+        50,
+        0,
+        0,
+        Arc::new(DescribeUserScramCredentialsHandler::new(
+            broker.clone(),
+            creds,
+        )),
+    );
+    d.register(
+        51,
+        0,
+        0,
+        Arc::new(AlterUserScramCredentialsHandler::new(broker.clone())),
     );
     d.register(47, 0, 0, Arc::new(OffsetDeleteHandler::new(broker)));
     d.set_auth(engines);

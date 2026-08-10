@@ -49,8 +49,8 @@ spec:
             {{- if .Values.observability.otlp.traces.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.observability.otlp.traces.endpoint | quote }}
-            - name: OTEL_EXPORTER_OTLP_INSECURE
-              value: "{{ .Values.observability.otlp.traces.insecure }}"
+            {{- /* OTEL_EXPORTER_OTLP_INSECURE was dropped (gh #257):
+                 plaintext vs TLS is inferred from the URI scheme. */}}
             - name: OTEL_TRACES_SAMPLER_ARG
               value: "{{ .Values.observability.otlp.traces.samplerRatio }}"
             {{- end }}

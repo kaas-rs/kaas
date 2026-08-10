@@ -113,6 +113,7 @@ pub fn install(
     kube: Option<kube::Client>,
     client_port: i32,
     topic_notify: Arc<TopicChangeNotifier>,
+    txn_num_slots: usize,
 ) -> Result<ClusterRuntime> {
     let self_id = format!("kaas-{broker_id}");
 
@@ -179,7 +180,11 @@ pub fn install(
     // Phase 6 transactional-state store + fence log, rooted in the
     // same cluster-state dir resolved above (gh #22 rejoin contract
     // holds in dev mode via the tmp-dir fallback).
-    let txn_state = Arc::new(TxnStateStore::open(&cluster_dir, 0)?);
+    // gh #255: the chart-emitted KAAS_TXN_NUM_SLOTS was ignored from
+    // the Rust cutover (always the hard-coded default). 0 = store
+    // default (50). Changing it on a live cluster re-shards txn
+    // ownership — the values.yaml comment carries the drain warning.
+    let txn_state = Arc::new(TxnStateStore::open(&cluster_dir, txn_num_slots)?);
     broker.install_txn_state(txn_state.clone());
     info!(
         slots = txn_state.num_slots(),

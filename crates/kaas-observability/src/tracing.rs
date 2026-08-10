@@ -1,7 +1,11 @@
 //! `tracing-subscriber` + OTel tracing bring-up.
 //!
-//! Honours `KAAS_LOG_LEVEL` (debug|info|warn|error) and
-//! `KAAS_LOG_FORMAT` (json|text). Replaces the ad-hoc `init_tracing`
+//! The level itself is the *caller's* input: the operator reads
+//! `KAAS_LOG_LEVEL` directly, and the broker resolves it in
+//! `kaas_broker::cli` (`RUST_LOG` wins, `KAAS_LOG_LEVEL` next,
+//! `info` last — gh #254; the broker ignored the chart's level
+//! entirely from the Rust cutover until then). `KAAS_LOG_FORMAT`
+//! (json|text) is read here. Replaces the ad-hoc `init_tracing`
 //! stubs in `bins/kaas/main.rs` and `bins/kaas-operator/main.rs`.
 //!
 //! The OTel layer emits every `tracing::span!` as an OTel span through

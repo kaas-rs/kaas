@@ -116,6 +116,12 @@ pub struct Broker {
     /// dev mode and unit tests — the handlers degrade to the
     /// pre-gh #107 stub behaviour (empty describe, no-op mutate).
     acl_cr_writer: RwLock<Option<Arc<dyn crate::acl_cr_writer::AclCRWriter>>>,
+    /// SCRAM credential rotation path (gh #252, KIP-554): key 51
+    /// patches `KafkaUser.spec.authentication.scram`. `None` in dev
+    /// mode and unit tests — the handler answers per-user
+    /// `CLUSTER_AUTHORIZATION_FAILED` (31), same degradation as the
+    /// topic writer.
+    user_cr_writer: RwLock<Option<Arc<dyn crate::user_cr_writer::UserCRWriter>>>,
     /// Concrete-typed [`QuotaEnforcer`] handle for the Phase 7
     /// admin handlers (DescribeClientQuotas / AlterClientQuotas)
     /// which need access to `set_user_quota` / `describe_user_quota`
@@ -194,6 +200,7 @@ impl Broker {
             marker_queue: RwLock::new(None),
             cr_writer: RwLock::new(None),
             acl_cr_writer: RwLock::new(None),
+            user_cr_writer: RwLock::new(None),
             quota_enforcer: RwLock::new(None),
             broker_view: RwLock::new(None),
             producer_ids: RwLock::new(None),
@@ -366,6 +373,16 @@ impl Broker {
     /// with an empty binding set and CreateAcls / DeleteAcls degrade
     /// to per-entry no-ops — the pre-gh #107 stub behaviour the
     /// kafka-compat tests rely on.
+    /// Install the KafkaUser credential writer (gh #252). Cluster
+    /// mode only; see the field docs for the dev-mode degradation.
+    pub fn install_user_cr_writer(&self, w: Arc<dyn crate::user_cr_writer::UserCRWriter>) {
+        *self.user_cr_writer.write() = Some(w);
+    }
+
+    pub fn user_cr_writer(&self) -> Option<Arc<dyn crate::user_cr_writer::UserCRWriter>> {
+        self.user_cr_writer.read().clone()
+    }
+
     pub fn acl_cr_writer(&self) -> Option<Arc<dyn crate::acl_cr_writer::AclCRWriter>> {
         self.acl_cr_writer.read().clone()
     }

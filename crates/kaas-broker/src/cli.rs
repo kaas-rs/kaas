@@ -22,6 +22,12 @@ pub enum ConfigError {
     FlushInterval(std::num::ParseIntError),
     #[error("KAAS_RETENTION_CHECK_INTERVAL: {0}")]
     RetentionCheckInterval(std::num::ParseIntError),
+    #[error("KAAS_TXN_NUM_SLOTS: {0}")]
+    TxnNumSlots(std::num::ParseIntError),
+    #[error("KAAS_MAX_MESSAGE_BYTES: {0}")]
+    MaxMessageBytes(std::num::ParseIntError),
+    #[error("KAAS_FSYNC_MAX_LATENCY_MS: {0}")]
+    FsyncMaxLatency(std::num::ParseIntError),
     #[error("{0}")]
     LogDirs(String),
 }
@@ -210,6 +216,27 @@ pub struct Cli {
     /// `KAAS_NUM_PARTITIONS` — Apache `num.partitions`, the partition
     /// count given to an auto-created topic. Apache's default is 1.
     pub num_partitions: i32,
+    /// `KAAS_REQUIRE_SASL` (gh #251, re-port of the Go broker's
+    /// `SKAFKA_REQUIRE_SASL`) — when true, listeners with no
+    /// `authentication.type` get the real SASL engine instead of the
+    /// anonymous allow-all one, closing the anonymous-fallthrough
+    /// hole cluster-wide. `KAAS_AUTH_DISABLED=true` outranks it.
+    pub require_sasl: bool,
+    /// `KAAS_TXN_NUM_SLOTS` (gh #255) — slot-shard count for the txn
+    /// state store. `0` (default) = the store's built-in default
+    /// (50, Apache's `transaction.state.log.num.partitions`).
+    /// Changing it on a live cluster re-shards txn ownership — drain
+    /// in-flight transactions first.
+    pub txn_num_slots: usize,
+    /// `KAAS_MAX_MESSAGE_BYTES` (gh #253) — Apache `message.max.bytes`,
+    /// the broker-wide cap on one Produce record batch. Same 1 MiB +
+    /// header default as Apache (1048588).
+    pub max_message_bytes: usize,
+    /// `KAAS_FSYNC_MAX_LATENCY_MS` (gh #256, re-port of gh #95) —
+    /// watchdog deadline for one log fsync; a commit cycle that
+    /// stalls longer fails the append instead of wedging the
+    /// partition. `0` disables the watchdog. Default 30 000 ms.
+    pub fsync_max_latency_ms: u64,
 }
 
 impl Cli {
@@ -287,7 +314,14 @@ impl Cli {
         };
 
         let topics_seed = env::var("KAAS_TOPICS").unwrap_or_default();
-        let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
+        // gh #254: the chart's observability.logs.level reaches the
+        // broker as KAAS_LOG_LEVEL (the operator already honours it);
+        // an explicit RUST_LOG still wins for ad-hoc debugging.
+        let log_level = env::var("RUST_LOG")
+            .or_else(|_| env::var("KAAS_LOG_LEVEL"))
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "info".to_owned());
 
         let auth_disabled = parse_bool_env("KAAS_AUTH_DISABLED").unwrap_or(false);
         let authorization_type = env::var("KAAS_AUTHORIZATION_TYPE").unwrap_or_default();
@@ -312,6 +346,36 @@ impl Cli {
             .filter(|n| *n > 0)
             .unwrap_or(1);
 
+        let require_sasl = parse_bool_env("KAAS_REQUIRE_SASL").unwrap_or(false);
+
+        // Unlike num_partitions above, a bad value here fails boot:
+        // these three change durability/limit semantics, and silently
+        // running with the default when the operator asked for
+        // something else is the gh #251/#255 dead-knob class of bug.
+        let txn_num_slots = env::var("KAAS_TXN_NUM_SLOTS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse::<usize>())
+            .transpose()
+            .map_err(ConfigError::TxnNumSlots)?
+            .unwrap_or(0);
+
+        let max_message_bytes = env::var("KAAS_MAX_MESSAGE_BYTES")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse::<usize>())
+            .transpose()
+            .map_err(ConfigError::MaxMessageBytes)?
+            .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES);
+
+        let fsync_max_latency_ms = env::var("KAAS_FSYNC_MAX_LATENCY_MS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse::<u64>())
+            .transpose()
+            .map_err(ConfigError::FsyncMaxLatency)?
+            .unwrap_or(30_000);
+
         Ok(Self {
             listeners,
             data_dir,
@@ -329,6 +393,10 @@ impl Cli {
             ssl_principal_mapping_rules,
             auto_create_topics,
             num_partitions,
+            require_sasl,
+            txn_num_slots,
+            max_message_bytes,
+            fsync_max_latency_ms,
         })
     }
 
@@ -342,6 +410,11 @@ impl Cli {
             .or_else(|| self.data_dir.as_ref().map(|d| d.join("__cluster")))
     }
 }
+
+/// Apache's `message.max.bytes` default: 1 MiB of records plus the
+/// record-batch header overhead. The produce handler reads it back
+/// through [`Cli::max_message_bytes`].
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 
 fn parse_bool_env(name: &str) -> Option<bool> {
     env::var(name).ok().map(|s| {

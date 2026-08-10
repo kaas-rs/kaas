@@ -198,3 +198,77 @@ answers `UNSUPPORTED_VERSION` (35). `validate_only` skips the install.
 `set_user_quota_live_updates_existing_bucket` and the debt-carry contention
 test in `crates/kaas-auth/src/quota.rs`; enforcement end-to-end in
 `bins/kaas/tests/auth_smoke.rs` (`produce_exceeds_quota_returns_throttle`).
+
+## DescribeUserScramCredentials
+
+Lists which SCRAM mechanisms a user has credentials for —
+`kafka-configs.sh --describe --entity-type users` and the AdminClient's
+`describeUserScramCredentials()` ([KIP-554](../kip/kip-554.md)).
+
+**Versions**: v0 (flexible from v0).
+
+**Handling**: authorize `Describe` on the cluster (denial → top-level
+`CLUSTER_AUTHORIZATION_FAILED` (31)), then answer from the live credential
+store — the operator-materialised `credentials.json`, hot-reloaded, so the
+response reflects the store the SCRAM authenticator actually verifies
+against. A null `users` array describes every user with SCRAM credentials;
+a named user without any answers a per-user `RESOURCE_NOT_FOUND` (83); a
+user named twice answers `DUPLICATE_RESOURCE` (81) — all Apache's shapes.
+Only mechanism + iteration count are reported, never salts or keys.
+
+**Deviations from Apache 3.7**:
+
+- Every credential reports mechanism `SCRAM-SHA-512` — kaas serves no
+  SCRAM-SHA-256, so a user never has more than one credential entry.
+
+**Source**: `crates/kaas-broker/src/handlers/describe_user_scram_credentials.rs`,
+`crates/kaas-codec/src/api/describe_user_scram_credentials.rs`,
+`crates/kaas-auth/src/credentials.rs` (`list_all_scram_users`).
+
+**Verified by**: codec round-trip tests (null-vs-empty users pinned) in
+`crates/kaas-codec/src/api/describe_user_scram_credentials.rs`;
+`scripts/kafka-configs.sh` (user describe scenarios).
+
+## AlterUserScramCredentials
+
+Rotates a user's SCRAM credential over the wire —
+`kafka-configs.sh --alter --entity-type users --add-config 'SCRAM-SHA-512=...'`
+([KIP-554](../kip/kip-554.md)).
+
+**Versions**: v0 (flexible from v0).
+
+**Handling**: authorize `Alter` on the cluster (denial → per-user
+`CLUSTER_AUTHORIZATION_FAILED` (31)). The wire carries pre-salted material —
+`(salt, saltedPassword, iterations)`, never the password — and the broker
+derives the RFC 5802 stored/server keys and patches them into
+`KafkaUser.spec.authentication.scram`. The operator materialises the change
+into `credentials.json` on reconcile and every broker hot-reloads it, so
+the rotation is **asynchronous** (typically a few seconds) and cluster-wide.
+The CR must already exist (`RESOURCE_NOT_FOUND` (83) otherwise) and its
+`authentication.type` must be `scram-sha-512` or unset — rotating a `tls`
+user's SCRAM credential would silently flip its auth mechanism, so that
+answers `INVALID_REQUEST` (42). Iterations below 4096 or empty
+salt/saltedPassword answer `UNACCEPTABLE_CREDENTIAL` (93).
+
+**Deviations from Apache 3.7**:
+
+- **SCRAM-SHA-512 only** — SHA-256 upsertions answer
+  `UNSUPPORTED_SASL_MECHANISM` (33).
+- **Deletions are refused** with `UNSUPPORTED_VERSION` (35): the credential
+  lifecycle belongs to the `KafkaUser` CR (delete the CR or change its
+  `authentication.type`). The operator would re-materialise anything the
+  broker removed, and a deletion that silently comes back is worse than a
+  refusal.
+- The rotation is visible to SCRAM handshakes only after the operator
+  reconcile plus the brokers' credential reload (~10 s worst case), not
+  atomically with the response.
+
+**Source**: `crates/kaas-broker/src/handlers/alter_user_scram_credentials.rs`,
+`crates/kaas-broker/src/user_cr_writer.rs`,
+`crates/kaas-codec/src/api/alter_user_scram_credentials.rs`,
+`crates/kaas-auth/src/scram.rs` (`keys_from_salted_password`).
+
+**Verified by**: handler tests (key derivation, mechanism/iteration
+rejection, deletion refusal) in
+`crates/kaas-broker/src/handlers/alter_user_scram_credentials.rs`; codec
+round-trips in `crates/kaas-codec/src/api/alter_user_scram_credentials.rs`.

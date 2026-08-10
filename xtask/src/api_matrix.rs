@@ -263,6 +263,18 @@ const API_DOCS: &[ApiDoc] = &[
         kips: &[546],
     },
     ApiDoc {
+        key: 50,
+        name: "DescribeUserScramCredentials",
+        page: "acls-quotas",
+        kips: &[554],
+    },
+    ApiDoc {
+        key: 51,
+        name: "AlterUserScramCredentials",
+        page: "acls-quotas",
+        kips: &[554],
+    },
+    ApiDoc {
         key: 60,
         name: "DescribeCluster",
         page: "cluster-misc",
@@ -282,16 +294,6 @@ const GAPS: &[(i16, &str, &str)] = &[
         33,
         "AlterConfigs (legacy)",
         "Superseded by [IncrementalAlterConfigs](api/topics-configs.md#incrementalalterconfigs) (key 44) but still served by Apache 3.7. Open follow-up.",
-    ),
-    (
-        50,
-        "DescribeUserScramCredentials",
-        "[KIP-554](kip/kip-554.md) partial — credential rotation is operator-side only; no codec module, no dispatch. Open follow-up.",
-    ),
-    (
-        51,
-        "AlterUserScramCredentials",
-        "[KIP-554](kip/kip-554.md) partial — same as key 50. Open follow-up.",
     ),
 ];
 

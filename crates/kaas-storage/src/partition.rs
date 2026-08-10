@@ -83,8 +83,12 @@ pub struct PartitionConfig {
     /// `log.flush.interval.messages`. Default 1 = honest acks=all on
     /// every batch; raise to amortise fsync cost over more records.
     pub flush_interval_messages: i64,
-    /// Watchdog deadline for one log fsync (gh #95). Default 30 s.
-    pub fsync_max_latency: Duration,
+    /// Watchdog deadline for one log fsync (gh #95): a commit cycle
+    /// that stalls longer fails the append instead of wedging the
+    /// partition. `None` disables the watchdog (the operator's
+    /// substrate is slower than any sane deadline). Default 30 s;
+    /// tune via `KAAS_FSYNC_MAX_LATENCY_MS` (gh #256), `0` = None.
+    pub fsync_max_latency: Option<Duration>,
 }
 
 impl Default for PartitionConfig {
@@ -94,7 +98,7 @@ impl Default for PartitionConfig {
             segment_ms: Some(7 * 24 * 60 * 60 * 1000),
             index_interval_bytes: 4096,
             flush_interval_messages: 1,
-            fsync_max_latency: Duration::from_secs(30),
+            fsync_max_latency: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -1371,7 +1375,7 @@ fn spawn_committer(
     inner: Arc<Mutex<PartitionInner>>,
     cond: Arc<Notify>,
     mut req_rx: mpsc::Receiver<()>,
-    fsync_max_latency: Duration,
+    fsync_max_latency: Option<Duration>,
     fs: Arc<dyn Fs>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1421,7 +1425,13 @@ fn spawn_committer(
                 Ok(seq)
             });
 
-            let outcome = tokio::time::timeout(fsync_max_latency, fsync_handle).await;
+            // gh #256: `None` = watchdog disabled — await the fsync
+            // however long it takes, wrapped so both arms share the
+            // downstream match (Ok(join_result) ↔ "did not time out").
+            let outcome = match fsync_max_latency {
+                Some(deadline) => tokio::time::timeout(deadline, fsync_handle).await,
+                None => Ok(fsync_handle.await),
+            };
             match outcome {
                 Ok(Ok(Ok(satisfied_seq))) => {
                     let mut guard = inner.lock();

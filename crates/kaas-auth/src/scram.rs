@@ -201,6 +201,19 @@ fn parse_attrs(s: &str) -> HashMap<String, String> {
     m
 }
 
+/// RFC 5802 key derivation from a client-supplied SaltedPassword
+/// (gh #252 — KIP-554 `AlterUserScramCredentials` sends
+/// `(salt, salted_password, iterations)`, never the password):
+/// `StoredKey = H(HMAC(salted, "Client Key"))`,
+/// `ServerKey = HMAC(salted, "Server Key")`. Returns
+/// `(stored_key, server_key)`.
+pub fn keys_from_salted_password(salted_password: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let client_key = hmac_sha512(salted_password, b"Client Key");
+    let stored_key = Sha512::digest(&client_key).to_vec();
+    let server_key = hmac_sha512(salted_password, b"Server Key");
+    (stored_key, server_key)
+}
+
 /// HMAC-SHA-512. The `new_from_slice` constructor is documented to
 /// accept any key length (oversize keys are hashed first internally),
 /// so the `Err` arm is unreachable — collapse it with a fallback

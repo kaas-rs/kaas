@@ -212,11 +212,14 @@ See `values.yaml` for the full set of tunables. Common overrides:
 | `storage.controlPlane.className` | "" | "" → same as `storage.className` |
 | `storage.pool` | [] | Named pool log dirs (gh #221 phase 2): each entry `{name, size, className, accessMode, defaultEligible}` becomes its own RWX PVC mounted at `/vols/<name>` on brokers + operator and advertised via `KAAS_LOG_DIRS`. Topics bind with `KafkaTopic.spec.storage.volumes`; `defaultEligible: false` members only receive topics that name them explicitly. Placement is creation-sticky. |
 | `auth.enabled` | true | Enable credentials.json/acls.json loading |
-| `auth.requireSasl` | false | Reject non-SASL requests |
+| `auth.requireSasl` | false | Anonymous listeners require SASL too — every connection must authenticate before any non-handshake API (gh #251) |
+| `auth.sslPrincipalMappingRules` | `""` | Apache `ssl.principal.mapping.rules` (KIP-371): regex rules mapping mTLS subject DNs to principals |
 | `listeners[]` | plain/external/authed | Strimzi-shape listener array (gh #126): per-entry `name`, `port`, `type`, `tls`, `authentication.type`, `enabled` — see values.yaml comments |
 | `authorization.type` | `""` | Cluster-wide authorization: `""` (off) or `simple` (ACL-based) |
 | `authorization.superUsers` | `[]` | Principals that bypass ACL evaluation |
 | `broker.flushIntervalMessages` | 1 | `KAAS_FLUSH_INTERVAL_MESSAGES` durability dial |
+| `broker.maxMessageBytes` | 1048588 | Apache `message.max.bytes` — broker-wide cap on one Produce batch (gh #253) |
+| `broker.fsyncMaxLatencyMs` | 30000 | fsync watchdog deadline; `0` disables (gh #256) |
 | `broker.controllerLease.durationSeconds` | 15 | Cluster-controller Lease lifetime; lower = faster failover, more etcd writes |
 | `podDisruptionBudget.maxUnavailable` | 1 | Equivalent to Kafka min-ISR guarantee |
 

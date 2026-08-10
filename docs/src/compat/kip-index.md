@@ -53,7 +53,7 @@ credibility test.
 | KIP-354 | `delete.retention.ms` config plumbing | tombstone-expiry enforcement (same missing compactor); upstream's `max.compaction.lag.ms` doesn't exist anywhere | [KIP-354](kip/kip-354.md) |
 | KIP-394 | `MEMBER_ID_REQUIRED` error code defined | the v4+ two-step join handshake — `join()` still takes the legacy assign-inline path | [KIP-394](kip/kip-394.md) |
 | KIP-516 | operator mints `Status.TopicID` (v4 UUID, never rotated) | broker-side wire propagation — the production topic watch inserts the all-zero sentinel, so Metadata serves nil topic IDs | [KIP-516](kip/kip-516.md) |
-| KIP-554 | operator-side SCRAM credential rotation path | wire keys 50/51 entirely — no codec modules, no dispatch | [KIP-554](kip/kip-554.md) |
+| KIP-554 | wire keys 50/51 served — describe answers from the live credential store, alter rotates via the `KafkaUser` CR | SCRAM-SHA-256 (kaas is SHA-512-only); wire-side credential *deletion* (refused — the lifecycle stays on the CR) | [KIP-554](kip/kip-554.md) |
 
 ## Deliberate non-goals (8)
 

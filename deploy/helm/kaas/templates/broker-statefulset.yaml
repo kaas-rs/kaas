@@ -141,8 +141,6 @@ spec:
               # KafkaClusterAssignments CR mirror writes back to the
               # right object (Phase 6).
               value: {{ include "kaas.fullname" . }}
-            - name: KAAS_PORT
-              value: "{{ .Values.broker.ports.kafka }}"
             - name: KAAS_HEALTH_ADDR
               value: ":{{ .Values.broker.ports.health }}"
             - name: KAAS_CONTROLLER_HEARTBEAT_ADDR
@@ -159,14 +157,23 @@ spec:
               value: "{{ .Values.broker.flushIntervalMessages | default 1 }}"
             - name: KAAS_RETENTION_CHECK_INTERVAL
               value: "{{ .Values.broker.retentionCheckIntervalSeconds | default 300 }}"
-            {{- if .Values.broker.pprof }}
-            # gh #132: pprof on the health server's mux at /debug/pprof/.
-            # Enables block + mutex profiling at full sample rate — only
-            # flip this on for short-lived investigations; the runtime
-            # overhead is observable.
-            - name: KAAS_PPROF
-              value: "true"
-            {{- end }}
+            # gh #253: Apache's message.max.bytes — broker-wide cap on
+            # one Produce record batch. Same default as Apache
+            # (1 MiB + batch-header overhead).
+            {{- /* `int` keeps helm from rendering the value in
+                 scientific notation (1.048588e+06). */}}
+            - name: KAAS_MAX_MESSAGE_BYTES
+              value: "{{ .Values.broker.maxMessageBytes | default 1048588 | int }}"
+            # gh #256 (gh #95 re-port): fsync watchdog deadline in ms.
+            # A commit cycle stalling longer fails the append
+            # (retriable) instead of wedging the partition. 0 disables
+            # the watchdog — for substrates whose worst-case fsync is
+            # legitimately slower than any sane deadline.
+            {{- /* NOT `| default 30000`: helm's default treats 0 as
+                 unset, and 0 is the documented "watchdog off" value.
+                 Only a truly absent key falls back. */}}
+            - name: KAAS_FSYNC_MAX_LATENCY_MS
+              value: "{{ if kindIs "invalid" .Values.broker.fsyncMaxLatencyMs }}30000{{ else }}{{ .Values.broker.fsyncMaxLatencyMs | int }}{{ end }}"
             # gh #108 (refactored v0.1.84): numSlots for the sharded
             # TxnStateStore is decoupled from the StatefulSet replica
             # count and pinned to a fixed cluster-wide constant —
@@ -193,8 +200,20 @@ spec:
             - name: KAAS_NUM_PARTITIONS
               value: "{{ .Values.broker.autoCreateTopics.numPartitions }}"
             {{- if .Values.auth.requireSasl }}
+            # gh #251: anonymous listeners get the real SASL engine —
+            # every connection must finish SASL before any
+            # non-handshake API. (Dead config from the Rust cutover
+            # until v0.2.45; the broker reads it again.)
             - name: KAAS_REQUIRE_SASL
               value: "true"
+            {{- end }}
+            {{- if .Values.auth.sslPrincipalMappingRules }}
+            # gh #257 / gh #43 (KIP-371): Apache's
+            # ssl.principal.mapping.rules — regex rules mapping mTLS
+            # subject DNs to principals. Was broker-readable but
+            # unreachable via the chart.
+            - name: KAAS_SSL_PRINCIPAL_MAPPING_RULES
+              value: {{ .Values.auth.sslPrincipalMappingRules | quote }}
             {{- end }}
             {{- if not .Values.auth.enabled }}
             - name: KAAS_AUTH_DISABLED
@@ -224,8 +243,9 @@ spec:
             {{- if .Values.observability.otlp.traces.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.observability.otlp.traces.endpoint | quote }}
-            - name: OTEL_EXPORTER_OTLP_INSECURE
-              value: "{{ .Values.observability.otlp.traces.insecure }}"
+            {{- /* OTEL_EXPORTER_OTLP_INSECURE was dropped (gh #257):
+                 the Rust exporter infers plaintext from the endpoint's
+                 URI scheme (http:// vs https://); the env was unread. */}}
             - name: OTEL_TRACES_SAMPLER_ARG
               value: "{{ .Values.observability.otlp.traces.samplerRatio }}"
             {{- end }}

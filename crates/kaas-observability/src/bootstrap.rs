@@ -261,7 +261,9 @@ fn split_num_unit(s: &str) -> Option<(&str, &str)> {
 /// `host:port` makes hyper read `host` as the scheme and the export
 /// dies with `InvalidUri`. Chart values written for earlier releases
 /// omit the scheme, so default them to `http://` (in-cluster,
-/// plaintext; `OTEL_EXPORTER_OTLP_INSECURE=true` deployments).
+/// plaintext). The scheme IS the plaintext/TLS selector — the old
+/// `OTEL_EXPORTER_OTLP_INSECURE` env was never read here and its
+/// chart emission was dropped (gh #257).
 fn ensure_scheme(s: &str) -> String {
     if s.contains("://") {
         s.replacen("grpc://", "http://", 1)

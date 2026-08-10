@@ -144,6 +144,19 @@ broker:
   # deletion.
   retentionCheckIntervalSeconds: 300
 
+  # gh #253: Apache's message.max.bytes — the broker-wide cap on one
+  # Produce record batch, same default (1 MiB + batch-header
+  # overhead). Larger batches are rejected with MESSAGE_TOO_LARGE.
+  # Raise together with the consumers' fetch.max.bytes, as in Apache.
+  maxMessageBytes: 1048588
+
+  # gh #256 (gh #95 re-port): fsync watchdog deadline in milliseconds.
+  # A log fsync stalling longer than this fails the append with a
+  # retriable error instead of wedging the partition — a stuck-NFS
+  # tripwire. 0 disables the watchdog for substrates whose worst-case
+  # fsync latency is legitimately above any sane deadline.
+  fsyncMaxLatencyMs: 30000
+
   # gh #108: TxnStateStore slot count. Pinned to a cluster-wide
   # constant independent of replicaCount — mirrors Apache's
   # transaction.state.log.num.partitions=50 default. Scale ops change
@@ -231,6 +244,12 @@ auth:
   # requests from connections that haven't completed SASL — closes the
   # "anonymous fallthrough" hole. Translates to KAAS_REQUIRE_SASL.
   requireSasl: false
+  # gh #257 / gh #43 (KIP-371): Apache's ssl.principal.mapping.rules,
+  # passed through verbatim — regex rules that map an mTLS client
+  # cert's subject DN to a principal name. Empty = DEFAULT (use the
+  # CN unchanged). Parse errors fail broker startup, so a typo shows
+  # up as a crash-loop rather than every cert mapping to its CN.
+  sslPrincipalMappingRules: ""
   tls:
     enabled: false
     existingSecret: ""          # Secret with tls.crt + tls.key
@@ -326,7 +345,8 @@ observability:
       # Switch to "otel-collector.observability.svc.cluster.local:4317"
       # if you front Tempo with the OTel Collector.
       endpoint: "tempo.observability.svc.cluster.local:4317"
-      insecure: true
+      # (gh #257: the old `insecure` toggle was dropped — the exporter
+      # infers plaintext vs TLS from the endpoint's URI scheme.)
       # 0.0 = off; 1.0 = every trace. Production default 0.1; bump to
       # 1.0 in dev / when actively debugging.
       samplerRatio: 0.1

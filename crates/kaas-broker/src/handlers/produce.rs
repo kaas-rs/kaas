@@ -23,7 +23,10 @@ const ERR_NOT_LEADER_FOR_PARTITION: i16 = 6;
 const ERR_MESSAGE_TOO_LARGE: i16 = 18;
 /// Mirrors Apache Kafka's `message.max.bytes` default: 1 MiB of
 /// records plus 12 bytes of batch overhead (gh #14).
-const MAX_MESSAGE_BYTES: usize = 1_048_588;
+/// Apache's `message.max.bytes` default (1 MiB + batch overhead).
+/// The production wiring overrides via [`ProduceHandler::with_max_message_bytes`]
+/// from `KAAS_MAX_MESSAGE_BYTES` (gh #253).
+const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 const ERR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
 const ERR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
@@ -33,11 +36,24 @@ const ERR_GENERIC: i16 = -1; // KAFKA_STORAGE_ERROR equivalent
 #[derive(Debug)]
 pub struct ProduceHandler {
     broker: Arc<Broker>,
+    max_message_bytes: usize,
 }
 
 impl ProduceHandler {
     pub fn new(broker: Arc<Broker>) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+        }
+    }
+
+    /// gh #253: broker-wide `message.max.bytes`. Was a hard-coded
+    /// constant from the Rust cutover (the Go broker read
+    /// `SKAFKA_MAX_MESSAGE_BYTES`, gh #14) — >1 MiB batches had no
+    /// knob at all.
+    pub fn with_max_message_bytes(mut self, max: usize) -> Self {
+        self.max_message_bytes = max;
+        self
     }
 }
 
@@ -160,7 +176,7 @@ impl ProduceHandler {
         // large batches and trips MaxFetchBytes loops at consume
         // time. Cap matches Apache's `message.max.bytes` default
         // (1 MiB + batch overhead).
-        if records.len() > MAX_MESSAGE_BYTES {
+        if records.len() > self.max_message_bytes {
             return error_partition_bumped(topic, p.index, ERR_MESSAGE_TOO_LARGE);
         }
 

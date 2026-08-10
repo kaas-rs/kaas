@@ -1397,6 +1397,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "kaas-auth",

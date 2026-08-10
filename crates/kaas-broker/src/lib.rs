@@ -29,6 +29,7 @@ pub mod topic_config_defaults;
 pub mod topic_cr_writer;
 pub mod topic_registry;
 pub mod txn_markers;
+pub mod user_cr_writer;
 
 #[cfg(feature = "cr-writer")]
 pub use acl_cr_writer::KubeAclCRWriter;
@@ -52,15 +53,16 @@ pub use group_hash::{
 pub use group_takeover::GroupTakeoverDriver;
 pub use handlers::{
     migrate_partition, AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, AlterClientQuotasHandler,
-    AlterReplicaLogDirsHandler, ApiVersionsHandler, CreateAclsHandler, CreatePartitionsHandler,
-    CreateTopicsHandler, DeleteAclsHandler, DeleteGroupsHandler, DeleteRecordsHandler,
-    DeleteTopicsHandler, DescribeAclsHandler, DescribeClientQuotasHandler, DescribeClusterHandler,
-    DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler, EndTxnHandler,
-    FetchHandler, FindCoordinatorHandler, HeartbeatHandler, IncrementalAlterConfigsHandler,
-    InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler, ListGroupsHandler,
-    ListOffsetsHandler, MetadataHandler, OffsetCommitHandler, OffsetDeleteHandler,
-    OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler, SaslHandshakeHandler,
-    SyncGroupHandler, TxnOffsetCommitHandler, WriteTxnMarkersHandler,
+    AlterReplicaLogDirsHandler, AlterUserScramCredentialsHandler, ApiVersionsHandler,
+    CreateAclsHandler, CreatePartitionsHandler, CreateTopicsHandler, DeleteAclsHandler,
+    DeleteGroupsHandler, DeleteRecordsHandler, DeleteTopicsHandler, DescribeAclsHandler,
+    DescribeClientQuotasHandler, DescribeClusterHandler, DescribeConfigsHandler,
+    DescribeGroupsHandler, DescribeLogDirsHandler, DescribeUserScramCredentialsHandler,
+    EndTxnHandler, FetchHandler, FindCoordinatorHandler, HeartbeatHandler,
+    IncrementalAlterConfigsHandler, InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler,
+    ListGroupsHandler, ListOffsetsHandler, MetadataHandler, OffsetCommitHandler,
+    OffsetDeleteHandler, OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler,
+    SaslHandshakeHandler, SyncGroupHandler, TxnOffsetCommitHandler, WriteTxnMarkersHandler,
 };
 pub use heartbeat_client::{CommandHandler, HeartbeatClient, TargetResolver};
 pub use local_lease::LocalLeaseManager;
@@ -77,6 +79,9 @@ pub use topic_cr_writer::{
     NoopTopicCRWriter, TopicCRWriter, TopicWriteError,
 };
 pub use topic_registry::{ConfigError as TopicConfigError, TopicMeta, TopicRegistry};
+#[cfg(feature = "cr-writer")]
+pub use user_cr_writer::KubeUserCRWriter;
+pub use user_cr_writer::{ScramCredentialSpec, UserCRWriter, UserWriteError};
 
 pub mod heartbeatpb {
     // tonic-build emits `as i32`, large match arms, and similar patterns that

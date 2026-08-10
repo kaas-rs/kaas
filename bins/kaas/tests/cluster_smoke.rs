@@ -79,6 +79,7 @@ async fn two_brokers_share_assignment_json_and_split_partitions() {
         None,
         9092,
         std::sync::Arc::new(cluster::TopicChangeNotifier::default()),
+        0,
     )
     .expect("install ok for broker 0");
     let rt1 = cluster::install(
@@ -93,6 +94,7 @@ async fn two_brokers_share_assignment_json_and_split_partitions() {
         None,
         9092,
         std::sync::Arc::new(cluster::TopicChangeNotifier::default()),
+        0,
     )
     .expect("install ok for broker 1");
 

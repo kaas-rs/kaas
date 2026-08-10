@@ -20,6 +20,7 @@ prost          = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 sha1           = { workspace = true }
+base64         = { workspace = true }
 kube           = { workspace = true, optional = true }
 kaas-auth          = { path = "../kaas-auth" }
 kaas-codec         = { path = "../kaas-codec" }
