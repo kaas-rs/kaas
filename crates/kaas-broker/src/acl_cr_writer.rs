@@ -181,7 +181,15 @@ mod kube_impl {
         async fn update(&self, user: &KafkaUser) -> Result<(), AclWriteError> {
             let name = user.metadata.name.as_deref().unwrap_or_default();
             self.api()
-                .replace(name, &PostParams::default(), user)
+                .replace(
+                    name,
+                    &PostParams {
+                        // gh #245: attributable managedFields.
+                        field_manager: Some("kaas-broker".to_owned()),
+                        ..Default::default()
+                    },
+                    user,
+                )
                 .await
                 .map(|_| ())
                 .map_err(|e| AclWriteError::Other(format!("update KafkaUser {name}: {e}")))

@@ -312,6 +312,15 @@ mod kube_impl {
     use super::*;
     use kaas_operator_api::KafkaTopic;
     use kube::api::{Patch, PatchParams};
+
+    /// gh #245: stamp broker writes with a recognisable fieldManager
+    /// so managedFields attributes them (default is `unknown`).
+    fn broker_patch_params() -> PatchParams {
+        PatchParams {
+            field_manager: Some("kaas-broker".to_owned()),
+            ..Default::default()
+        }
+    }
     use kube::Api;
     use serde_json::json;
 
@@ -371,7 +380,15 @@ mod kube_impl {
                 },
                 status: None,
             };
-            match self.api().create(&PostParams::default(), &cr).await {
+            // gh #245: name the writer. Without a fieldManager every
+            // broker-minted CR shows `manager: unknown` in
+            // managedFields, which is exactly what made the 2026-08-02
+            // CR-deletion incident unattributable after the fact.
+            let pp = PostParams {
+                field_manager: Some("kaas-broker".to_owned()),
+                ..Default::default()
+            };
+            match self.api().create(&pp, &cr).await {
                 Ok(_) => Ok(()),
                 Err(kube::Error::Api(e)) if e.code == 409 => {
                     Err(TopicWriteError::AlreadyExists(name.into()))
@@ -403,7 +420,7 @@ mod kube_impl {
                 Err(e) => return Err(map_kube_err(e)),
             }
             let patch = json!({ "spec": { "partitions": new_count } });
-            api.patch(&meta_name, &PatchParams::default(), &Patch::Merge(&patch))
+            api.patch(&meta_name, &broker_patch_params(), &Patch::Merge(&patch))
                 .await
                 .map(|_| ())
                 .map_err(map_kube_err)
@@ -443,7 +460,7 @@ mod kube_impl {
             let (meta_name, _) = super::name_for_cr(name);
             let api = self.api();
             match api
-                .patch(&meta_name, &PatchParams::default(), &Patch::Merge(&patch))
+                .patch(&meta_name, &broker_patch_params(), &Patch::Merge(&patch))
                 .await
             {
                 Ok(_) => Ok(()),
@@ -485,7 +502,7 @@ mod kube_impl {
             let (meta_name, _) = super::name_for_cr(name);
             match self
                 .api()
-                .patch_status(&meta_name, &PatchParams::default(), &Patch::Merge(&patch))
+                .patch_status(&meta_name, &broker_patch_params(), &Patch::Merge(&patch))
                 .await
             {
                 Ok(_) => Ok(()),
