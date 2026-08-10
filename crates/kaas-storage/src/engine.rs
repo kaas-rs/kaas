@@ -323,6 +323,16 @@ pub trait StorageEngine: Send + Sync + 'static {
         None
     }
 
+    /// gh #236 — the topic's operator-materialised `.config.json`
+    /// overrides, or `None` when the topic has none (or the engine
+    /// keeps no per-topic config at all — memory/dev). Re-reads the
+    /// file on every call, same hot-reload contract as the retention
+    /// sweep's `TopicConfigPolicySource`: a CR edit is visible on the
+    /// next DescribeConfigs with no restart. Not a hot path.
+    fn topic_config(&self, _topic: &str) -> Option<crate::topicconfig::TopicConfigFile> {
+        None
+    }
+
     /// SIGTERM-time drain: close every open partition so the next
     /// leader doesn't hit NFS silly-rename pain on takeover
     /// (gh #61 + gh #139). Default impl is a no-op — `MemoryStorage`

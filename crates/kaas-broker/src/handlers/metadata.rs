@@ -135,7 +135,9 @@ impl MetadataHandler {
             // so the honest answer is that it doesn't exist.
             return ERR_UNKNOWN_TOPIC_OR_PARTITION;
         };
-        match writer.create_topic(name, self.num_partitions).await {
+        // Auto-create carries no config overrides — broker defaults,
+        // same as Apache's `auto.create.topics.enable` path.
+        match writer.create_topic(name, self.num_partitions, &[]).await {
             Ok(()) | Err(TopicWriteError::AlreadyExists(_)) => {
                 tracing::info!(topic = %name, partitions = self.num_partitions, "auto-created topic");
                 ERR_LEADER_NOT_AVAILABLE
@@ -366,7 +368,12 @@ mod tests {
 
     #[async_trait]
     impl TopicCRWriter for RecordingWriter {
-        async fn create_topic(&self, name: &str, n: i32) -> Result<(), TopicWriteError> {
+        async fn create_topic(
+            &self,
+            name: &str,
+            n: i32,
+            _configs: &[(String, String)],
+        ) -> Result<(), TopicWriteError> {
             self.calls.lock().push((name.to_owned(), n));
             if self.already_exists {
                 return Err(TopicWriteError::AlreadyExists(name.into()));

@@ -4,8 +4,9 @@
 # Scenarios:
 #   1. --describe broker config (read path)
 #   2. --describe topic config (read path)
-#   3. --alter topic config — currently a GAP (issue #9), expected to fail.
-#      Marked as expected-fail until IncrementalAlterConfigs is implemented.
+#   3. --alter topic config, then assert --describe reports it as a
+#      dynamic (non-default) config — the gh #236 round trip. Also
+#      asserts an unknown key is rejected rather than silently accepted.
 #   4. --describe --all (broad DescribeConfigs surface).
 #   5. --describe specific broker by id.
 #   6-9. Client quota CRUD via AlterClientQuotas / DescribeClientQuotas
@@ -25,13 +26,35 @@ echo ">> Scenario 2: --describe topic config for '$TOPIC'"
 "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \
   --entity-type topics --entity-name "$TOPIC" --describe
 
-echo ">> Scenario 3 (XFAIL, gap #9): --alter topic config retention.ms"
+echo ">> Scenario 3: --alter topic config retention.ms, then round-trip via --describe"
+"$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \
+  --entity-type topics --entity-name "$TOPIC" \
+  --alter --add-config retention.ms=60000
+# The change is CR-mediated (broker patch → operator reconcile → .config.json),
+# so give the operator a moment before asserting the read side.
+deadline=$((SECONDS + 30))
+until "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \
+        --entity-type topics --entity-name "$TOPIC" --describe 2>&1 \
+      | grep -q 'retention.ms=60000'; do
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    # gh #236: --describe (non---all) prints only non-default entries, so
+    # this fails both when the alter was dropped and when the override is
+    # misreported as DEFAULT_CONFIG.
+    echo "FAIL: retention.ms=60000 not reported as a dynamic config within 30s (gh #236)" >&2
+    exit 1
+  fi
+  sleep 1
+done
+echo "override round-tripped as a dynamic topic config"
+
+echo ">> Scenario 3b: --alter with an unknown key must be rejected, not swallowed"
 if "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \
      --entity-type topics --entity-name "$TOPIC" \
-     --alter --add-config retention.ms=60000 2>&1; then
-  echo "UNEXPECTED PASS — IncrementalAlterConfigs may now be implemented; close gap #9."
+     --alter --add-config max.message.bytes=1048576 2>&1; then
+  echo "FAIL: unsupported key max.message.bytes was accepted — silent-drop regression (gh #236)" >&2
+  exit 1
 else
-  echo "(expected) alter rejected — broker work needed (#9)"
+  echo "(expected) unsupported key rejected with an error"
 fi
 
 echo ">> Scenario 4: --describe with --all (every config key, not just overridden)"
@@ -152,4 +175,4 @@ fi
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --delete --topic "$PROBE_TOPIC" >/dev/null 2>&1 || true
 
-echo ">> PASS (read paths + quota XFAILs as expected pending #122)"
+echo ">> PASS (config read/alter round trip + quota XFAILs as expected pending #122)"

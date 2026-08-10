@@ -96,6 +96,15 @@ pub enum TopicWriteError {
     #[error("unsupported config op: {0:?}")]
     UnsupportedOp(ConfigOpKind),
 
+    /// gh #236: unknown config key or unparseable value. Wire:
+    /// `INVALID_CONFIG` (40) — a real rejection instead of the
+    /// silent success that motivated the issue (the API server
+    /// *prunes* unknown `spec.config` fields from a merge patch, so
+    /// anything not caught here would report success and change
+    /// nothing).
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
     /// Caller tried to shrink partition count. Wire:
     /// `INVALID_PARTITIONS` (37).
     #[error("invalid partitions: {0}")]
@@ -120,7 +129,19 @@ pub trait TopicCRWriter: Send + Sync + 'static {
     /// when the CR already exists (idempotent creates map to
     /// `TOPIC_ALREADY_EXISTS` upstream — the caller decides which
     /// error code to surface).
-    async fn create_topic(&self, name: &str, num_partitions: i32) -> Result<(), TopicWriteError>;
+    ///
+    /// `configs` are the wire request's topic-level overrides
+    /// (`--config retention.ms=600000`), landed in the minted CR's
+    /// `spec.config` so the operator materialises them on first
+    /// reconcile (gh #236 — they were previously parsed and
+    /// dropped). Unknown keys / bad values fail the whole creation
+    /// with [`TopicWriteError::InvalidConfig`].
+    async fn create_topic(
+        &self,
+        name: &str,
+        num_partitions: i32,
+        configs: &[(String, String)],
+    ) -> Result<(), TopicWriteError>;
 
     /// Patch `KafkaTopic.spec.partitions` to `new_count`. The
     /// operator's reconciler validates the decrease guard; this
@@ -171,10 +192,15 @@ pub struct ConfigOpWithValue {
 /// the spec.config patch. The shape mirrors what the operator's
 /// `KafkaTopicConfig` deserialiser expects — integer fields as
 /// JSON numbers, `cleanupPolicy` as a string.
-pub fn config_value_to_json(key: &str, value: &str) -> Value {
+///
+/// gh #236: fallible. The old shape passed bad integers and unknown
+/// keys through as strings "for the operator schema to reject" —
+/// but a merge patch's unknown fields are *pruned* by the API
+/// server, and a string where the CRD wants an integer 422s into an
+/// opaque `UNKNOWN_SERVER_ERROR`. Rejecting here yields the
+/// `INVALID_CONFIG` (40) a Kafka client actually understands.
+pub fn config_value_to_json(key: &str, value: &str) -> Result<Value, TopicWriteError> {
     match key {
-        // Integer fields: parse as i64; fall back to string on parse failure
-        // so the operator-side schema validation produces a clean error.
         "segment.ms"
         | "segmentMs"
         | "retention.ms"
@@ -187,15 +213,87 @@ pub fn config_value_to_json(key: &str, value: &str) -> Value {
         | "minCompactionLagMs"
         | "delete.retention.ms"
         | "deleteRetentionMs" => match value.parse::<i64>() {
-            Ok(n) => Value::Number(n.into()),
-            Err(_) => Value::String(value.to_string()),
+            Ok(n) => Ok(Value::Number(n.into())),
+            Err(_) => Err(TopicWriteError::InvalidConfig(format!(
+                "{key}: not an integer: {value:?}"
+            ))),
         },
-        // Scalar string fields.
-        "cleanup.policy" | "cleanupPolicy" => Value::String(value.to_string()),
-        // Unknown key: pass through as string and let the operator
-        // schema reject it.
-        _ => Value::String(value.to_string()),
+        "cleanup.policy" | "cleanupPolicy" => match value {
+            // Same set the CRD's regex admits; rejecting early spares
+            // the client an admission-webhook error dressed as -1.
+            "delete" | "compact" | "compact,delete" => Ok(Value::String(value.to_string())),
+            _ => Err(TopicWriteError::InvalidConfig(format!(
+                "{key}: must be delete, compact, or compact,delete; got {value:?}"
+            ))),
+        },
+        _ => Err(TopicWriteError::InvalidConfig(format!(
+            "unknown config key: {key}"
+        ))),
     }
+}
+
+/// gh #236: build the `spec.config` JSON object for a fresh CR from
+/// the wire request's `(key, value)` pairs. Pure — the CreateTopics
+/// handler calls it up front so validation (and `validate_only`)
+/// behaves identically whether or not a kube writer is installed.
+pub fn create_configs_to_spec(
+    configs: &[(String, String)],
+) -> Result<serde_json::Map<String, Value>, TopicWriteError> {
+    let mut out = serde_json::Map::new();
+    for (key, value) in configs {
+        let Some(field) = config_key_to_json_field(key) else {
+            return Err(TopicWriteError::InvalidConfig(format!(
+                "unknown config key: {key}"
+            )));
+        };
+        out.insert(field.into(), config_value_to_json(key, value)?);
+    }
+    Ok(out)
+}
+
+/// gh #236: translate IncrementalAlterConfigs ops into the
+/// `spec.config` merge-patch object (`Set` → parsed value, `Delete`
+/// / `Set` with null → JSON null). Pure for the same reason as
+/// [`create_configs_to_spec`] — the handler validates through it
+/// before touching the writer.
+pub fn ops_to_config_patch(
+    ops: &[ConfigOpWithValue],
+) -> Result<serde_json::Map<String, Value>, TopicWriteError> {
+    let mut out = serde_json::Map::new();
+    for op in ops {
+        match op.kind {
+            ConfigOpKind::Append | ConfigOpKind::Subtract => {
+                return Err(TopicWriteError::UnsupportedOp(op.kind));
+            }
+            ConfigOpKind::Set => {
+                let Some(field) = config_key_to_json_field(&op.key) else {
+                    return Err(TopicWriteError::InvalidConfig(format!(
+                        "unknown config key: {}",
+                        op.key
+                    )));
+                };
+                match op.value.as_deref() {
+                    // Set with null → treat as Delete.
+                    None => {
+                        out.insert(field.into(), Value::Null);
+                    }
+                    Some(value) => {
+                        out.insert(field.into(), config_value_to_json(&op.key, value)?);
+                    }
+                }
+            }
+            ConfigOpKind::Delete => {
+                let Some(field) = config_key_to_json_field(&op.key) else {
+                    return Err(TopicWriteError::InvalidConfig(format!(
+                        "unknown config key: {}",
+                        op.key
+                    )));
+                };
+                out.insert(field.into(), Value::Null);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Map an Apache wire `key` to the JSON field on
@@ -266,7 +364,12 @@ pub struct NoopTopicCRWriter;
 
 #[async_trait]
 impl TopicCRWriter for NoopTopicCRWriter {
-    async fn create_topic(&self, _name: &str, _num_partitions: i32) -> Result<(), TopicWriteError> {
+    async fn create_topic(
+        &self,
+        _name: &str,
+        _num_partitions: i32,
+        _configs: &[(String, String)],
+    ) -> Result<(), TopicWriteError> {
         Err(TopicWriteError::Forbidden(
             "broker is not running in cluster mode".into(),
         ))
@@ -358,9 +461,19 @@ mod kube_impl {
             &self,
             name: &str,
             num_partitions: i32,
+            configs: &[(String, String)],
         ) -> Result<(), TopicWriteError> {
             use kaas_operator_api::{KafkaTopicConfig, KafkaTopicSpec};
             use kube::api::PostParams;
+
+            // gh #236: land the wire request's config overrides in the
+            // minted CR so the operator materialises them on first
+            // reconcile. The handler has already validated the pairs;
+            // this re-derivation keeps the writer safe for other
+            // callers.
+            let spec_config = super::create_configs_to_spec(configs)?;
+            let config: KafkaTopicConfig = serde_json::from_value(Value::Object(spec_config))
+                .map_err(|e| TopicWriteError::InvalidConfig(e.to_string()))?;
 
             // gh #86: non-RFC-1123 Kafka names (Streams internals)
             // get a deterministic synthetic CR name with the literal
@@ -375,7 +488,7 @@ mod kube_impl {
                 spec: KafkaTopicSpec {
                     topic_name,
                     partitions: num_partitions,
-                    config: KafkaTopicConfig::default(),
+                    config,
                     storage: None,
                 },
                 status: None,
@@ -431,31 +544,7 @@ mod kube_impl {
             name: &str,
             ops: &[ConfigOpWithValue],
         ) -> Result<(), TopicWriteError> {
-            let mut config = serde_json::Map::new();
-            for op in ops {
-                match op.kind {
-                    ConfigOpKind::Append | ConfigOpKind::Subtract => {
-                        return Err(TopicWriteError::UnsupportedOp(op.kind));
-                    }
-                    ConfigOpKind::Set => {
-                        let Some(field) = config_key_to_json_field(&op.key) else {
-                            return Err(TopicWriteError::UnsupportedOp(op.kind));
-                        };
-                        let Some(value) = op.value.as_deref() else {
-                            // Set with null → treat as Delete.
-                            config.insert(field.into(), Value::Null);
-                            continue;
-                        };
-                        config.insert(field.into(), config_value_to_json(&op.key, value));
-                    }
-                    ConfigOpKind::Delete => {
-                        let Some(field) = config_key_to_json_field(&op.key) else {
-                            return Err(TopicWriteError::UnsupportedOp(op.kind));
-                        };
-                        config.insert(field.into(), Value::Null);
-                    }
-                }
-            }
+            let config = super::ops_to_config_patch(ops)?;
             let patch = json!({ "spec": { "config": config } });
             let (meta_name, _) = super::name_for_cr(name);
             let api = self.api();
@@ -552,18 +641,78 @@ mod tests {
     #[test]
     fn config_value_parses_integer_fields() {
         assert_eq!(
-            config_value_to_json("retention.ms", "60000"),
+            config_value_to_json("retention.ms", "60000").unwrap(),
             Value::Number(60_000_i64.into())
         );
         assert_eq!(
-            config_value_to_json("cleanup.policy", "compact"),
+            config_value_to_json("cleanup.policy", "compact").unwrap(),
             Value::String("compact".into())
         );
-        // Unparseable integer falls back to string.
-        assert_eq!(
+        // gh #236: an unparseable integer is a rejection, not a
+        // string the API server would 422 on (or worse, prune).
+        assert!(matches!(
             config_value_to_json("retention.ms", "huh"),
-            Value::String("huh".into())
-        );
+            Err(TopicWriteError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            config_value_to_json("cleanup.policy", "vacuum"),
+            Err(TopicWriteError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn create_configs_land_in_spec_config_fields() {
+        let spec = create_configs_to_spec(&[
+            ("retention.ms".into(), "600000".into()),
+            ("segment.bytes".into(), "16777216".into()),
+            ("cleanup.policy".into(), "compact".into()),
+        ])
+        .unwrap();
+        assert_eq!(spec["retentionMs"], Value::Number(600_000_i64.into()));
+        assert_eq!(spec["segmentBytes"], Value::Number(16_777_216_i64.into()));
+        assert_eq!(spec["cleanupPolicy"], Value::String("compact".into()));
+    }
+
+    #[test]
+    fn create_config_with_unknown_key_is_invalid_config() {
+        // The dangerous half of gh #236 was the silent success: an
+        // unsupported key must fail the creation, not vanish.
+        let err =
+            create_configs_to_spec(&[("max.message.bytes".into(), "1000".into())]).unwrap_err();
+        assert!(matches!(err, TopicWriteError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn alter_ops_map_set_and_delete() {
+        let patch = ops_to_config_patch(&[
+            ConfigOpWithValue {
+                key: "retention.ms".into(),
+                kind: ConfigOpKind::Set,
+                value: Some("1200000".into()),
+            },
+            ConfigOpWithValue {
+                key: "segment.ms".into(),
+                kind: ConfigOpKind::Delete,
+                value: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(patch["retentionMs"], Value::Number(1_200_000_i64.into()));
+        assert_eq!(patch["segmentMs"], Value::Null);
+    }
+
+    #[test]
+    fn alter_op_on_unknown_key_is_invalid_config() {
+        // Was UnsupportedOp → UNSUPPORTED_VERSION (35), which told the
+        // client its *client* was too new. INVALID_CONFIG (40) names
+        // the actual problem.
+        let err = ops_to_config_patch(&[ConfigOpWithValue {
+            key: "max.message.bytes".into(),
+            kind: ConfigOpKind::Set,
+            value: Some("1000".into()),
+        }])
+        .unwrap_err();
+        assert!(matches!(err, TopicWriteError::InvalidConfig(_)));
     }
 
     #[tokio::test]

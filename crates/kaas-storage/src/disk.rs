@@ -345,6 +345,16 @@ impl StorageEngine for DiskStorageEngine {
             .map(|e| e.value().epoch())
     }
 
+    fn topic_config(&self, topic: &str) -> Option<crate::topicconfig::TopicConfigFile> {
+        // Partition 0's root: the operator writes `.config.json` to
+        // every root the topic touches, and partition 0's is always
+        // one of them.
+        let dir = self.topic_dir(topic, 0);
+        crate::topicconfig::read_topic_config(self.fs(), &dir)
+            .ok()
+            .flatten()
+    }
+
     fn high_watermark(&self, topic: &str, partition: i32) -> Result<i64, StorageError> {
         Ok(self
             .partitions

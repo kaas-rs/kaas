@@ -8,7 +8,9 @@
 //! a JSON-merge PATCH on `KafkaTopic.spec.config`. `Set` writes
 //! the parsed value, `Delete` writes null, `Append` / `Subtract`
 //! surface as `UNSUPPORTED_VERSION` (kaas's topic configs are
-//! scalar — list-valued ops don't apply).
+//! scalar — list-valued ops don't apply). Unknown keys and
+//! unparseable values are rejected with `INVALID_CONFIG` (40)
+//! before anything touches the API server (gh #236).
 //!
 //! Authorization: `Operation::AlterConfigs` on the topic resource.
 
@@ -23,13 +25,16 @@ use parking_lot::Mutex;
 
 use super::principal_from;
 use crate::broker::Broker;
-use crate::topic_cr_writer::{ConfigOpKind, ConfigOpWithValue, TopicWriteError};
+use crate::topic_cr_writer::{
+    ops_to_config_patch, ConfigOpKind, ConfigOpWithValue, TopicWriteError,
+};
 
 const ERR_NONE: i16 = 0;
 const ERR_UNKNOWN_TOPIC: i16 = 3;
 const ERR_CLUSTER_AUTHZ_FAILED: i16 = 31;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_UNSUPPORTED_VERSION: i16 = 35;
+const ERR_INVALID_CONFIG: i16 = 40;
 const ERR_UNKNOWN_SERVER: i16 = -1;
 
 #[derive(Debug)]
@@ -100,6 +105,21 @@ impl Handler for IncrementalAlterConfigsHandler {
                 })
                 .collect();
 
+            // gh #236: validate up front so `validate_only` answers
+            // honestly and a bad key/value never reaches the API
+            // server (whose merge-patch semantics would *prune* an
+            // unknown field — the silent success this issue is about).
+            if let Err(e) = ops_to_config_patch(&ops) {
+                let (code, msg) = match &e {
+                    TopicWriteError::UnsupportedOp(kind) => {
+                        (ERR_UNSUPPORTED_VERSION, format!("unsupported op: {kind:?}"))
+                    }
+                    other => (ERR_INVALID_CONFIG, other.to_string()),
+                };
+                responses.push(response_for(&resource, code, Some(&msg)));
+                continue;
+            }
+
             if req.validate_only {
                 responses.push(response_for(&resource, ERR_NONE, None));
                 continue;
@@ -115,6 +135,9 @@ impl Handler for IncrementalAlterConfigsHandler {
                     ERR_UNSUPPORTED_VERSION,
                     Some(&format!("unsupported op: {kind:?}")),
                 )),
+                Err(TopicWriteError::InvalidConfig(msg)) => {
+                    responses.push(response_for(&resource, ERR_INVALID_CONFIG, Some(&msg)))
+                }
                 Err(TopicWriteError::Forbidden(msg)) => responses.push(response_for(
                     &resource,
                     ERR_CLUSTER_AUTHZ_FAILED,
@@ -160,5 +183,134 @@ fn response_for(
         error_message: message.map(str::to_owned),
         resource_type: resource.resource_type,
         resource_name: resource.resource_name.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topic_cr_writer::TopicCRWriter;
+    use crate::topic_registry::TopicRegistry;
+    use kaas_codec::api::incremental_alter_configs::{
+        op, resource_type, AlterConfigOp, AlterConfigsResource, Request,
+    };
+    use kaas_storage::{MemoryStorage, StorageEngine};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+
+    fn conn() -> Mutex<ConnState> {
+        Mutex::new(ConnState::new(
+            "internal",
+            SocketAddr::from_str("127.0.0.1:9092").unwrap(),
+        ))
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingWriter {
+        calls: Mutex<Vec<(String, Vec<ConfigOpWithValue>)>>,
+    }
+
+    #[async_trait]
+    impl TopicCRWriter for RecordingWriter {
+        async fn create_topic(
+            &self,
+            _: &str,
+            _: i32,
+            _: &[(String, String)],
+        ) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+        async fn expand_topic(&self, _: &str, _: i32) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+        async fn update_topic_config(
+            &self,
+            name: &str,
+            ops: &[ConfigOpWithValue],
+        ) -> Result<(), TopicWriteError> {
+            self.calls.lock().push((name.to_owned(), ops.to_vec()));
+            Ok(())
+        }
+        async fn delete_topic(&self, _: &str) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+        async fn set_partition_log_dir(
+            &self,
+            _: &str,
+            _: i32,
+            _: &str,
+        ) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+    }
+
+    async fn alter(
+        writer: Arc<RecordingWriter>,
+        key: &str,
+        value: Option<&str>,
+        wire_op: i8,
+    ) -> incremental_alter_configs::Response {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let broker = Arc::new(Broker::new(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+        ));
+        broker.install_cr_writer(writer);
+        let h = IncrementalAlterConfigsHandler::new(broker);
+        let req = Request {
+            resources: vec![AlterConfigsResource {
+                resource_type: resource_type::TOPIC,
+                resource_name: "t".into(),
+                configs: vec![AlterConfigOp {
+                    name: key.into(),
+                    op: wire_op,
+                    value: value.map(str::to_owned),
+                }],
+            }],
+            validate_only: false,
+        };
+        let mut buf = BytesMut::new();
+        incremental_alter_configs::encode_request(&mut buf, &req, 1).unwrap();
+        let out = h.handle(&conn(), 1, buf.freeze()).await.unwrap();
+        let mut r = out.freeze();
+        incremental_alter_configs::decode_response(&mut r, 1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_valid_set_reaches_the_writer() {
+        let w = Arc::new(RecordingWriter::default());
+        let resp = alter(w.clone(), "retention.ms", Some("1200000"), op::SET).await;
+        assert_eq!(resp.responses[0].error_code, ERR_NONE);
+        assert_eq!(w.calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_answers_invalid_config_not_success() {
+        // gh #236: `kafka-configs.sh --alter --add-config
+        // max.message.bytes=…` used to answer UNSUPPORTED_VERSION —
+        // and before that, plain success. INVALID_CONFIG (40) is the
+        // honest, actionable answer.
+        let w = Arc::new(RecordingWriter::default());
+        let resp = alter(w.clone(), "max.message.bytes", Some("1000"), op::SET).await;
+        assert_eq!(resp.responses[0].error_code, ERR_INVALID_CONFIG);
+        assert!(
+            resp.responses[0]
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max.message.bytes"),
+            "the message should name the offending key"
+        );
+        assert!(w.calls.lock().is_empty(), "nothing may reach the CR");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_value_answers_invalid_config() {
+        let w = Arc::new(RecordingWriter::default());
+        let resp = alter(w.clone(), "retention.ms", Some("huh"), op::SET).await;
+        assert_eq!(resp.responses[0].error_code, ERR_INVALID_CONFIG);
+        assert!(w.calls.lock().is_empty());
     }
 }

@@ -30,20 +30,23 @@ AdminClient's "server default" convention) maps to 1, mirroring Apache's
 Kafka topic names that aren't valid RFC 1123 subdomains (Kafka Streams
 internals, dotted names) get a deterministic synthetic CR name
 `kaas-topic-<16 hex>` with the literal name stashed in `spec.topicName`.
-`validate_only` (v1+) runs the authorization and writer checks, then returns
-the would-be response without minting the CR. Error mapping: authorization
-denial → `TOPIC_AUTHORIZATION_FAILED` (29), existing CR →
-`TOPIC_ALREADY_EXISTS` (36), missing writer or Kubernetes RBAC denial →
-`CLUSTER_AUTHORIZATION_FAILED` (31), other kube errors →
-`UNKNOWN_SERVER_ERROR` (-1).
+Config overrides on the request (`--config retention.ms=600000`) are
+validated against the supported key set and land in the minted CR's
+`spec.config`, so the operator materialises them on first reconcile exactly
+as if they had been authored on the CR; an unknown key or an unparseable
+value fails that topic's creation with `INVALID_CONFIG` (40), as in Apache.
+`validate_only` (v1+) runs the authorization, writer, and config-validation
+checks, then returns the would-be response without minting the CR. Error
+mapping: authorization denial → `TOPIC_AUTHORIZATION_FAILED` (29), bad
+config → `INVALID_CONFIG` (40), existing CR → `TOPIC_ALREADY_EXISTS` (36),
+missing writer or Kubernetes RBAC denial → `CLUSTER_AUTHORIZATION_FAILED`
+(31), other kube errors → `UNKNOWN_SERVER_ERROR` (-1).
 
 **Deviations from Apache 3.7**:
 
-- Config overrides on the request (`retention.ms=...` at create time) are
-  decoded for protocol fidelity but **ignored** — the CR is created with a
-  default `spec.config`. Set configs afterwards via
-  [IncrementalAlterConfigs](#incrementalalterconfigs); threading them through
-  the initial POST is tracked follow-up.
+- The supported config-key set is the seven keys DescribeConfigs reports —
+  an override outside it is rejected with `INVALID_CONFIG` where Apache
+  would accept any of its several dozen topic keys.
 - The v7+ response `topic_id` ([KIP-516](../kip/kip-516.md)) is always the
   all-zero UUID: the real TopicID is minted by the operator on first
   reconcile, after the response has gone out.
@@ -58,8 +61,9 @@ denial → `TOPIC_AUTHORIZATION_FAILED` (29), existing CR →
 
 **Verified by**: `scripts/kafka-topics.sh` (create/list/describe scenarios);
 codec round-trip tests in `crates/kaas-codec/src/api/create_topics.rs`
-(including `v7_carries_topic_id`); CR-name mapping tests in
-`crates/kaas-broker/src/topic_cr_writer.rs`.
+(including `v7_carries_topic_id`); CR-name mapping and config-conversion
+tests in `crates/kaas-broker/src/topic_cr_writer.rs`; config-threading and
+rejection handler tests in `crates/kaas-broker/src/handlers/create_topics.rs`.
 
 ## DeleteTopics
 
@@ -135,27 +139,31 @@ admin UI's config pane.
 
 **Handling**: two resource types are served. **TOPIC**: authorize
 `DescribeConfigs` on the topic (denial → 29), require the topic in the
-registry (miss → `UNKNOWN_TOPIC_OR_PARTITION` (3)), then answer a static
-Apache-3.7-compatible defaults table of the six config keys kaas actually
-honours: `retention.ms`, `retention.bytes`, `segment.bytes`, `cleanup.policy`,
-`min.compaction.lag.ms`, `delete.retention.ms`. v1+ attaches one
-`DEFAULT_CONFIG` synonym per entry (mirroring Apache), v3+ adds one-line
-documentation strings, and the request's `configuration_keys` filter is
-honoured. **BROKER**: answers a small fixed read-only table (`broker.id` plus
-static defaults) so `kafka-configs.sh --entity-type brokers` and Kafbat-UI's
-broker page work. Everything else (`BROKER_LOGGER` included) gets a
-per-resource `UNSUPPORTED_VERSION` (35).
+registry (miss → `UNKNOWN_TOPIC_OR_PARTITION` (3)), then answer an
+Apache-3.7-compatible defaults table of the seven config keys kaas actually
+honours — `retention.ms`, `retention.bytes`, `segment.bytes`, `segment.ms`,
+`cleanup.policy`, `min.compaction.lag.ms`, `delete.retention.ms` — with the
+topic's stored overrides layered on top. An overridden key reports the
+override as its value with source `DYNAMIC_TOPIC_CONFIG`, so
+`kafka-configs.sh --describe` (which shows only non-default entries) and
+admin UIs distinguish "someone set this" from "this is the default", as in
+Apache. Overrides are re-read from the operator-materialised per-topic
+config file on every request, so a change is visible as soon as the
+operator has reconciled it — no broker restart. v1+ attaches the synonym
+chain per entry (the dynamic override first when present, then the
+`DEFAULT_CONFIG` it shadows), v3+ adds one-line documentation strings, and
+the request's `configuration_keys` filter is honoured. **BROKER**: answers
+a small fixed read-only table (`broker.id` plus static defaults) so
+`kafka-configs.sh --entity-type brokers` and Kafbat-UI's broker page work.
+Everything else (`BROKER_LOGGER` included) gets a per-resource
+`UNSUPPORTED_VERSION` (35).
 
 **Deviations from Apache 3.7**:
 
-- **Per-topic overrides are not surfaced.** Even when a topic's
-  `KafkaTopic.spec.config` overrides retention, the response reports the
-  cluster default with `is_default = true` / source `DEFAULT_CONFIG`. The
-  override *is* enforced by the storage engine's cleaner — it just isn't
-  echoed here yet. `kafka-configs.sh --describe` after `--alter` will not show
-  the change.
-- Only six topic keys are reported, versus Apache's several dozen; tools that
-  iterate the full key set see a short list.
+- Only seven topic keys are reported, versus Apache's several dozen; tools
+  that iterate the full key set see a short list.
+- In dev mode (in-memory storage engine) there is no per-topic config file,
+  so every key reports its default.
 - The broker table reports static `kafka.version = 3.6.0` /
   `inter.broker.protocol.version = 3.6` strings (predating the 3.7 parity
   target).
@@ -166,7 +174,8 @@ per-resource `UNSUPPORTED_VERSION` (35).
 `crates/kaas-broker/src/topic_config_defaults.rs`.
 
 **Verified by**: `scripts/kafka-configs.sh` (broker describe, topic describe,
-`--describe --all`, per-broker-id describe).
+`--describe --all`, per-broker-id describe); override-layering handler tests
+in `crates/kaas-broker/src/handlers/describe_configs.rs`.
 
 ## CreatePartitions
 
@@ -212,30 +221,37 @@ Per-key topic config mutation ([KIP-339](../kip/kip-339.md)) —
 the topic, translates the op list, and issues a single JSON-merge patch on
 `KafkaTopic.spec.config`: `SET` writes the parsed value (integer keys become
 JSON numbers), `DELETE` — and `SET` with a null value — write JSON null. The
-patchable key set is the same six keys DescribeConfigs reports, accepted in
-dotted or camelCase form. The operator materialises the change on reconcile
-and the storage engine's cleaner picks it up. `validate_only` skips the patch.
-`BROKER` and `BROKER_LOGGER` resource types answer a per-resource
-`UNSUPPORTED_VERSION` (35) — there is no dynamic broker-config surface.
+patchable key set is the same seven keys DescribeConfigs reports, accepted in
+dotted or camelCase form; a key outside it, or a value that doesn't parse
+for its key, is rejected with `INVALID_CONFIG` (40) before anything reaches
+the Kubernetes API server. The operator materialises the change on
+reconcile, the storage engine's cleaner picks it up, and a subsequent
+DescribeConfigs reports the override as `DYNAMIC_TOPIC_CONFIG`.
+`validate_only` runs the same validation and skips the patch. `BROKER` and
+`BROKER_LOGGER` resource types answer a per-resource `UNSUPPORTED_VERSION`
+(35) — there is no dynamic broker-config surface.
 
 **Deviations from Apache 3.7**:
 
 - **`APPEND` and `SUBTRACT` are unsupported** and answer
   `UNSUPPORTED_VERSION` (35): every kaas topic-config key is scalar, so the
   list-valued ops have nothing to apply to.
-- Config keys outside the six-key allow-list answer `UNSUPPORTED_VERSION`
-  (35), where Apache validates the key and returns `INVALID_CONFIG` for
-  unknown names.
+- Config keys outside the seven-key allow-list answer `INVALID_CONFIG` (40)
+  as Apache does for unknown names — but the allow-list itself is far
+  smaller than Apache's key set, so keys Apache would accept
+  (`max.message.bytes`, ...) are rejected here.
 - `BROKER` / `BROKER_LOGGER` alteration is unsupported (Apache 3.7 supports
   dynamic broker configs, KIP-226).
 - One bad op fails the whole resource — the ops for a resource are applied as
   a single all-or-nothing merge patch.
-- The change is asynchronous, and — per the DescribeConfigs deviation above —
-  a subsequent describe does not yet echo the override.
+- The change is asynchronous: it is visible to DescribeConfigs once the
+  operator has reconciled the CR (typically well under a second), not
+  atomically with the alter response.
 
 **Source**: `crates/kaas-broker/src/handlers/incremental_alter_configs.rs`,
 `crates/kaas-broker/src/topic_cr_writer.rs` (`update_topic_config`,
 `config_key_to_json_field`, `config_value_to_json`).
 
 **Verified by**: `scripts/kafka-configs.sh` (scenario 3); key/value-mapping
-unit tests in `crates/kaas-broker/src/topic_cr_writer.rs`.
+unit tests in `crates/kaas-broker/src/topic_cr_writer.rs`; rejection handler
+tests in `crates/kaas-broker/src/handlers/incremental_alter_configs.rs`.
