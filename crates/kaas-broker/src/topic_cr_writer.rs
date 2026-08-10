@@ -234,6 +234,36 @@ pub fn config_value_to_json(key: &str, value: &str) -> Result<Value, TopicWriteE
     }
 }
 
+/// Accept-only keys: valid Apache configs whose **only** legal value
+/// on kaas is the one kaas already enforces by construction, so they
+/// are validated and then deliberately *not* persisted — the default
+/// IS the requested behaviour, and a CR field for a knob with one
+/// legal value would be noise. The canonical case (found by Kafka
+/// Streams the day gh #236 shipped): `InternalTopicManager` stamps
+/// `message.timestamp.type=CreateTime` on every repartition/changelog
+/// topic it creates, and kaas is CreateTime-only — byte-opacity means
+/// the broker never rewrites record timestamps, which is exactly
+/// CreateTime semantics (LogAppendTime is the missing half of
+/// KIP-32).
+fn is_accept_only_key(key: &str) -> bool {
+    matches!(key, "message.timestamp.type" | "messageTimestampType")
+}
+
+/// Validate an accept-only key's value: `Ok` when it names the
+/// behaviour kaas already has, `Err` when it demands one kaas lacks.
+fn validate_accept_only(key: &str, value: &str) -> Result<(), TopicWriteError> {
+    match (key, value) {
+        ("message.timestamp.type" | "messageTimestampType", "CreateTime") => Ok(()),
+        ("message.timestamp.type" | "messageTimestampType", other) => {
+            Err(TopicWriteError::InvalidConfig(format!(
+                "{key}: kaas is CreateTime-only (the broker never rewrites record \
+                 timestamps); {other:?} is not supported"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// gh #236: build the `spec.config` JSON object for a fresh CR from
 /// the wire request's `(key, value)` pairs. Pure — the CreateTopics
 /// handler calls it up front so validation (and `validate_only`)
@@ -243,6 +273,10 @@ pub fn create_configs_to_spec(
 ) -> Result<serde_json::Map<String, Value>, TopicWriteError> {
     let mut out = serde_json::Map::new();
     for (key, value) in configs {
+        if is_accept_only_key(key) {
+            validate_accept_only(key, value)?;
+            continue;
+        }
         let Some(field) = config_key_to_json_field(key) else {
             return Err(TopicWriteError::InvalidConfig(format!(
                 "unknown config key: {key}"
@@ -268,6 +302,14 @@ pub fn ops_to_config_patch(
                 return Err(TopicWriteError::UnsupportedOp(op.kind));
             }
             ConfigOpKind::Set => {
+                if is_accept_only_key(&op.key) {
+                    if let Some(value) = op.value.as_deref() {
+                        validate_accept_only(&op.key, value)?;
+                    }
+                    // Valid and already the enforced behaviour —
+                    // nothing to persist.
+                    continue;
+                }
                 let Some(field) = config_key_to_json_field(&op.key) else {
                     return Err(TopicWriteError::InvalidConfig(format!(
                         "unknown config key: {}",
@@ -285,6 +327,11 @@ pub fn ops_to_config_patch(
                 }
             }
             ConfigOpKind::Delete => {
+                // Deleting an accept-only key resets it to a default
+                // it already has — a no-op, not an error.
+                if is_accept_only_key(&op.key) {
+                    continue;
+                }
                 let Some(field) = config_key_to_json_field(&op.key) else {
                     return Err(TopicWriteError::InvalidConfig(format!(
                         "unknown config key: {}",
@@ -786,6 +833,26 @@ mod tests {
         // topic create that carried the flag.
         let spec = create_configs_to_spec(&[("flush.messages".into(), "1".into())]).unwrap();
         assert_eq!(spec["flushMessages"], Value::Number(1_i64.into()));
+    }
+
+    #[test]
+    fn message_timestamp_type_createtime_is_accepted_and_dropped() {
+        // The Kafka Streams shape: InternalTopicManager creates every
+        // repartition/changelog topic with this key. CreateTime is
+        // kaas's only behaviour, so it validates and stays out of the
+        // CR; LogAppendTime demands the missing KIP-32 half → 40.
+        let spec = create_configs_to_spec(&[
+            ("cleanup.policy".into(), "compact".into()),
+            ("message.timestamp.type".into(), "CreateTime".into()),
+        ])
+        .unwrap();
+        assert_eq!(spec.len(), 1, "accept-only key must not be persisted");
+        assert!(spec.contains_key("cleanupPolicy"));
+
+        let err =
+            create_configs_to_spec(&[("message.timestamp.type".into(), "LogAppendTime".into())])
+                .unwrap_err();
+        assert!(matches!(err, TopicWriteError::InvalidConfig(_)));
     }
 
     #[test]

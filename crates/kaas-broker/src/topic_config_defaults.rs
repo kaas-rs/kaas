@@ -84,6 +84,18 @@ pub const ALL_KEYS: &[Entry] = &[
             "Tombstone retention for compacted topics (KIP-354). 0 = tombstones live forever.",
     },
     Entry {
+        dotted_name: "message.timestamp.type",
+        // The only mode kaas has: byte-opacity means the broker never
+        // rewrites record timestamps. Accept-only on the write paths
+        // (CreateTime validates and is dropped, LogAppendTime is
+        // INVALID_CONFIG) — Kafka Streams stamps this key on every
+        // internal topic it creates.
+        default_value: Some("CreateTime"),
+        config_type: config_type::STRING,
+        documentation: "Always CreateTime — kaas never rewrites record timestamps \
+                        (LogAppendTime is not supported).",
+    },
+    Entry {
         dotted_name: "flush.messages",
         // Wire null: the effective default is the broker-wide
         // KAAS_FLUSH_INTERVAL_MESSAGES, which this static table
