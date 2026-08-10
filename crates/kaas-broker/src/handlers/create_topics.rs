@@ -32,11 +32,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{Operation, Principal, Resource};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::create_topics;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 use crate::topic_cr_writer::TopicWriteError;
 
@@ -148,11 +149,4 @@ impl Handler for CreateTopicsHandler {
         create_topics::encode_response(&mut out, &resp, version)?;
         Ok(out)
     }
-}
-
-fn principal_from(conn: &Mutex<ConnState>) -> Principal {
-    conn.lock()
-        .principal
-        .clone()
-        .unwrap_or_else(Principal::anonymous)
 }

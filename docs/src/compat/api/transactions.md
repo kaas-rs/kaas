@@ -52,11 +52,17 @@ Four facts are shared by everything below:
   **ungated by slot ownership** — every broker walks every slot — a
   known multi-broker sharp edge; see the architecture page.
 
-One cross-cutting deviation up front: Apache 3.7 gates this surface on
-`WRITE` for the `TransactionalId` resource (plus `CLUSTER_ACTION` for
-`WriteTxnMarkers`). The kaas txn handlers perform no ACL checks — with
-`authorization.type: simple` enabled, Produce and Fetch enforce ACLs but
-the transactional APIs do not. Open gap, not a design decision.
+One cross-cutting note up front: this surface is ACL-gated the way
+Apache 3.7 gates it. Every transactional handler checks `WRITE` on the
+`TransactionalId` resource (denial → `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`,
+53) before coordinator routing is revealed; the offset-adjacent handlers
+additionally check `READ` on the group (30) and — for `TxnOffsetCommit` —
+`READ` per topic (29); `WriteTxnMarkers` requires `CLUSTER_ACTION` on the
+Cluster resource (31). The one deliberate exception is the *idempotent*
+`InitProducerId` path (empty `transactional.id`), which is not gated —
+the Java client enables idempotence by default and Apache relaxed the
+same gate in KIP-679; Produce's per-topic `WRITE` check is the
+enforcement point.
 
 ## InitProducerId
 
@@ -291,10 +297,12 @@ exactly Apache's receiver behaviour.
   `/data/__cluster/marker_queue/`, never via this RPC. Invisible to
   clients (the API is broker-internal in Apache), but relevant when
   tracing a cluster on the wire.
-- No `CLUSTER_ACTION` authorization gate. Apache restricts this API to
-  brokers; in kaas any authenticated client on any listener can append
-  control markers to partitions this broker leads. Sharp edge of the
-  missing txn-surface ACLs (see preamble).
+- `CLUSTER_ACTION` on the Cluster resource is required, as in Apache
+  (denial → `CLUSTER_AUTHORIZATION_FAILED` (31) on every partition). No
+  kaas component holds that ACL — coordinators dispatch via the marker
+  queue — so under `simple` authorization this API is effectively
+  broker-only unless you grant `ClusterAction` to a harness principal
+  deliberately.
 
 **Source**: `crates/kaas-broker/src/handlers/write_txn_markers.rs`
 (handler), `crates/kaas-codec/src/api/write_txn_markers.rs` (codec),

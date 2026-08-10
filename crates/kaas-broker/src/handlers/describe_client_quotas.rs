@@ -19,13 +19,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{Operation, Principal, Quotas, Resource};
+use kaas_auth::{Operation, Quotas, Resource};
 use kaas_codec::api::describe_client_quotas::{
     self, entity_type, match_type, ComponentData, EntityData, EntryData, Response, ValueData,
 };
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NONE: i16 = 0;
@@ -184,13 +185,6 @@ fn encode(version: i16, resp: Response) -> Result<BytesMut, HandlerError> {
     let mut out = BytesMut::new();
     describe_client_quotas::encode_response(&mut out, &resp, version)?;
     Ok(out)
-}
-
-fn principal_from(conn: &Mutex<ConnState>) -> Principal {
-    conn.lock()
-        .principal
-        .clone()
-        .unwrap_or_else(Principal::anonymous)
 }
 
 #[allow(clippy::cast_precision_loss, clippy::as_conversions)]

@@ -140,6 +140,10 @@ pub enum Operation {
     Describe,
     DescribeConfigs,
     AlterConfigs,
+    /// Broker-internal APIs (WriteTxnMarkers et al). Apache grants
+    /// this to broker principals only; a client holding it can inject
+    /// control batches, so treat it like a super-user bit (gh #199).
+    ClusterAction,
 }
 
 impl Operation {
@@ -153,6 +157,7 @@ impl Operation {
             Self::Describe => "Describe",
             Self::DescribeConfigs => "DescribeConfigs",
             Self::AlterConfigs => "AlterConfigs",
+            Self::ClusterAction => "ClusterAction",
         }
     }
 
@@ -169,6 +174,7 @@ impl Operation {
             "Describe" => Some(Self::Describe),
             "DescribeConfigs" => Some(Self::DescribeConfigs),
             "AlterConfigs" => Some(Self::AlterConfigs),
+            "ClusterAction" => Some(Self::ClusterAction),
             _ => None,
         }
     }
@@ -217,6 +223,7 @@ mod tests {
             Operation::Describe,
             Operation::DescribeConfigs,
             Operation::AlterConfigs,
+            Operation::ClusterAction,
         ] {
             assert_eq!(Operation::parse(op.as_str()), Some(op));
         }

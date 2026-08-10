@@ -81,11 +81,8 @@ runs — on-disk (in-memory-engine) data is left alone.
 
 **Deviations from Apache 3.7**:
 
-- **No authorization check.** Apache requires `DELETE` on the topic; the kaas
-  handler never consults the authorizer, so any client that clears the
-  listener's authentication gate can delete any topic. Pair authenticated
-  listeners with the expectation that authenticated principals are trusted for
-  topic deletion until this is closed.
+- Authorization: `Delete` on the topic per entry, as in Apache — denial
+  answers `TOPIC_AUTHORIZATION_FAILED` (29) and skips the CR delete.
 - Deletion is asynchronous: the wire response confirms the CR delete, while
   directory teardown follows on the operator's reconcile.
 
@@ -118,8 +115,8 @@ because only the leader holds open handles.
   moves immediately; the covering bytes are reclaimed later by segment roll
   and retention. Apache behaves similarly for partial segments but kaas holds
   the active segment even when the purge covers the entire log.
-- **No authorization check** — Apache requires `DELETE` on the topic; the kaas
-  handler doesn't consult the authorizer.
+- Authorization: `Delete` on the topic, as in Apache — denial answers
+  `TOPIC_AUTHORIZATION_FAILED` (29) per partition and nothing is purged.
 
 **Source**: `crates/kaas-broker/src/handlers/delete_records.rs`,
 `crates/kaas-storage/src/partition.rs` (`delete_records`),

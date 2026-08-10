@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{Operation, Principal, Resource};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::describe_configs::{
     self, config_type, resource_type, source, DescribeConfigsResult, DescribeConfigsResultConfig,
     DescribeConfigsSynonym, Response,
@@ -31,6 +31,7 @@ use kaas_codec::api::describe_configs::{
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 use crate::topic_config_defaults;
 
@@ -230,11 +231,4 @@ fn make_config(entry: &topic_config_defaults::Entry, version: i16) -> DescribeCo
             None
         },
     }
-}
-
-fn principal_from(conn: &Mutex<ConnState>) -> Principal {
-    conn.lock()
-        .principal
-        .clone()
-        .unwrap_or_else(Principal::anonymous)
 }

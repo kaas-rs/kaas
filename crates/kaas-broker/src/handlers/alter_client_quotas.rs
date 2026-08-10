@@ -22,13 +22,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{Operation, Principal, QuotaEnforcer, Quotas, Resource};
+use kaas_auth::{Operation, QuotaEnforcer, Quotas, Resource};
 use kaas_codec::api::alter_client_quotas::{
     self, EntityData, EntryData, EntryResponseData, OpData, Response,
 };
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NONE: i16 = 0;
@@ -196,13 +197,6 @@ fn encode(version: i16, resp: Response) -> Result<BytesMut, HandlerError> {
     let mut out = BytesMut::new();
     alter_client_quotas::encode_response(&mut out, &resp, version)?;
     Ok(out)
-}
-
-fn principal_from(conn: &Mutex<ConnState>) -> Principal {
-    conn.lock()
-        .principal
-        .clone()
-        .unwrap_or_else(Principal::anonymous)
 }
 
 fn f64_to_i64(v: f64) -> i64 {

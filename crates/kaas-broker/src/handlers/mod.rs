@@ -75,3 +75,43 @@ pub use sasl::{SaslAuthenticateHandler, SaslHandshakeHandler};
 pub use sync_group::SyncGroupHandler;
 pub use txn_offset_commit::TxnOffsetCommitHandler;
 pub use write_txn_markers::WriteTxnMarkersHandler;
+
+/// The connection's authenticated principal, or `User:ANONYMOUS` on a
+/// listener that never ran SASL. Shared by every handler that
+/// consults the authorizer (gh #199 hoisted the per-file copies).
+pub(crate) fn principal_from(
+    conn: &parking_lot::Mutex<kaas_protocol::ConnState>,
+) -> kaas_auth::Principal {
+    conn.lock()
+        .principal
+        .clone()
+        .unwrap_or_else(kaas_auth::Principal::anonymous)
+}
+
+/// gh #199 deny-path test doubles. Handler tests build a broker with
+/// one of these to prove a gate exists and fires the right code.
+#[cfg(test)]
+pub(crate) mod test_authz {
+    use kaas_auth::{Authorizer, Operation, Principal, Resource};
+
+    /// Denies every check.
+    #[derive(Debug)]
+    pub struct DenyAllAuthorizer;
+
+    impl Authorizer for DenyAllAuthorizer {
+        fn authorize(&self, _p: &Principal, _r: &Resource, _op: Operation) -> bool {
+            false
+        }
+    }
+
+    /// Denies any resource with the given name, allows the rest —
+    /// for mixed-outcome shapes (one topic denied, the other not).
+    #[derive(Debug)]
+    pub struct DenyNamedAuthorizer(pub &'static str);
+
+    impl Authorizer for DenyNamedAuthorizer {
+        fn authorize(&self, _p: &Principal, r: &Resource, _op: Operation) -> bool {
+            r.name != self.0
+        }
+    }
+}

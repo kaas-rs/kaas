@@ -7,6 +7,10 @@
 //! Phase 3.
 //!
 //! Transactional (`transactional_id: Some(_)`):
+//! 0. gh #199 ACL gate — `Write` on the `TransactionalId` resource,
+//!    else `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53). Checked
+//!    before routing so an unauthorized client learns nothing about
+//!    coordinator placement.
 //! 1. gh #91 routing gate — if [`Broker::owns_txn`] says no, return
 //!    `NOT_COORDINATOR` (16) so the Java client `markCoordinatorUnknown`
 //!    + re-FindCoordinator path lands on the right broker.
@@ -25,15 +29,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::init_producer_id;
 use kaas_coordinator::TxnStateError;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 /// `NOT_COORDINATOR` — gh #91 routing miss.
 pub const ERR_NOT_COORDINATOR: i16 = 16;
+/// `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` — gh #199 ACL gate.
+pub const ERR_TXN_ID_AUTHZ_FAILED: i16 = 53;
 /// `COORDINATOR_NOT_AVAILABLE` — txn store not yet wired.
 pub const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 /// `PRODUCER_FENCED` — epoch mismatch.
@@ -57,7 +65,7 @@ impl InitProducerIdHandler {
 impl Handler for InitProducerIdHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
@@ -67,7 +75,12 @@ impl Handler for InitProducerIdHandler {
         let resp = match req.transactional_id.as_deref() {
             None | Some("") => {
                 // Idempotent (non-transactional) — no per-key state,
-                // every broker can answer locally.
+                // every broker can answer locally. Deliberately NOT
+                // gated on IDEMPOTENT_WRITE: the Java client enables
+                // idempotence by default since 3.0, and Apache itself
+                // relaxed the gate (KIP-679) so a topic-WRITE-only
+                // principal can still produce. The real enforcement
+                // point is Produce's per-topic Write check.
                 init_producer_id::Response {
                     throttle_time_ms: 0,
                     error_code: 0,
@@ -75,7 +88,21 @@ impl Handler for InitProducerIdHandler {
                     producer_epoch: 0,
                 }
             }
-            Some(txn_id) => self.handle_transactional(txn_id, req.transaction_timeout_ms),
+            Some(txn_id) => {
+                // gh #199: Apache gates the transactional path on
+                // WRITE for the TransactionalId resource, before any
+                // coordinator routing is revealed.
+                let principal = principal_from(conn);
+                if !self.broker.authorizer.authorize(
+                    &principal,
+                    &Resource::transactional_id(txn_id),
+                    Operation::Write,
+                ) {
+                    error_response(ERR_TXN_ID_AUTHZ_FAILED)
+                } else {
+                    self.handle_transactional(txn_id, req.transaction_timeout_ms)
+                }
+            }
         };
 
         let mut out = BytesMut::new();
@@ -240,6 +267,50 @@ mod tests {
         let out = h.handle(&conn(), 4, body).await.unwrap();
         let mut r = out.freeze();
         init_producer_id::decode_response(&mut r, 4).unwrap()
+    }
+
+    #[tokio::test]
+    async fn transactional_denied_returns_txn_id_authz_failed() {
+        // gh #199: `Write` on the TransactionalId resource gates the
+        // transactional path, before any coordinator routing.
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        use kaas_auth::NoQuotaChecker;
+        let engine: Arc<dyn kaas_storage::StorageEngine> = Arc::new(MemoryStorage::new());
+        let b = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(NoQuotaChecker),
+        ));
+        let h = InitProducerIdHandler::new(b);
+        let resp = call(&h, Some("tx-1"), 60_000).await;
+        assert_eq!(resp.error_code, ERR_TXN_ID_AUTHZ_FAILED);
+        assert_eq!(resp.producer_id, -1);
+    }
+
+    #[tokio::test]
+    async fn idempotent_path_is_not_gated() {
+        // Deliberate (KIP-679): the Java client turns idempotence on
+        // by default, so the idempotent InitProducerId stays open even
+        // under a deny-all authorizer — Produce's per-topic Write
+        // check is the enforcement point.
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        use kaas_auth::NoQuotaChecker;
+        let engine: Arc<dyn kaas_storage::StorageEngine> = Arc::new(MemoryStorage::new());
+        let b = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(NoQuotaChecker),
+        ));
+        let h = InitProducerIdHandler::new(b);
+        let resp = call(&h, None, 0).await;
+        assert_eq!(resp.error_code, 0);
+        assert!(resp.producer_id >= 1);
     }
 
     #[tokio::test]

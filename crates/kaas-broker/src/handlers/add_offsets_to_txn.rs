@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::add_offsets_to_txn;
 use kaas_coordinator::TxnStateError;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_INVALID_REQUEST: i16 = 42;
@@ -22,6 +24,8 @@ const ERR_INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 const ERR_PRODUCER_FENCED: i16 = 90;
 const ERR_CONCURRENT_TRANSACTIONS: i16 = 51;
 const ERR_INVALID_TXN_STATE: i16 = 50;
+const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
+const ERR_TXN_ID_AUTHZ_FAILED: i16 = 53;
 
 #[derive(Debug)]
 pub struct AddOffsetsToTxnHandler {
@@ -38,14 +42,15 @@ impl AddOffsetsToTxnHandler {
 impl Handler for AddOffsetsToTxnHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = add_offsets_to_txn::decode_request(&mut body, version)?;
+        let principal = principal_from(conn);
 
-        let error_code = match self.classify(&req) {
+        let error_code = match self.classify(&principal, &req) {
             Some(code) => code,
             None => match self.broker.txn_state() {
                 Some(store) => match store.add_offsets_to_txn(
@@ -73,9 +78,26 @@ impl Handler for AddOffsetsToTxnHandler {
 }
 
 impl AddOffsetsToTxnHandler {
-    fn classify(&self, req: &add_offsets_to_txn::Request) -> Option<i16> {
+    fn classify(&self, principal: &Principal, req: &add_offsets_to_txn::Request) -> Option<i16> {
         if req.transactional_id.is_empty() {
             return Some(ERR_INVALID_REQUEST);
+        }
+        // gh #199 ACL gates, before routing is revealed. Apache checks
+        // `Write` on the txn id first, then `Read` on the group whose
+        // offsets the transaction will commit.
+        if !self.broker.authorizer.authorize(
+            principal,
+            &Resource::transactional_id(&req.transactional_id),
+            Operation::Write,
+        ) {
+            return Some(ERR_TXN_ID_AUTHZ_FAILED);
+        }
+        if !self.broker.authorizer.authorize(
+            principal,
+            &Resource::group(&req.group_id),
+            Operation::Read,
+        ) {
+            return Some(ERR_GROUP_AUTHZ_FAILED);
         }
         if !self.broker.owns_txn(&req.transactional_id) {
             return Some(ERR_NOT_COORDINATOR);
@@ -159,6 +181,60 @@ mod tests {
         let out = h.handle(&conn(), 3, body).await.unwrap();
         let mut r = out.freeze();
         add_offsets_to_txn::decode_response(&mut r, 3).unwrap()
+    }
+
+    fn broker_with_txn_and_auth(
+        auth: Arc<dyn kaas_auth::Authorizer>,
+    ) -> (tempfile::TempDir, Arc<Broker>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let b = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            auth,
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        b.install_txn_state(Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap()));
+        (tmp, b)
+    }
+
+    /// gh #199: no `Write` on the txn id -> 53.
+    #[tokio::test]
+    async fn denied_txn_id_returns_authz_failed() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let (_t, b) = broker_with_txn_and_auth(Arc::new(DenyNamedAuthorizer("tx-1")));
+        let h = AddOffsetsToTxnHandler::new(b);
+        let req = add_offsets_to_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: 1,
+            producer_epoch: 0,
+            group_id: "g1".into(),
+        };
+        let resp = call(&h, &req).await;
+        assert_eq!(resp.error_code, ERR_TXN_ID_AUTHZ_FAILED);
+    }
+
+    /// gh #199: no `Read` on the group -> 30, and the group is NOT
+    /// recorded on the transaction.
+    #[tokio::test]
+    async fn denied_group_returns_group_authz_failed() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let (_t, b) = broker_with_txn_and_auth(Arc::new(DenyNamedAuthorizer("g1")));
+        let store = b.txn_state().unwrap();
+        let (pid, epoch) = store.get_or_allocate("tx-1", || 42).unwrap();
+        let h = AddOffsetsToTxnHandler::new(b);
+        let req = add_offsets_to_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+            group_id: "g1".into(),
+        };
+        let resp = call(&h, &req).await;
+        assert_eq!(resp.error_code, ERR_GROUP_AUTHZ_FAILED);
+        let snap = store.snapshot();
+        assert!(snap["tx-1"].groups.is_empty());
     }
 
     #[tokio::test]

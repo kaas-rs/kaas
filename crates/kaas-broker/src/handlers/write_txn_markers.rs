@@ -19,15 +19,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::write_txn_markers;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 use crate::control_batch::build_control_batch;
 
 const ERR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 const ERR_UNKNOWN_SERVER_ERROR: i16 = -1;
+const ERR_CLUSTER_AUTHZ_FAILED: i16 = 31;
 const ACKS_ALL: i16 = -1;
 
 #[derive(Debug)]
@@ -45,14 +48,58 @@ impl WriteTxnMarkersHandler {
 impl Handler for WriteTxnMarkersHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = write_txn_markers::decode_request(&mut body, version)?;
 
+        // gh #199: Apache restricts this API to brokers via
+        // `CLUSTER_ACTION` on the Cluster resource. Without the gate,
+        // any authenticated client could append COMMIT/ABORT control
+        // batches to partitions this broker leads — i.e. commit or
+        // abort other producers' transactions. kaas coordinators
+        // dispatch markers via the shared-PVC queue, never this RPC,
+        // so with `simple` authorization nothing legitimate loses
+        // access; grant `ClusterAction` to a principal explicitly to
+        // drive this API from an external harness.
+        let principal = principal_from(conn);
+        let authorized = self.broker.authorizer.authorize(
+            &principal,
+            &Resource::cluster(),
+            Operation::ClusterAction,
+        );
+
         let mut markers_resp = Vec::with_capacity(req.markers.len());
+        if !authorized {
+            for marker in &req.markers {
+                markers_resp.push(write_txn_markers::WritableTxnMarkerResult {
+                    producer_id: marker.producer_id,
+                    topics: marker
+                        .topics
+                        .iter()
+                        .map(|topic| write_txn_markers::WritableTxnMarkerTopicResult {
+                            name: topic.name.clone(),
+                            partitions: topic
+                                .partition_indexes
+                                .iter()
+                                .map(|&p| write_txn_markers::WritableTxnMarkerPartitionResult {
+                                    partition_index: p,
+                                    error_code: ERR_CLUSTER_AUTHZ_FAILED,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                });
+            }
+            let resp = write_txn_markers::Response {
+                markers: markers_resp,
+            };
+            let mut out = BytesMut::new();
+            write_txn_markers::encode_response(&mut out, &resp, version)?;
+            return Ok(out);
+        }
         for marker in &req.markers {
             let batch = Bytes::from(build_control_batch(
                 marker.producer_id,
@@ -197,6 +244,48 @@ mod tests {
         let out = h.handle(&conn(), 1, body).await.unwrap();
         let mut r = out.freeze();
         write_txn_markers::decode_response(&mut r, 1).unwrap()
+    }
+
+    /// gh #199: no `ClusterAction` on the Cluster resource -> 31 on
+    /// every partition, and no control batch is appended.
+    #[tokio::test]
+    async fn denied_cluster_action_appends_nothing() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let b = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        b.engine.create_partition("t", 0).await.unwrap();
+        let hwm_before = b.engine.high_watermark("t", 0).unwrap();
+
+        let h = WriteTxnMarkersHandler::new(b.clone());
+        let req = write_txn_markers::Request {
+            markers: vec![write_txn_markers::WritableTxnMarker {
+                producer_id: 42,
+                producer_epoch: 0,
+                transaction_result: true,
+                topics: vec![write_txn_markers::WritableTxnMarkerTopic {
+                    name: "t".into(),
+                    partition_indexes: vec![0],
+                }],
+                coordinator_epoch: 0,
+            }],
+        };
+        let resp = call(&h, &req).await;
+        assert_eq!(
+            resp.markers[0].topics[0].partitions[0].error_code,
+            ERR_CLUSTER_AUTHZ_FAILED
+        );
+        assert_eq!(
+            b.engine.high_watermark("t", 0).unwrap(),
+            hwm_before,
+            "denied request must not append a control batch"
+        );
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::acl_types::{
     self, operation_from_cr, operation_to_cr, pattern_type, pattern_type_from_cr,
     pattern_type_to_cr, permission_from_cr, permission_to_cr, resource_type_from_cr,
@@ -27,11 +28,23 @@ use kaas_codec::api::{create_acls, delete_acls, describe_acls};
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::acl_cr_writer::{AclBinding, AclFilter, AclWriteError};
 use crate::broker::Broker;
 
 const ERR_UNKNOWN_SERVER_ERROR: i16 = -1;
+const ERR_CLUSTER_AUTHZ_FAILED: i16 = 31;
 const ERR_INVALID_REQUEST: i16 = 42;
+
+/// gh #199 gate shared by the trio: reading ACLs needs `Describe`
+/// on the Cluster resource, editing them needs `Alter` — Apache's
+/// mapping. Checked before the writer so the answer is the same
+/// with or without an apiserver wired.
+fn authorize_cluster(broker: &Broker, conn: &Mutex<ConnState>, op: Operation) -> bool {
+    broker
+        .authorizer
+        .authorize(&principal_from(conn), &Resource::cluster(), op)
+}
 
 /// CreateAcls wire entry → CR string binding. Rejects UNKNOWN/ANY
 /// codes and unsupported resource types (DELEGATION_TOKEN, USER) —
@@ -187,7 +200,7 @@ impl DescribeAclsHandler {
 impl Handler for DescribeAclsHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
@@ -195,6 +208,12 @@ impl Handler for DescribeAclsHandler {
         let req = describe_acls::decode_request(&mut body, version)?;
 
         let mut resp = describe_acls::Response::default();
+        if !authorize_cluster(&self.broker, conn, Operation::Describe) {
+            resp.error_code = ERR_CLUSTER_AUTHZ_FAILED;
+            let mut out = BytesMut::new();
+            describe_acls::encode_response(&mut out, &resp, version)?;
+            return Ok(out);
+        }
         if let Some(w) = self.broker.acl_cr_writer() {
             match wire_filter_to_acl(&req.filter, version) {
                 Err(msg) => {
@@ -234,17 +253,23 @@ impl CreateAclsHandler {
 impl Handler for CreateAclsHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = create_acls::decode_request(&mut body, version)?;
 
+        let authorized = authorize_cluster(&self.broker, conn, Operation::Alter);
         let writer = self.broker.acl_cr_writer();
         let mut results = Vec::with_capacity(req.creations.len());
         for b in &req.creations {
             let mut result = create_acls::CreateAclsResult::default();
+            if !authorized {
+                result.error_code = ERR_CLUSTER_AUTHZ_FAILED;
+                results.push(result);
+                continue;
+            }
             if let Some(w) = writer.as_ref() {
                 match wire_binding_to_acl(b, version) {
                     Err(msg) => {
@@ -293,17 +318,23 @@ impl DeleteAclsHandler {
 impl Handler for DeleteAclsHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = delete_acls::decode_request(&mut body, version)?;
 
+        let authorized = authorize_cluster(&self.broker, conn, Operation::Alter);
         let writer = self.broker.acl_cr_writer();
         let mut filter_results = Vec::with_capacity(req.filters.len());
         for f in &req.filters {
             let mut fr = delete_acls::DeleteAclsFilterResult::default();
+            if !authorized {
+                fr.error_code = ERR_CLUSTER_AUTHZ_FAILED;
+                filter_results.push(fr);
+                continue;
+            }
             if let Some(w) = writer.as_ref() {
                 match wire_filter_to_acl(f, version) {
                     Err(msg) => {
@@ -345,6 +376,87 @@ impl Handler for DeleteAclsHandler {
 mod tests {
     use super::*;
     use kaas_codec::api::acl_types::{operation, permission, resource_type};
+
+    use crate::broker::Broker;
+    use crate::handlers::test_authz::DenyAllAuthorizer;
+    use crate::topic_registry::TopicRegistry;
+    use kaas_storage::{MemoryStorage, StorageEngine};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    fn conn() -> Mutex<ConnState> {
+        Mutex::new(ConnState::new(
+            "internal",
+            SocketAddr::from_str("127.0.0.1:9092").unwrap(),
+        ))
+    }
+
+    fn deny_all_broker() -> Arc<Broker> {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ))
+    }
+
+    /// gh #199: reading ACLs needs `Describe` on the Cluster.
+    #[tokio::test]
+    async fn describe_denied_returns_cluster_authz_failed() {
+        let h = DescribeAclsHandler::new(deny_all_broker());
+        let req = describe_acls::Request::default();
+        let mut body = BytesMut::new();
+        describe_acls::encode_request(&mut body, &req, 2).unwrap();
+        let out = h.handle(&conn(), 2, body.freeze()).await.unwrap();
+        let mut r = out.freeze();
+        let resp = describe_acls::decode_response(&mut r, 2).unwrap();
+        assert_eq!(resp.error_code, ERR_CLUSTER_AUTHZ_FAILED);
+        assert!(resp.resources.is_empty());
+    }
+
+    /// gh #199: editing ACLs needs `Alter` on the Cluster.
+    #[tokio::test]
+    async fn create_denied_returns_cluster_authz_failed_per_entry() {
+        let h = CreateAclsHandler::new(deny_all_broker());
+        let req = create_acls::Request {
+            creations: vec![acl_types::AclBinding {
+                resource_type: acl_types::resource_type::TOPIC,
+                resource_name: "orders".into(),
+                pattern_type: pattern_type::LITERAL,
+                principal: "User:alice".into(),
+                host: "*".into(),
+                operation: acl_types::operation::WRITE,
+                permission: acl_types::permission::ALLOW,
+            }],
+        };
+        let mut body = BytesMut::new();
+        create_acls::encode_request(&mut body, &req, 2).unwrap();
+        let out = h.handle(&conn(), 2, body.freeze()).await.unwrap();
+        let mut r = out.freeze();
+        let resp = create_acls::decode_response(&mut r, 2).unwrap();
+        assert_eq!(resp.results[0].error_code, ERR_CLUSTER_AUTHZ_FAILED);
+    }
+
+    /// gh #199: deleting ACLs needs `Alter` on the Cluster; nothing
+    /// matches (and nothing is removed) on denial.
+    #[tokio::test]
+    async fn delete_denied_returns_cluster_authz_failed_per_filter() {
+        let h = DeleteAclsHandler::new(deny_all_broker());
+        let req = delete_acls::Request {
+            filters: vec![acl_types::AclFilter::default()],
+        };
+        let mut body = BytesMut::new();
+        delete_acls::encode_request(&mut body, &req, 2).unwrap();
+        let out = h.handle(&conn(), 2, body.freeze()).await.unwrap();
+        let mut r = out.freeze();
+        let resp = delete_acls::decode_response(&mut r, 2).unwrap();
+        assert_eq!(resp.filter_results[0].error_code, ERR_CLUSTER_AUTHZ_FAILED);
+        assert!(resp.filter_results[0].matching_acls.is_empty());
+    }
 
     #[test]
     fn wire_binding_translation_maps_enums() {

@@ -36,11 +36,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::end_txn;
 use kaas_coordinator::TxnStateError;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 use crate::txn_markers::ERR_COORDINATOR_NOT_AVAILABLE;
 
@@ -50,6 +52,7 @@ const ERR_INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 const ERR_PRODUCER_FENCED: i16 = 90;
 const ERR_CONCURRENT_TRANSACTIONS: i16 = 51;
 const ERR_INVALID_TXN_STATE: i16 = 50;
+const ERR_TXN_ID_AUTHZ_FAILED: i16 = 53;
 
 #[derive(Debug)]
 pub struct EndTxnHandler {
@@ -66,14 +69,15 @@ impl EndTxnHandler {
 impl Handler for EndTxnHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = end_txn::decode_request(&mut body, version)?;
+        let principal = principal_from(conn);
 
-        let error_code = match self.classify(&req) {
+        let error_code = match self.classify(&principal, &req) {
             Some(code) => code,
             None => self.transition_and_dispatch(&req).await,
         };
@@ -89,9 +93,17 @@ impl Handler for EndTxnHandler {
 }
 
 impl EndTxnHandler {
-    fn classify(&self, req: &end_txn::Request) -> Option<i16> {
+    fn classify(&self, principal: &Principal, req: &end_txn::Request) -> Option<i16> {
         if req.transactional_id.is_empty() {
             return Some(ERR_INVALID_REQUEST);
+        }
+        // gh #199 ACL gate, before routing is revealed.
+        if !self.broker.authorizer.authorize(
+            principal,
+            &Resource::transactional_id(&req.transactional_id),
+            Operation::Write,
+        ) {
+            return Some(ERR_TXN_ID_AUTHZ_FAILED);
         }
         if !self.broker.owns_txn(&req.transactional_id) {
             return Some(ERR_NOT_COORDINATOR);
@@ -237,6 +249,53 @@ mod tests {
         let out = h.handle(&conn(), 3, body).await.unwrap();
         let mut r = out.freeze();
         end_txn::decode_response(&mut r, 3).unwrap()
+    }
+
+    /// gh #199: no `Write` on the txn id -> 53, and the txn state
+    /// is untouched (still Ongoing, partitions retained).
+    #[tokio::test]
+    async fn denied_txn_id_returns_authz_failed_and_mutates_nothing() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let b = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyNamedAuthorizer("tx-1")),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        b.install_txn_state(Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap()));
+        let store = b.txn_state().unwrap();
+        let (pid, epoch) = store.get_or_allocate("tx-1", || 1).unwrap();
+        store
+            .add_partitions(
+                "tx-1",
+                pid,
+                epoch,
+                &[TxnTopic {
+                    topic: "t".into(),
+                    partitions: vec![0],
+                }],
+                100,
+            )
+            .unwrap();
+        let h = EndTxnHandler::new(b.clone());
+        let resp = call(
+            &h,
+            &end_txn::Request {
+                transactional_id: "tx-1".into(),
+                producer_id: pid,
+                producer_epoch: epoch,
+                committed: true,
+            },
+        )
+        .await;
+        assert_eq!(resp.error_code, ERR_TXN_ID_AUTHZ_FAILED);
+        let snap = store.snapshot();
+        assert_eq!(snap["tx-1"].state, kaas_coordinator::TxnState::Ongoing);
+        assert!(!snap["tx-1"].partitions.is_empty());
     }
 
     #[tokio::test]

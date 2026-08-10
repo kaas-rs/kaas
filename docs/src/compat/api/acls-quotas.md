@@ -14,11 +14,13 @@ reach the canonical store. Without a writer wired (dev mode), DescribeAcls
 returns an empty set and CreateAcls/DeleteAcls report per-entry success
 **without persisting anything**.
 
-One cross-cutting honesty note: none of the three ACL handlers perform an
-authorization check of their own — Apache requires `DESCRIBE`/`ALTER` on the
-`Cluster` resource. On kaas, any client that clears the listener's
-authentication gate can read and edit ACLs. The `host` field of a binding is
-stored and round-tripped verbatim but ignored by ACL evaluation.
+One cross-cutting note: the trio is gated the way Apache gates it —
+`DescribeAcls` requires `Describe` on the `Cluster` resource, and
+`CreateAcls`/`DeleteAcls` require `Alter` on it; denial answers
+`CLUSTER_AUTHORIZATION_FAILED` (31) before the CR writer is consulted, so
+the answer is the same with or without an apiserver wired. The `host`
+field of a binding is stored and round-tripped verbatim but ignored by
+ACL evaluation.
 
 ## DescribeAcls
 
@@ -39,7 +41,6 @@ failures answer `UNKNOWN_SERVER_ERROR` (-1).
 
 **Deviations from Apache 3.7**:
 
-- No `DESCRIBE` authorization on the Cluster resource (see the note above).
 - Resource types are limited to topic, group, cluster, and transactional-ID —
   `DELEGATION_TOKEN` and `USER` filters answer `INVALID_REQUEST` (42)
   (delegation tokens are a [non-goal](../non-goals.md)).
@@ -79,7 +80,6 @@ conflict surfaces as `UNKNOWN_SERVER_ERROR` (-1) and the AdminClient retries.
 - An ACL for a principal with **no KafkaUser CR is refused** (`INVALID_REQUEST`
   with `no KafkaUser CR for principal ...`); Apache accepts ACLs for arbitrary
   principal strings. Create the KafkaUser first.
-- No `ALTER` authorization on the Cluster resource (see the page note).
 - Dev mode reports success without persisting.
 
 **Source**: `crates/kaas-broker/src/handlers/acls.rs`,
@@ -109,7 +109,6 @@ mid-deletion are skipped.
 
 **Deviations from Apache 3.7**:
 
-- No `ALTER` authorization on the Cluster resource (see the page note).
 - Dev mode reports success with zero matches, without touching anything.
 
 **Source**: `crates/kaas-broker/src/handlers/acls.rs`,

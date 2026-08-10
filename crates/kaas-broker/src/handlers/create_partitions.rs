@@ -26,11 +26,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{Operation, Principal, Resource};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::create_partitions;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 use crate::topic_cr_writer::TopicWriteError;
 
@@ -148,11 +149,4 @@ fn error_result(
         error_code: code,
         error_message: message.map(str::to_owned),
     }
-}
-
-fn principal_from(conn: &Mutex<ConnState>) -> Principal {
-    conn.lock()
-        .principal
-        .clone()
-        .unwrap_or_else(Principal::anonymous)
 }
