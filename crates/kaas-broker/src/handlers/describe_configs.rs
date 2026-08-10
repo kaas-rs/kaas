@@ -229,6 +229,7 @@ fn override_value(cfg: &kaas_storage::TopicConfigFile, key: &str) -> Option<Stri
         "cleanup.policy" => (!cfg.cleanup_policy.is_empty()).then(|| cfg.cleanup_policy.clone()),
         "min.compaction.lag.ms" => cfg.min_compaction_lag_ms.map(|v| v.to_string()),
         "delete.retention.ms" => cfg.delete_retention_ms.map(|v| v.to_string()),
+        "flush.messages" => cfg.flush_messages.map(|v| v.to_string()),
         _ => None,
     }
 }

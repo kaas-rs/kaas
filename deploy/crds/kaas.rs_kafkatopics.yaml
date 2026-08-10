@@ -38,6 +38,12 @@ spec:
                     minimum: 0.0
                     nullable: true
                     type: integer
+                  flushMessages:
+                    description: 'Apache''s per-topic `flush.messages` (gh #213): fsync the log after this many records, overriding the broker-wide `KAAS_FLUSH_INTERVAL_MESSAGES`. `1` = fsync every batch (honest acks=all); `0` = flush only at segment roll. Unset = broker default.'
+                    format: int64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   minCompactionLagMs:
                     format: int64
                     minimum: 0.0

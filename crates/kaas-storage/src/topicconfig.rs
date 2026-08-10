@@ -56,6 +56,12 @@ pub struct TopicConfigFile {
     /// `delete.retention.ms` (KIP-354, gh #116).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_retention_ms: Option<i64>,
+
+    /// `flush.messages` (gh #213) — per-topic override of the
+    /// broker-wide `KAAS_FLUSH_INTERVAL_MESSAGES`. `0` = flush only
+    /// at segment roll; unset = broker default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flush_messages: Option<i64>,
 }
 
 /// Kafka's "unlimited / never" sentinel is `-1`; `0` reaches us as an
@@ -88,6 +94,12 @@ pub fn apply_to_partition_config(
     // explicit value always wins — including when it disables the roll.
     if let Some(raw) = cfg.segment_ms {
         out.segment_ms = sentinel_to_option(raw);
+    }
+    // gh #213: per-topic `flush.messages`. An explicit value always
+    // wins — including `0`, which means "flush only at segment roll"
+    // (the committer's trigger predicate treats <= 0 as never).
+    if let Some(v) = cfg.flush_messages {
+        out.flush_interval_messages = v;
     }
     out
 }
@@ -145,6 +157,26 @@ mod tests {
     }
 
     #[test]
+    fn flush_messages_overrides_the_engine_default() {
+        let base = crate::partition::PartitionConfig {
+            flush_interval_messages: 500,
+            ..Default::default()
+        };
+        // Explicit override wins — including 0 (flush only at roll).
+        for (set, want) in [(Some(1), 1), (Some(0), 0), (None, 500)] {
+            let cfg = TopicConfigFile {
+                flush_messages: set,
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_to_partition_config(&cfg, &base).flush_interval_messages,
+                want,
+                "flush_messages={set:?}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_file_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let fs = RealFs::new();
@@ -163,6 +195,7 @@ mod tests {
             cleanup_policy: "compact".into(),
             min_compaction_lag_ms: None,
             delete_retention_ms: Some(86_400_000),
+            flush_messages: Some(1),
         };
         write_topic_config(&fs, tmp.path(), &c).unwrap();
         let got = read_topic_config(&fs, tmp.path()).unwrap().unwrap();

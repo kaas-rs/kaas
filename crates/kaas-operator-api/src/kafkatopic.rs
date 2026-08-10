@@ -139,6 +139,15 @@ pub struct KafkaTopicConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub delete_retention_ms: Option<i64>,
+
+    /// Apache's per-topic `flush.messages` (gh #213): fsync the log
+    /// after this many records, overriding the broker-wide
+    /// `KAAS_FLUSH_INTERVAL_MESSAGES`. `1` = fsync every batch
+    /// (honest acks=all); `0` = flush only at segment roll. Unset =
+    /// broker default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    pub flush_messages: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

@@ -212,7 +212,9 @@ pub fn config_value_to_json(key: &str, value: &str) -> Result<Value, TopicWriteE
         | "min.compaction.lag.ms"
         | "minCompactionLagMs"
         | "delete.retention.ms"
-        | "deleteRetentionMs" => match value.parse::<i64>() {
+        | "deleteRetentionMs"
+        | "flush.messages"
+        | "flushMessages" => match value.parse::<i64>() {
             Ok(n) => Ok(Value::Number(n.into())),
             Err(_) => Err(TopicWriteError::InvalidConfig(format!(
                 "{key}: not an integer: {value:?}"
@@ -309,6 +311,10 @@ pub fn config_key_to_json_field(key: &str) -> Option<&'static str> {
         "cleanup.policy" | "cleanupPolicy" => Some("cleanupPolicy"),
         "min.compaction.lag.ms" | "minCompactionLagMs" => Some("minCompactionLagMs"),
         "delete.retention.ms" | "deleteRetentionMs" => Some("deleteRetentionMs"),
+        // gh #213: per-topic flush.messages. Rejecting it broke every
+        // client that creates topics with `--config flush.messages=1`
+        // (the bench suite does) the moment gh #236 started validating.
+        "flush.messages" | "flushMessages" => Some("flushMessages"),
         _ => None,
     }
 }
@@ -770,6 +776,16 @@ mod tests {
         assert_eq!(spec["retentionMs"], Value::Number(600_000_i64.into()));
         assert_eq!(spec["segmentBytes"], Value::Number(16_777_216_i64.into()));
         assert_eq!(spec["cleanupPolicy"], Value::String("compact".into()));
+    }
+
+    #[test]
+    fn flush_messages_is_a_supported_create_config() {
+        // gh #213 regression shape: `kafka-topics --create --config
+        // flush.messages=1` — the bench suite's init container. The
+        // gh #236 validation initially rejected it, failing every
+        // topic create that carried the flag.
+        let spec = create_configs_to_spec(&[("flush.messages".into(), "1".into())]).unwrap();
+        assert_eq!(spec["flushMessages"], Value::Number(1_i64.into()));
     }
 
     #[test]

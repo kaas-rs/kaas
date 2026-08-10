@@ -48,7 +48,7 @@ appear in the Application tree without being prune targets — see
 
 **Deviations from Apache 3.7**:
 
-- The supported config-key set is the seven keys DescribeConfigs reports —
+- The supported config-key set is the eight keys DescribeConfigs reports —
   an override outside it is rejected with `INVALID_CONFIG` where Apache
   would accept any of its several dozen topic keys.
 - The v7+ response `topic_id` ([KIP-516](../kip/kip-516.md)) is always the
@@ -144,10 +144,14 @@ admin UI's config pane.
 **Handling**: two resource types are served. **TOPIC**: authorize
 `DescribeConfigs` on the topic (denial → 29), require the topic in the
 registry (miss → `UNKNOWN_TOPIC_OR_PARTITION` (3)), then answer an
-Apache-3.7-compatible defaults table of the seven config keys kaas actually
+Apache-3.7-compatible defaults table of the eight config keys kaas actually
 honours — `retention.ms`, `retention.bytes`, `segment.bytes`, `segment.ms`,
-`cleanup.policy`, `min.compaction.lag.ms`, `delete.retention.ms` — with the
-topic's stored overrides layered on top. An overridden key reports the
+`cleanup.policy`, `min.compaction.lag.ms`, `delete.retention.ms`,
+`flush.messages` — with the topic's stored overrides layered on top.
+(`flush.messages` advertises a null default: its effective default is the
+broker-wide flush interval, which the static table can't know — a fixed
+number here would be the advertised-vs-enforced drift this page keeps
+warning about.) An overridden key reports the
 override as its value with source `DYNAMIC_TOPIC_CONFIG`, so
 `kafka-configs.sh --describe` (which shows only non-default entries) and
 admin UIs distinguish "someone set this" from "this is the default", as in
@@ -164,7 +168,7 @@ Everything else (`BROKER_LOGGER` included) gets a per-resource
 
 **Deviations from Apache 3.7**:
 
-- Only seven topic keys are reported, versus Apache's several dozen; tools
+- Only eight topic keys are reported, versus Apache's several dozen; tools
   that iterate the full key set see a short list.
 - In dev mode (in-memory storage engine) there is no per-topic config file,
   so every key reports its default.
@@ -225,7 +229,7 @@ Per-key topic config mutation ([KIP-339](../kip/kip-339.md)) —
 the topic, translates the op list, and issues a single JSON-merge patch on
 `KafkaTopic.spec.config`: `SET` writes the parsed value (integer keys become
 JSON numbers), `DELETE` — and `SET` with a null value — write JSON null. The
-patchable key set is the same seven keys DescribeConfigs reports, accepted in
+patchable key set is the same eight keys DescribeConfigs reports, accepted in
 dotted or camelCase form; a key outside it, or a value that doesn't parse
 for its key, is rejected with `INVALID_CONFIG` (40) before anything reaches
 the Kubernetes API server. The operator materialises the change on
@@ -240,7 +244,7 @@ DescribeConfigs reports the override as `DYNAMIC_TOPIC_CONFIG`.
 - **`APPEND` and `SUBTRACT` are unsupported** and answer
   `UNSUPPORTED_VERSION` (35): every kaas topic-config key is scalar, so the
   list-valued ops have nothing to apply to.
-- Config keys outside the seven-key allow-list answer `INVALID_CONFIG` (40)
+- Config keys outside the eight-key allow-list answer `INVALID_CONFIG` (40)
   as Apache does for unknown names — but the allow-list itself is far
   smaller than Apache's key set, so keys Apache would accept
   (`max.message.bytes`, ...) are rejected here.

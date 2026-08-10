@@ -233,6 +233,7 @@ impl KafkaTopicReconciler {
             cleanup_policy: topic.spec.config.cleanup_policy.clone(),
             min_compaction_lag_ms: topic.spec.config.min_compaction_lag_ms,
             delete_retention_ms: topic.spec.config.delete_retention_ms,
+            flush_messages: topic.spec.config.flush_messages,
         };
         for root in &involved_roots {
             kaas_storage::write_topic_config(&fs, &root.join(&topic_name), &cfg)?;

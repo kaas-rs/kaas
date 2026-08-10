@@ -83,6 +83,18 @@ pub const ALL_KEYS: &[Entry] = &[
         documentation:
             "Tombstone retention for compacted topics (KIP-354). 0 = tombstones live forever.",
     },
+    Entry {
+        dotted_name: "flush.messages",
+        // Wire null: the effective default is the broker-wide
+        // KAAS_FLUSH_INTERVAL_MESSAGES, which this static table
+        // cannot know — advertising Apache's LONG_MAX here when the
+        // broker enforces something else would be exactly the
+        // advertised-vs-enforced drift gh #250 removed.
+        default_value: None,
+        config_type: config_type::LONG,
+        documentation: "Fsync the log after this many records (gh #213). 1 = every batch; \
+                        0 = only at segment roll. Unset = the broker-wide flush interval.",
+    },
 ];
 
 /// The `retention.ms` default, parsed from the same table
