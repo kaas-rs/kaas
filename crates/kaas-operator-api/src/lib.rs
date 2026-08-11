@@ -12,10 +12,6 @@
 //! - [`kafkauser::KafkaUser`] — Strimzi-shape user CR: authentication +
 //!   inline `spec.authorization.acls` (gh #135) + per-broker quotas
 //!   (gh #126, named-honestly `producerMaxByteRatePerBroker`).
-//! - [`kafkaclusterassignments::KafkaClusterAssignments`] — read-only
-//!   debug mirror of `/data/__cluster/assignment.json`. The
-//!   controller-broker writes Status fire-and-forget after every
-//!   assignment.json rewrite; brokers never read it.
 //!
 //! Every CR derives `kube::CustomResource` so callers get
 //! `<T>::api(client)`, `<T>::crd()`, and the apiVersion/kind metadata
@@ -28,7 +24,6 @@
 
 pub mod condition;
 pub mod kafkacluster;
-pub mod kafkaclusterassignments;
 pub mod kafkatopic;
 pub mod kafkauser;
 pub mod scheme;
@@ -38,10 +33,6 @@ pub use kafkacluster::{
     CertManagerConfig, ExternalListener, GatewayConfig, GatewayRef, InternalListener, IssuerRef,
     KafkaCluster, KafkaClusterListeners, KafkaClusterSpec, KafkaClusterStatus, KafkaClusterStorage,
     ServiceConfig, TlsConfig,
-};
-pub use kafkaclusterassignments::{
-    BrokerHealth, KafkaClusterAssignments, KafkaClusterAssignmentsSpec,
-    KafkaClusterAssignmentsStatus, MirroredBroker, MirroredConsumerGroup, MirroredPartition,
 };
 pub use kafkatopic::{
     KafkaTopic, KafkaTopicConfig, KafkaTopicSpec, KafkaTopicStatus, KafkaTopicStorage,

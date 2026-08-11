@@ -10,11 +10,11 @@ Kubernetes Lease implementation; `LocalElection` is the dev-mode
 always-elected stub), `balancer.rs` (partition + consumer-group placement
 with deterministic smoothing, so recomputes move as little as possible),
 `assignment_writer.rs` (atomic `assignment.json` writes behind the
-`TopicSource` / `BrokerSource` / `GroupSource` / `CrMirror` trait seams),
+`TopicSource` / `BrokerSource` / `GroupSource` trait seams), and
 `heartbeat_server.rs` (the bidi gRPC server side of
-`proto/heartbeat.proto`), `k8s_mirror.rs` (the `CrMirror` trait seam for
-the `KafkaClusterAssignments` debug mirror — only a `NoopMirror` ships
-today; the kube-backed status writer is un-started follow-up).
+`proto/heartbeat.proto`). The `k8s_mirror.rs` seam for a
+`KafkaClusterAssignments` debug mirror was removed along with that CRD
+in v0.3.2 — its kube-backed writer was never ported from Go.
 
 **The trait seams are the point**: the balancer and writer are pure over
 their sources, which is what makes

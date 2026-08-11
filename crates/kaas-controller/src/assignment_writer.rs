@@ -32,7 +32,6 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::balancer::{balance, balance_groups, GroupSpec, TopicSpec};
-use crate::k8s_mirror::{CrMirror, NoopMirror};
 
 /// "Tell the loop *why* it should recompute". Reasons are
 /// informational — they end up on tracing spans but don't gate the
@@ -80,8 +79,8 @@ pub trait BrokerSource: Send + Sync + 'static {
     /// or `draining` instead of vanishing from it.
     ///
     /// Two things depend on the distinction. Fenced brokers are
-    /// reportable (DescribeCluster v2 `IsFenced`, the CR mirror,
-    /// `kubectl`), and — the load-bearing one — the coordinator hash
+    /// reportable (DescribeCluster v2 `IsFenced`), and — the
+    /// load-bearing one — the coordinator hash
     /// divisor is the **full** set, so `hash(group) % n` doesn't
     /// reshuffle every group the moment one broker dies. See
     /// `kaas_broker::group_hash`.
@@ -156,7 +155,6 @@ pub struct AssignmentLoop<T, B, G> {
     topics: Arc<T>,
     brokers: Arc<B>,
     groups: Option<Arc<G>>,
-    mirror: Arc<dyn CrMirror>,
     state: Mutex<LoopState>,
 }
 
@@ -201,7 +199,6 @@ where
             topics,
             brokers,
             groups: None,
-            mirror: Arc::new(NoopMirror),
             state: Mutex::new(LoopState::default()),
         })
     }
@@ -237,15 +234,6 @@ where
         this
     }
 
-    /// Attach a [`CrMirror`]. Default is [`NoopMirror`].
-    pub fn with_mirror(self: Arc<Self>, m: Arc<dyn CrMirror>) -> Arc<Self> {
-        let mut this = self;
-        if let Some(inner) = Arc::get_mut(&mut this) {
-            inner.mirror = m;
-        }
-        this
-    }
-
     /// Stamp the lease-acquire epoch + bootstrap from any existing
     /// `assignment.json` on disk. Returns the new file's version
     /// after the initial recompute. The epoch swap is atomic so a
@@ -275,8 +263,8 @@ where
         self.state.lock().current.clone()
     }
 
-    /// Recompute + write + (optionally) mirror. `reason` is
-    /// informational. Returns the new assignment_version.
+    /// Recompute + write. `reason` is informational. Returns the new
+    /// assignment_version.
     pub async fn update_assignment(&self, reason: AssignmentReason) -> io::Result<i64> {
         // Snapshot inputs outside the lock so the source traits'
         // own locking doesn't intersect with our `state` lock.
@@ -386,14 +374,6 @@ where
             )],
         );
         write_res?;
-
-        self.mirror.mirror(&assignment).await;
-        // Mirror errors are swallowed by the trait's `async fn`
-        // signature (returns `()`); count the attempt regardless so
-        // the operator alert can gate on staleness rather than a
-        // rate-of-errors ratio.
-        m.cr_mirror_writes
-            .add(1, &[kaas_observability::KeyValue::new("result", "ok")]);
         Ok(version)
     }
 }

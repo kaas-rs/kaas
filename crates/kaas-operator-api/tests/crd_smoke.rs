@@ -8,7 +8,7 @@
 //! `printcolumn` JSON, etc.) at the crate gate, not at the workspace
 //! gate.
 
-use kaas_operator_api::{KafkaCluster, KafkaClusterAssignments, KafkaTopic, KafkaUser};
+use kaas_operator_api::{KafkaCluster, KafkaTopic, KafkaUser};
 use kube::CustomResourceExt;
 
 #[test]
@@ -39,16 +39,6 @@ fn kafkacluster_crd_serialises() {
     // The two default ports we explicitly carry through schemars.
     assert!(yaml.contains("9092"), "internal port default present");
     assert!(yaml.contains("9093"), "external port default present");
-}
-
-#[test]
-fn kafkaclusterassignments_crd_serialises() {
-    let crd = KafkaClusterAssignments::crd();
-    let yaml = serde_yaml::to_string(&crd).expect("crd serialises");
-    assert!(yaml.contains("name: kafkaclusterassignments.kaas.rs"));
-    // Spec is intentionally empty; Status carries the real shape.
-    assert!(yaml.contains("controllerEpoch"));
-    assert!(yaml.contains("assignmentVersion"));
 }
 
 #[test]

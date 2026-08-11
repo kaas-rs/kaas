@@ -44,7 +44,6 @@ const EXPECTED_WIRED: &[&str] = &[
     "assignment_pushes",
     "assignment_polls",
     "stale_assignments_rejected",
-    "cr_mirror_writes",
     "heartbeat_misses",
     "group_rebalances",
     "auth_success",

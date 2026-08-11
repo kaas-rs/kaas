@@ -16,14 +16,13 @@ rules:
   # gh #135: kafkaacls + kafkausergroups CRs removed. ACLs now live
   # inline on KafkaUser.spec.authorization (Strimzi-style).
   - apiGroups: [kaas.rs]
-    resources: [kafkatopics, kafkausers, kafkaclusters, kafkaclusterassignments]
+    resources: [kafkatopics, kafkausers, kafkaclusters]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [kaas.rs]
     resources:
       - kafkatopics/status
       - kafkausers/status
       - kafkaclusters/status
-      - kafkaclusterassignments/status
       - kafkatopics/finalizers
       - kafkausers/finalizers
       - kafkaclusters/finalizers

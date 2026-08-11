@@ -1,6 +1,6 @@
 # Kubernetes integration
 
-The four CRDs, their reconcilers, reconcile-time cleanup (no
+The three CRDs, their reconcilers, reconcile-time cleanup (no
 finalizers), and the broker's RBAC surface.
 
 In Apache Kafka, cluster metadata — topics, users, ACLs, quotas — lives
@@ -16,8 +16,7 @@ brokers, but **files on the shared volume** that brokers read directly.
 
 ## The CRD surface
 
-Four CRDs — `KafkaCluster`, `KafkaTopic`, `KafkaUser`, and the
-read-only `KafkaClusterAssignments` debug mirror; the
+Three CRDs — `KafkaCluster`, `KafkaTopic`, and `KafkaUser`; the
 [overview](./overview.md) table shows what each materializes into, and
 the [CRD reference](../operations/crds.md) documents every field. The
 CRD YAML ships bundled with the Helm chart. `KafkaUser` mirrors Strimzi
@@ -83,7 +82,6 @@ flowchart LR
     ru --> creds["__cluster/credentials.json (upsert user)<br/>__cluster/acls.json (rebuilt from all users)"]
     ru --> secret["&lt;user&gt;-kafka-credentials Secret<br/>OwnerReference → K8s GC"]
     rc --> plumbing["cert-manager Certificates ·<br/>per-broker Services · TLSRoutes<br/>OwnerReferences → K8s GC"]
-    rc --> kca["KafkaClusterAssignments CR<br/>create-only; reserved as the assignment<br/>debug mirror (status writer not wired yet)"]
     sweep --> dirs
     sweep --> creds
 ```
@@ -95,11 +93,6 @@ Reconciler guard rails worth knowing:
   semantics.
 - **KafkaUser** with a missing referenced Secret parks on
   `await_change` instead of hot-looping.
-- **KafkaClusterAssignments** has no reconciler at all: the operator
-  only creates it (with an OwnerReference). It is reserved as the
-  controller broker's assignment debug mirror, but the status writer
-  is not wired yet, so its status is empty today; brokers never read
-  it either way.
 - A CR with `deletionTimestamp` set is left untouched by the
   reconcilers; cleanup happens via K8s GC (owned resources) and the
   orphan sweep (on-disk state).

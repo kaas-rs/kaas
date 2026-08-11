@@ -72,8 +72,7 @@ REF=v0.3.1-preview
 BASE=https://raw.githubusercontent.com/kaas-rs/kaas/${REF}/deploy/crds
 for f in kaas.rs_kafkaclusters.yaml \
          kaas.rs_kafkatopics.yaml \
-         kaas.rs_kafkausers.yaml \
-         kaas.rs_kafkaclusterassignments.yaml; do
+         kaas.rs_kafkausers.yaml; do
   kubectl apply -f "${BASE}/${f}"
 done
 ```

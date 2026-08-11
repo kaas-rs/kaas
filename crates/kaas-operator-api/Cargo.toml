@@ -6,7 +6,7 @@ license.workspace      = true
 repository.workspace   = true
 rust-version.workspace = true
 publish      = false
-description  = "CRD types (kube-derive): KafkaCluster, KafkaTopic, KafkaUser, KafkaClusterAssignments."
+description  = "CRD types (kube-derive): KafkaCluster, KafkaTopic, KafkaUser."
 
 [dependencies]
 kube        = { workspace = true }

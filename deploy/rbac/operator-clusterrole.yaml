@@ -10,12 +10,6 @@ rules:
   - apiGroups: [kaas.rs]
     resources: [kafkatopics/status, kafkausers/status, kafkausergroups/status, kafkaacls/status]
     verbs: [get, update, patch]
-  # KafkaClusterAssignments — operator creates the singleton CR alongside the
-  # KafkaCluster (one CR per KafkaCluster, sharing the cluster's name). The
-  # controller broker writes the status; the operator only owns lifecycle.
-  - apiGroups: [kaas.rs]
-    resources: [kafkaclusterassignments]
-    verbs: [get, list, watch, create, delete]
   # Secrets — own namespace only (enforced via RoleBinding)
   - apiGroups: [""]
     resources: [secrets]

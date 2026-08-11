@@ -12,7 +12,7 @@ Two layers:
   passthrough enables zero-downtime rotation), `kafkacluster_controller.rs`
   (cert-manager Certificates, per-broker Services, Gateway TLSRoutes — all
   with OwnerReferences; also idempotently creates the per-cluster
-  `KafkaClusterAssignments` CR, create-only).
+
 - **Helpers** — `credentials.rs` + `acls.rs` (the file materializers),
   `sweep.rs` (the leader-elected orphan sweep — an initial pass at leader
   election plus a periodic re-run every 5 minutes, resumable across

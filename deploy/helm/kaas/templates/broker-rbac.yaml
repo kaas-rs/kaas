@@ -49,16 +49,6 @@ rules:
   - apiGroups: [kaas.rs]
     resources: [kafkatopics/status]
     verbs: [get, update, patch]
-  # KafkaClusterAssignments mirror: the elected controller broker
-  # writes Status to it via crates/sk-controller/src/k8s_mirror.rs after every
-  # assignment.json change. Read on every broker (debug/diag); update
-  # only fires on the controller, but RBAC is per-pod identity.
-  - apiGroups: [kaas.rs]
-    resources: [kafkaclusterassignments]
-    verbs: [get, list, watch]
-  - apiGroups: [kaas.rs]
-    resources: [kafkaclusterassignments/status]
-    verbs: [get, update, patch]
   # Kubernetes ServiceAccount JWT validation (SASL PLAIN).
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]

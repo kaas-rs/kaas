@@ -17,9 +17,8 @@ integration](../architecture/kubernetes.md).
 | `kafkaclusters.kaas.rs` | `KafkaCluster` | External-listener plumbing: certificates, per-broker Services, TLSRoutes | [KafkaCluster](./crds/kafkacluster.md) |
 | `kafkatopics.kaas.rs` | `KafkaTopic` | Topic existence, partition count, per-topic config, volume placement | [KafkaTopic](./crds/kafkatopic.md) |
 | `kafkausers.kaas.rs` | `KafkaUser` | Credentials, ACLs, quotas — one CR per principal | [KafkaUser](./crds/kafkauser.md) |
-| `kafkaclusterassignments.kaas.rs` | `KafkaClusterAssignments` | Nothing — reserved as a read-only assignment debug mirror (status writer not wired yet) | [KafkaClusterAssignments](./crds/kafkaclusterassignments.md) |
 
-All four are namespaced. The examples in this chapter use the `kafka`
+All three are namespaced. The examples in this chapter use the `kafka`
 namespace from [Getting Started](../getting-started.md).
 
 ## Installing and upgrading the CRDs

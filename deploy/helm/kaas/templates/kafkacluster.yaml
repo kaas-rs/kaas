@@ -1,8 +1,8 @@
 {{- /*
 KafkaCluster CR. The operator's KafkaClusterReconciler watches this and
 materializes the per-broker external-listener resources from it
-(cert-manager Certificate, per-broker Service, Gateway API TLSRoute) plus
-the KafkaClusterAssignments mirror CR. The chart templates this CR, so
+(cert-manager Certificate, per-broker Service, Gateway API TLSRoute).
+The chart templates this CR, so
 day-2 hostname / cert / replica changes flow through helm values (helm
 upgrade / ArgoCD sync) — hand edits to the CR are reverted on the next
 sync.

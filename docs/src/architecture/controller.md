@@ -36,10 +36,10 @@ sequenceDiagram
     B->>B: consumer-group takeover diff<br/>+ orphan sweep
 ```
 
-A `KafkaClusterAssignments` CR exists as the intended `kubectl`-visible
-debug mirror of this file, but the status writer is not wired up yet —
-the CR's status is empty today, and the file on the volume is the only
-place to read the assignment. There is no per-partition Lease: the
+The file on the volume is where you read the assignment (from any
+broker pod, or via `kafka-topics.sh --describe` on the client side) —
+there is no Kubernetes-object reflection of it. There is no
+per-partition Lease either: the
 singleton controller Lease is the only Kubernetes coordination
 primitive, and everything downstream of it travels through
 `assignment.json` on the shared volume.
@@ -158,7 +158,7 @@ persisted.
 - Controller-side logic lives in `crates/kaas-controller`:
   `heartbeat_server.rs` (serves `proto/heartbeat.proto`),
   `balancer.rs` (assignment computation), `assignment_writer.rs`
-  (epoch-prefixed write), `k8s_mirror.rs` (the CR mirror).
+  (epoch-prefixed write).
 - Recompute wiring — the topic-watch callback (gh #74) and the 2 s
   broker-set watcher (gh #77) — is in `bins/kaas/src/cluster.rs`.
 - The broker-side assignment watcher and stale-epoch rejection live in

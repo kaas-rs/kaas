@@ -21,16 +21,6 @@ rules:
   - apiGroups: [kaas.rs]
     resources: [kafkatopics, kafkausers]
     verbs: [get, list, watch]
-  # KafkaClusterAssignments — the controller broker writes this CR as a
-  # best-effort fire-and-forget debug mirror of /data/__cluster/assignment.json.
-  # All brokers can read; only the elected controller actually writes. Brokers
-  # never read this CR for cluster state — the file on the PVC is authoritative.
-  - apiGroups: [kaas.rs]
-    resources: [kafkaclusterassignments]
-    verbs: [get, list, watch, update]
-  - apiGroups: [kaas.rs]
-    resources: [kafkaclusterassignments/status]
-    verbs: [get, update, patch]
   # Credentials and TLS secrets — own namespace only (enforced via RoleBinding)
   - apiGroups: [""]
     resources: [secrets]

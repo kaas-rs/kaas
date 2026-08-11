@@ -59,7 +59,6 @@ pub struct Metrics {
     pub assignment_file_writes: Counter<u64>,
     pub assignment_file_write_latency: Histogram<f64>,
     pub assignment_pushes: Counter<u64>,
-    pub cr_mirror_writes: Counter<u64>,
     pub assignment_polls: Counter<u64>,
     pub stale_assignments_rejected: Counter<u64>,
 
@@ -171,11 +170,6 @@ pub fn new_metrics(m: &Meter) -> Metrics {
             m,
             "kaas.assignment.pushes",
             "ASSIGNMENT_CHANGED broadcasts via heartbeat server",
-        ),
-        cr_mirror_writes: counter(
-            m,
-            "kaas.assignment.cr.mirror.writes",
-            "KafkaClusterAssignments CR Status update attempts (result=ok|error)",
         ),
         assignment_polls: counter(
             m,
@@ -351,7 +345,7 @@ pub fn new_metrics(m: &Meter) -> Metrics {
         k8s_api_calls: counter(
             m,
             "kaas.k8s.api.calls",
-            "Apiserver calls from the broker (operation=Get|List|Watch|Patch|Update|Create, resource=KafkaTopic|EndpointSlice|Lease|Pod|KafkaClusterAssignments, result=ok|error)",
+            "Apiserver calls from the broker (operation=Get|List|Watch|Patch|Update|Create, resource=KafkaTopic|EndpointSlice|Lease|Pod, result=ok|error)",
         ),
         k8s_api_latency: latency_hist(
             m,

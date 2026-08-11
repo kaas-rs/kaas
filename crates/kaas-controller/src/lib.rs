@@ -6,20 +6,16 @@
 //!   placement with deterministic smoothing.
 //! - [`assignment_writer`] — atomic `assignment.json` writer with
 //!   the trait seams (`TopicSource`, `BrokerSource`,
-//!   `GroupSource`, `CrMirror`).
+//!   `GroupSource`).
 //! - [`heartbeat_server`] — controller-side bidi gRPC server.
 //! - [`election`] + [`LocalElection`] — dev-mode "always elected"
 //!   stub. The kube-backed Lease implementation lands in workstream
 //!   E follow-up alongside `ControllerWatch`.
-//! - [`k8s_mirror`] — [`CrMirror`] trait + [`NoopMirror`] zero-
-//!   value impl. The real `KafkaClusterAssignments` writer is a
-//!   Phase 7 follow-up.
 
 pub mod assignment_writer;
 pub mod balancer;
 pub mod election;
 pub mod heartbeat_server;
-pub mod k8s_mirror;
 
 #[cfg(feature = "kube-election")]
 pub mod kube_election;
@@ -38,4 +34,3 @@ pub use balancer::{
 };
 pub use election::{LeaseElection, LocalElection};
 pub use heartbeat_server::{BrokerLiveness, HeartbeatServer, HeartbeatService};
-pub use k8s_mirror::{CrMirror, NoopMirror};

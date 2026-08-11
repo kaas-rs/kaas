@@ -14,7 +14,7 @@ use std::process::Command;
 use std::{env, fs};
 
 use anyhow::{bail, Context, Result};
-use kaas_operator_api::{KafkaCluster, KafkaClusterAssignments, KafkaTopic, KafkaUser};
+use kaas_operator_api::{KafkaCluster, KafkaTopic, KafkaUser};
 use kube::CustomResourceExt;
 
 mod api_matrix;
@@ -57,10 +57,6 @@ fn gen_crds() -> Result<()> {
         ("kaas.rs_kafkaclusters.yaml", kafkacluster_yaml),
         ("kaas.rs_kafkatopics.yaml", kafkatopic_yaml),
         ("kaas.rs_kafkausers.yaml", kafkauser_yaml),
-        (
-            "kaas.rs_kafkaclusterassignments.yaml",
-            kafkaclusterassignments_yaml,
-        ),
     ];
 
     for (filename, render) in entries {
@@ -134,9 +130,6 @@ fn kafkatopic_yaml() -> Result<String> {
 }
 fn kafkauser_yaml() -> Result<String> {
     crd_yaml(&KafkaUser::crd())
-}
-fn kafkaclusterassignments_yaml() -> Result<String> {
-    crd_yaml(&KafkaClusterAssignments::crd())
 }
 
 fn crd_yaml<T: serde::Serialize>(crd: &T) -> Result<String> {

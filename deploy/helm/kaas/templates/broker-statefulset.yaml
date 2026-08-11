@@ -136,11 +136,6 @@ spec:
             {{- end }}
             - name: KAAS_CLUSTER_ID
               value: {{ .Values.broker.clusterID }}
-            - name: KAAS_CLUSTER_NAME
-              # Matches the KafkaCluster CR's metadata.name so the
-              # KafkaClusterAssignments CR mirror writes back to the
-              # right object (Phase 6).
-              value: {{ include "kaas.fullname" . }}
             - name: KAAS_HEALTH_ADDR
               value: ":{{ .Values.broker.ports.health }}"
             - name: KAAS_CONTROLLER_HEARTBEAT_ADDR

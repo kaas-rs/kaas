@@ -144,27 +144,11 @@ spec:
           annotations:
             summary: "assignment.json approaching the Kubernetes 1MB CR-status cap"
             description: |
-              The KafkaClusterAssignments mirror CR truncates partition lists
-              when the rendered Status exceeds 1MB. With ~100 bytes/partition,
-              this fires around 5000-8000 partitions. The authoritative file
-              on the PVC is unaffected; only the kubectl-debug view truncates.
-
-        - alert: KaasCRMirrorErrorSustained
-          expr: rate(kaas_assignment_cr_mirror_writes_total{result="error"}[5m]) > 0
-          for: 15m
-          labels:
-            severity: warning
-            {{- with .Values.observability.alerts.additionalLabels }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          annotations:
-            summary: "KafkaClusterAssignments CR mirror writes failing for 15m"
-            description: |
-              The CR is the kubectl-visible debug mirror — failures here
-              don't affect the data plane (the file on the PVC is the
-              source of truth) but mean kubectl get kafkaclusterassignments
-              shows stale state. Check operator RBAC (kafkaclusterassignments,
-              kafkaclusterassignments/status) and CRD installation.
+              assignment.json is growing toward sizes (~1MB, roughly
+              5000-8000 partitions at ~100 bytes each) where Kubernetes
+              object caps would bite any CR-shaped reflection of it, and
+              where write/parse latency on the shared volume starts to
+              matter. The authoritative file on the PVC keeps working.
 
     - name: kaas.heartbeat
       interval: 30s

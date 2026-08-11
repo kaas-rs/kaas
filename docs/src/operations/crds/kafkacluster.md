@@ -92,17 +92,14 @@ external listener is enabled), and `Ready`.
   that is the chart's listener array, delivered to brokers by
   environment variable.
 - Deleting it does not delete topic data; it tears down the external
-  access path only. (It does cascade-delete the
-  [KafkaClusterAssignments](./kafkaclusterassignments.md) debug
-  mirror, which is created with an OwnerReference to it.)
+  access path only.
 
 ## Implementation notes (for contributors)
 
 - Type: `crates/kaas-operator-api/src/kafkacluster.rs`; generated
   schema `deploy/crds/kaas.rs_kafkaclusters.yaml`.
 - Reconciler: `crates/kaas-operator-controllers/` (KafkaCluster
-  reconciler, 300 s requeue). It also creates the companion
-  `KafkaClusterAssignments` CR, create-only.
+  reconciler, 300 s requeue).
 - The chart→CR template is
   `deploy/helm/kaas/templates/kafkacluster.yaml`, using the
   `kaas.firstByType` helper to collapse the listener array into the

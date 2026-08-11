@@ -7,9 +7,6 @@
 //!   `statefulset.kubernetes.io/pod-name`.
 //! - One Gateway-API `TLSRoute` (gateway.networking.k8s.io/v1alpha2)
 //!   per broker ordinal, matched by SNI hostname.
-//! - The per-cluster `KafkaClusterAssignments` CR (idempotent
-//!   create-only; the controller-broker mirrors Status via
-//!   `kaas_controller::k8s_mirror`).
 //!
 //! Cleanup runs through K8s GC via OwnerReferences set at creation
 //! time — no finalizers. When `external.enabled` is toggled off
@@ -26,10 +23,7 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kaas_operator_api::{
-    Condition, KafkaCluster, KafkaClusterAssignments, KafkaClusterAssignmentsSpec,
-    KafkaClusterStatus,
-};
+use kaas_operator_api::{Condition, KafkaCluster, KafkaClusterStatus};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams};
 use kube::core::ObjectMeta;
 use kube::runtime::controller::Action;
@@ -115,14 +109,6 @@ impl KafkaClusterReconciler {
             return Ok(Action::await_change());
         }
 
-        // 0. Idempotent create of the per-cluster KafkaClusterAssignments CR.
-        if let Err(e) = self.reconcile_assignments_cr(&cluster).await {
-            self.fail_ready(&cluster, "AssignmentsCRError", &e.to_string())
-                .await?;
-            self.observer.bump_error();
-            return Err(e);
-        }
-
         let ext = &cluster.spec.listeners.external;
         if !ext.enabled {
             // External listener disabled — tear down any previously-
@@ -190,42 +176,6 @@ impl KafkaClusterReconciler {
 
         self.observer.bump_success();
         Ok(Action::requeue(Duration::from_secs(300)))
-    }
-
-    async fn reconcile_assignments_cr(
-        &self,
-        cluster: &KafkaCluster,
-    ) -> Result<(), ControllerError> {
-        let Some(name) = cluster.metadata.name.as_deref() else {
-            return Err(ControllerError::Other(
-                "cluster has no metadata.name".into(),
-            ));
-        };
-        let ns = cluster
-            .metadata
-            .namespace
-            .as_deref()
-            .unwrap_or(&self.namespace);
-        let api: Api<KafkaClusterAssignments> = Api::namespaced(self.client.clone(), ns);
-
-        match api.get(name).await {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => {
-                let cr = KafkaClusterAssignments {
-                    metadata: ObjectMeta {
-                        name: Some(name.into()),
-                        namespace: Some(ns.into()),
-                        owner_references: Some(vec![owner_ref_for(cluster)]),
-                        ..ObjectMeta::default()
-                    },
-                    spec: KafkaClusterAssignmentsSpec {},
-                    status: None,
-                };
-                api.create(&PostParams::default(), &cr).await?;
-                Ok(())
-            }
-            Err(e) => Err(ControllerError::Kube(e)),
-        }
     }
 
     async fn reconcile_certificate(&self, cluster: &KafkaCluster) -> Result<(), ControllerError> {
