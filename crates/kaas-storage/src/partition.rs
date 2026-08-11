@@ -53,6 +53,7 @@ use crate::producer_snapshot::{read_producer_snapshot, write_producer_snapshot};
 use crate::recovery_checkpoint::{self, RecoveryCheckpoint};
 use crate::segment::{self, parse_batch_offsets, ActiveSegment, SegmentMeta};
 use crate::txn_index::{AbortedTxn, AbortedTxnIndex, OpenTxnIndex};
+use crate::txn_index_snapshot::{read_txn_index_snapshot, write_txn_index_snapshot};
 
 /// gh #recovery-checkpoint: the committer writes a fresh recovery
 /// checkpoint once the fsynced log has grown this far past the last one.
@@ -196,6 +197,8 @@ struct OpenedState {
     closed: Vec<SegmentMeta>,
     active: ActiveSegment,
     producer_states: HashMap<i64, ProducerEntry>,
+    open_txns: OpenTxnIndex,
+    aborted_txns: AbortedTxnIndex,
 }
 
 /// Blocking prologue of [`Partition::open`] — runs on a
@@ -337,6 +340,23 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         .map(|entries| entries.into_iter().collect::<HashMap<i64, ProducerEntry>>())
         .unwrap_or_default();
 
+    // Restore the read_committed indexes (gh #177). Absent snapshot →
+    // empty indexes, which is the pre-gh #177 behaviour for exactly one
+    // restart (the first persist writes the file). Aborted entries fully
+    // below log_start are dropped on the way in — DeleteRecords may have
+    // advanced it since the snapshot was written.
+    let (open_txns, aborted_txns) = match read_txn_index_snapshot(fs, dir).map_err(|e| match e {
+        crate::txn_index_snapshot::TxnIndexSnapshotError::Io(e) => StorageError::Io(e),
+        crate::txn_index_snapshot::TxnIndexSnapshotError::Json(e) => StorageError::Json(e),
+    })? {
+        Some((open, aborted)) => {
+            let mut idx = AbortedTxnIndex::restore(aborted);
+            idx.evict_below(log_start);
+            (OpenTxnIndex::restore(open), idx)
+        }
+        None => (OpenTxnIndex::new(), AbortedTxnIndex::new()),
+    };
+
     // Persist the manifest so the next open is fast — but never below
     // the epoch on disk (gh #235). `epoch` was read at the top of this
     // function, and everything since (the segment listing, the handle
@@ -371,6 +391,8 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         closed,
         active,
         producer_states,
+        open_txns,
+        aborted_txns,
     })
 }
 
@@ -491,6 +513,8 @@ impl Partition {
             closed,
             active,
             producer_states,
+            open_txns,
+            aborted_txns,
         } = tokio::task::spawn_blocking(move || {
             open_blocking_retrying(fs_open.as_ref(), &dir_open)
         })
@@ -510,8 +534,8 @@ impl Partition {
             completed_flush_seq: 0,
             flush_err: None,
             producer_states,
-            open_txns: OpenTxnIndex::new(),
-            aborted_txns: AbortedTxnIndex::new(),
+            open_txns,
+            aborted_txns,
         }));
         let initial_snapshot = snapshot_of(&inner.lock());
 
@@ -1006,6 +1030,12 @@ impl Partition {
                 }
                 guard.closed = new_closed;
 
+                // gh #177: aborted-txn entries whose span is now fully
+                // below log_start can never appear in a fetchable range
+                // again — drop them so the index doesn't grow with
+                // abort history for the life of the leadership.
+                guard.aborted_txns.evict_below(new_start);
+
                 self.snapshot.store(Arc::new(snapshot_of(&guard)));
             }
             guard.log_start
@@ -1345,6 +1375,20 @@ fn persist_state_locked(
     write_producer_snapshot(fs, &guard.dir, &snap).map_err(|e| match e {
         crate::producer_snapshot::ProducerSnapshotError::Io(e) => StorageError::Io(e),
         crate::producer_snapshot::ProducerSnapshotError::Json(e) => StorageError::Json(e),
+    })?;
+    // gh #177: the read_committed indexes ride the same triggers and
+    // the same superseded-epoch guard as the producer snapshot — a
+    // fenced leader's stale LSO/abort state must not replay over its
+    // successor's either.
+    write_txn_index_snapshot(
+        fs,
+        &guard.dir,
+        &guard.open_txns.entries(),
+        &guard.aborted_txns.snapshot(),
+    )
+    .map_err(|e| match e {
+        crate::txn_index_snapshot::TxnIndexSnapshotError::Io(e) => StorageError::Io(e),
+        crate::txn_index_snapshot::TxnIndexSnapshotError::Json(e) => StorageError::Json(e),
     })?;
     // Re-checked at the write itself, not just at the top of this
     // function: the producer-snapshot write sits in between, and on a
@@ -2066,6 +2110,123 @@ mod tests {
             assert_eq!(aborted[0].first_offset, 0);
             assert_eq!(p.last_stable_offset(), p.high_watermark());
             p.close().await.unwrap();
+        });
+    }
+
+    /// gh #177: both read_committed indexes survive close + reopen.
+    /// Pre-fix, a restart snapped LSO to the HWM (serving a still-open
+    /// transaction's records to read_committed consumers) and dropped
+    /// the aborted list (serving aborted records with nothing to
+    /// filter them by).
+    #[test]
+    fn txn_indexes_survive_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            // pid 7: 3 records at 0..2, aborted (marker at 3).
+            p.append(0, -1, build_txn_data_batch(7, 3)).await.unwrap();
+            p.append(0, -1, build_marker_batch(7, false)).await.unwrap();
+            // pid 42: 3 records at 4..6, left open across the restart.
+            p.append(0, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            assert_eq!(p.high_watermark(), 7);
+            assert_eq!(p.last_stable_offset(), 4);
+            p.close().await.unwrap();
+
+            let p2 = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(p2.high_watermark(), 7);
+            assert_eq!(
+                p2.last_stable_offset(),
+                4,
+                "LSO must hold at the open txn's first offset across reopen"
+            );
+            let aborted = p2.aborted_in_range(0, i64::MAX);
+            assert_eq!(aborted.len(), 1, "aborted list must survive reopen");
+            assert_eq!(aborted[0].producer_id, 7);
+            assert_eq!(aborted[0].first_offset, 0);
+
+            // The open txn is still live state: its commit marker must
+            // release the LSO exactly as if no restart had happened.
+            p2.append(0, -1, build_marker_batch(42, true))
+                .await
+                .unwrap();
+            assert_eq!(p2.last_stable_offset(), p2.high_watermark());
+            p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #177: a snapshotted aborted entry whose span fell below
+    /// log_start while the partition was closed is evicted on restore,
+    /// and delete_records evicts live entries as it advances.
+    #[test]
+    fn aborted_entries_below_log_start_are_evicted() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_txn_data_batch(7, 3)).await.unwrap();
+            p.append(0, -1, build_marker_batch(7, false)).await.unwrap();
+            assert_eq!(p.aborted_in_range(0, i64::MAX).len(), 1);
+
+            // Advance log_start past the abort marker: live eviction.
+            p.delete_records(4).await.unwrap();
+            assert!(
+                p.aborted_in_range(0, i64::MAX).is_empty(),
+                "delete_records must evict fully-covered aborted entries"
+            );
+            p.close().await.unwrap();
+
+            // Restore-side eviction: plant a stale entry below the
+            // persisted log_start and reopen — it must not come back.
+            write_txn_index_snapshot(
+                fs.as_ref(),
+                tmp.path(),
+                &[],
+                &[crate::txn_index::AbortedTxn {
+                    producer_id: 99,
+                    first_offset: 0,
+                    last_offset: 3,
+                }],
+            )
+            .unwrap();
+            let p2 = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                p2.aborted_in_range(0, i64::MAX).is_empty(),
+                "restore must evict entries below the persisted log_start"
+            );
+            p2.close().await.unwrap();
         });
     }
 

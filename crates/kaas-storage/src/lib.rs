@@ -35,6 +35,7 @@ pub mod segment;
 pub mod topic_identity;
 pub mod topicconfig;
 pub mod txn_index;
+pub mod txn_index_snapshot;
 
 pub use cleaner::{
     FixedPolicySource, OwnershipSource, OwnsEverything, PolicySource, RetentionCleaner,

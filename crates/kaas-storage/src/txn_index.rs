@@ -11,11 +11,12 @@
 //!   the Fetch response can include `AbortedTransactions[]` for the
 //!   client to filter out the aborted records.
 //!
-//! Both indexes are in-memory only for the MVP; on broker restart
-//! `recover_segment` rebuilds them by scanning the active segment's
-//! batch headers (cheap — batch attrs + pid are 12 fixed-position
-//! bytes). The on-disk `.txnindex` per-segment file Apache uses for
-//! cold restarts without log scan is a follow-up.
+//! Both indexes are populated at append time and persisted to
+//! `txn-index.snapshot` (gh #177, [`crate::txn_index_snapshot`]) on
+//! the same triggers as the producer snapshot — take-over and
+//! close/relinquish — then restored on `Partition::open`. Apache's
+//! per-segment `.txnindex` files are the same idea at finer
+//! granularity; one file per partition keeps NFS round-trips down.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -68,6 +69,18 @@ impl OpenTxnIndex {
     /// txn is open — caller uses HWM as the LSO in that case.
     pub fn min_open_offset(&self) -> Option<i64> {
         self.first_offset.values().copied().min()
+    }
+
+    /// All `(pid, first_offset)` entries, for the gh #177 snapshot.
+    pub fn entries(&self) -> Vec<(i64, i64)> {
+        self.first_offset.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// Rebuild from a gh #177 snapshot's entries.
+    pub fn restore(entries: impl IntoIterator<Item = (i64, i64)>) -> Self {
+        Self {
+            first_offset: entries.into_iter().collect(),
+        }
     }
 
     /// True when no transaction is currently open on this
@@ -128,10 +141,20 @@ impl AbortedTxnIndex {
             .collect()
     }
 
-    /// Test-only accessor for the full entry list.
-    #[cfg(test)]
+    /// The full entry list, sorted by `first_offset` — the gh #177
+    /// snapshot source (and test observability).
     pub fn snapshot(&self) -> Vec<AbortedTxn> {
         self.entries.iter().copied().collect()
+    }
+
+    /// Rebuild from a gh #177 snapshot's entries. `record` keeps the
+    /// deque sorted regardless of input order.
+    pub fn restore(entries: impl IntoIterator<Item = AbortedTxn>) -> Self {
+        let mut idx = Self::default();
+        for e in entries {
+            idx.record(e);
+        }
+        idx
     }
 }
 
