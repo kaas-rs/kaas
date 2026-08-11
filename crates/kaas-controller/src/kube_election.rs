@@ -48,6 +48,26 @@ pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(15);
 pub const DEFAULT_RENEW_DEADLINE: Duration = Duration::from_secs(10);
 pub const DEFAULT_RETRY_PERIOD: Duration = Duration::from_secs(2);
 
+/// Annotation stamped on the Lease by [`KubeLeaseElection::release`]
+/// recording who held it before `holderIdentity` was blanked. Lets a
+/// subsequent acquire distinguish "same broker re-acquiring after its
+/// own release" (no real handover — don't bump `leaseTransitions`)
+/// from a genuine change of holder (gh #204). Self-cleaning: the
+/// acquire apply omits it, so SSA prunes it once a real holder is set.
+const LAST_HOLDER_ANNOTATION: &str = "kaas.rs/last-holder";
+
+/// `leaseTransitions` is the controller epoch that fences
+/// `assignment.json`; it must count *handovers*, not acquisitions.
+/// Bump only when the previous holder — the live `holderIdentity` if
+/// non-empty, else the [`LAST_HOLDER_ANNOTATION`] a release left
+/// behind — is someone else or unknown (gh #204).
+fn next_transitions(prev_holder: Option<&str>, identity: &str, current: i32) -> i32 {
+    match prev_holder {
+        Some(prev) if prev == identity => current,
+        _ => current + 1,
+    }
+}
+
 pub struct KubeLeaseElection {
     client: Client,
     namespace: String,
@@ -145,6 +165,13 @@ impl KubeLeaseElection {
                 )
             }
         };
+        let last_holder_annotation = existing.as_ref().and_then(|l| {
+            l.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(LAST_HOLDER_ANNOTATION))
+                .cloned()
+        });
 
         let we_already_hold = current_holder.as_deref() == Some(self.identity.as_str());
         let lease_window = lease_seconds
@@ -167,11 +194,16 @@ impl KubeLeaseElection {
             return Ok(None);
         }
 
-        let new_transitions = if we_already_hold {
-            current_transitions
-        } else {
-            current_transitions + 1
+        // The previous holder is the live one if set; a blank holder
+        // means a release happened, and the release stamped who it
+        // was in the annotation. Bumping on every re-acquire (the
+        // pre-gh #204 behaviour) inflated the epoch by ~1000 with a
+        // single broker and zero real handovers.
+        let prev_holder = match current_holder.as_deref() {
+            Some(h) if !h.is_empty() => Some(h),
+            _ => last_holder_annotation.as_deref(),
         };
+        let new_transitions = next_transitions(prev_holder, &self.identity, current_transitions);
 
         let duration_secs = i32::try_from(self.lease_duration.as_secs()).unwrap_or(i32::MAX);
         let patch = serde_json::json!({
@@ -272,7 +304,16 @@ impl KubeLeaseElection {
         let patch = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": { "name": self.lease_name, "namespace": self.namespace },
+            "metadata": {
+                "name": self.lease_name,
+                "namespace": self.namespace,
+                // Record who is releasing so the next acquire can
+                // tell a self-re-acquire from a real handover and
+                // leave `leaseTransitions` alone for the former
+                // (gh #204). The acquire apply omits this key, so
+                // SSA prunes it once a live holder is set again.
+                "annotations": { LAST_HOLDER_ANNOTATION: self.identity },
+            },
             "spec": {
                 "holderIdentity": "",
                 "leaseDurationSeconds": duration_secs,
@@ -430,5 +471,30 @@ mod tests {
         assert!(s.ends_with('Z'), "must be UTC");
         // YYYY-MM-DDTHH:MM:SS.ffffffZ → 27 chars.
         assert_eq!(s.len(), 27, "got {s:?}");
+    }
+
+    #[test]
+    fn a_self_reacquire_after_release_keeps_the_epoch() {
+        // gh #204: release blanks holderIdentity but the annotation
+        // remembers us; taking the lease back is not a transition.
+        assert_eq!(next_transitions(Some("kaas-1"), "kaas-1", 42), 42);
+    }
+
+    #[test]
+    fn a_real_handover_bumps_the_epoch() {
+        assert_eq!(next_transitions(Some("kaas-0"), "kaas-1", 42), 43);
+    }
+
+    #[test]
+    fn an_unknown_previous_holder_bumps_conservatively() {
+        // Fresh lease, or a pre-annotation release: no way to prove
+        // it was us, so the fence must move forward.
+        assert_eq!(next_transitions(None, "kaas-1", 0), 1);
+    }
+
+    #[test]
+    fn a_renew_while_holding_keeps_the_epoch() {
+        // try_acquire while we are still the live holder.
+        assert_eq!(next_transitions(Some("kaas-2"), "kaas-2", 7), 7);
     }
 }
