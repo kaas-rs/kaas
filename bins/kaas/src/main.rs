@@ -964,6 +964,21 @@ fn spawn_jwks_refreshers(validators: &[Arc<OauthValidator>]) -> Vec<tokio::task:
         .map(|v| {
             tokio::spawn(async move {
                 let endpoint = v.config().jwks_endpoint_uri.clone();
+                // Defence-in-depth (gh #42 review): a plaintext JWKS
+                // endpoint lets an on-path attacker swap in signing
+                // keys and mint tokens. HTTPS is the only safe choice;
+                // http:// is accepted (Apache does too, for in-cluster
+                // plaintext issuers) but called out loudly so a
+                // misconfiguration is visible in the log rather than
+                // silent.
+                if !endpoint.trim_start().to_ascii_lowercase().starts_with("https://") {
+                    warn!(
+                        jwks = endpoint.as_str(),
+                        "jwks: endpoint is not https — signing keys are fetched in plaintext; \
+                         an on-path attacker could inject keys and forge tokens. Use an https \
+                         JWKS URL in production."
+                    );
+                }
                 let refresh = std::time::Duration::from_secs(v.config().jwks_refresh_seconds);
                 let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(10))
