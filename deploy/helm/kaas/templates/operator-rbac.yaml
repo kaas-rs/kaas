@@ -43,6 +43,12 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [tlsroutes]
     verbs: [get, list, watch, create, update, patch, delete]
+  # gh #186: the KafkaCluster reconciler reads the Helm-owned broker
+  # StatefulSet to detect CR-vs-chart replicas drift before fanning out
+  # per-broker Services.
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -121,6 +121,16 @@ impl KafkaClusterReconciler {
             return Ok(Action::requeue(Duration::from_secs(300)));
         }
 
+        // gh #186: `spec.replicas` is chart-templated from the same value
+        // as the Helm-owned StatefulSet's replicas, so they only diverge
+        // when someone hand-edits one of them — and a CR running ahead of
+        // the StatefulSet fans out per-broker Services whose pod-name
+        // selector matches nothing: zero-endpoint Services, silently.
+        // Cap the fan-out at the smaller count (existing brokers stay
+        // served) and surface the drift as Ready=False below.
+        let sts_replicas = self.statefulset_replicas(&cluster).await;
+        let (fanout, drifted_sts) = effective_fanout(cluster.spec.replicas, sts_replicas);
+
         // 1. cert-manager Certificate (if enabled).
         if ext.tls.cert_manager.enabled {
             if let Err(e) = self.reconcile_certificate(&cluster).await {
@@ -132,7 +142,7 @@ impl KafkaClusterReconciler {
         }
 
         // 2. Per-broker Services.
-        for i in 0..cluster.spec.replicas {
+        for i in 0..fanout {
             if let Err(e) = self.reconcile_broker_service(&cluster, i).await {
                 self.fail_ready(&cluster, "ServiceError", &e.to_string())
                     .await?;
@@ -143,7 +153,7 @@ impl KafkaClusterReconciler {
 
         // 3. Per-broker TLSRoutes (Gateway API).
         if ext.gateway.enabled {
-            for i in 0..cluster.spec.replicas {
+            for i in 0..fanout {
                 if let Err(e) = self.reconcile_broker_tls_route(&cluster, i).await {
                     self.fail_ready(&cluster, "TLSRouteError", &e.to_string())
                         .await?;
@@ -151,6 +161,24 @@ impl KafkaClusterReconciler {
                     return Err(e);
                 }
             }
+        }
+
+        // Drift found: report it and requeue on a short fuse — the heal
+        // is a `helm upgrade` growing the StatefulSet, which this
+        // reconciler can only poll for.
+        if let Some(sts) = drifted_sts {
+            self.fail_ready(
+                &cluster,
+                "ReplicasMismatch",
+                &format!(
+                    "CR replicas={}, StatefulSet replicas={sts} — run helm upgrade; \
+                     per-broker resources capped at {fanout}",
+                    cluster.spec.replicas
+                ),
+            )
+            .await?;
+            self.observer.bump_requeue();
+            return Ok(Action::requeue(Duration::from_secs(30)));
         }
 
         // 4. Status: bootstrap server list + Ready=True.
@@ -469,6 +497,29 @@ impl KafkaClusterReconciler {
         .await
     }
 
+    /// The Helm-owned broker StatefulSet's `spec.replicas`, or `None`
+    /// when it can't be read — absent (operator running without the
+    /// chart, tests) or a transient API error. `None` skips the
+    /// gh #186 drift check rather than failing the reconcile: the
+    /// check is defense-in-depth, not a serving dependency.
+    async fn statefulset_replicas(&self, cluster: &KafkaCluster) -> Option<i32> {
+        let name = cluster.metadata.name.as_deref()?;
+        let ns = cluster
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(&self.namespace);
+        let api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
+            Api::namespaced(self.client.clone(), ns);
+        match api.get_opt(name).await {
+            Ok(sts) => sts.and_then(|s| s.spec.and_then(|spec| spec.replicas)),
+            Err(err) => {
+                tracing::warn!(%err, name, "statefulset read failed; skipping replicas drift check");
+                None
+            }
+        }
+    }
+
     async fn fail_ready(
         &self,
         cluster: &KafkaCluster,
@@ -540,6 +591,18 @@ fn nonzero_or(v: i32, fallback: i32) -> i32 {
         fallback
     } else {
         v
+    }
+}
+
+/// gh #186: how many broker ordinals to fan per-broker resources over,
+/// given the CR's replicas and the StatefulSet's (when readable).
+/// Returns `(fanout, Some(sts_replicas))` on drift — the fan-out is
+/// capped at the smaller count so no Service ever selects a pod that
+/// can't exist, while existing ordinals stay served.
+fn effective_fanout(cr_replicas: i32, sts_replicas: Option<i32>) -> (i32, Option<i32>) {
+    match sts_replicas {
+        Some(sts) if sts != cr_replicas => (cr_replicas.min(sts), Some(sts)),
+        _ => (cr_replicas, None),
     }
 }
 
@@ -686,6 +749,23 @@ mod tests {
         assert_eq!(owner.uid, "uid-1");
         assert_eq!(owner.controller, Some(true));
         assert_eq!(owner.api_version, "kaas.rs/v1alpha1");
+    }
+
+    #[test]
+    fn a_drifted_statefulset_caps_the_fanout_and_reports() {
+        // CR ahead of the StatefulSet (the gh #186 hand-edit): cap.
+        assert_eq!(effective_fanout(5, Some(3)), (3, Some(3)));
+        // StatefulSet ahead of the CR (edit in the other direction —
+        // extra pods exist but the CR doesn't claim them): still a
+        // drift worth reporting; fan out only what the CR asks for.
+        assert_eq!(effective_fanout(3, Some(5)), (3, Some(5)));
+    }
+
+    #[test]
+    fn agreement_or_unreadable_statefulset_fans_out_the_cr_count() {
+        assert_eq!(effective_fanout(3, Some(3)), (3, None));
+        // No StatefulSet (tests, chart-less operator): fail open.
+        assert_eq!(effective_fanout(3, None), (3, None));
     }
 
     #[test]
