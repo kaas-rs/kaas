@@ -31,6 +31,9 @@ pub const ERR_UNSUPPORTED_VERSION: i16 = 35;
 /// completed SASL and the requested API is not in the pre-SASL
 /// allowlist.
 pub const ERR_CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
+/// KIP-368: what an expired session answers with until the client
+/// re-authenticates.
+pub const ERR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 
 /// API keys allowed before SASL completes — handshake (17),
 /// ApiVersions (18), and authenticate (36).
@@ -197,13 +200,24 @@ impl Dispatcher {
         // is rejected until SASL completes. mTLS sets sasl_done=true
         // at handshake time so the same gate works for cert clients.
         if let Some(sel) = self.engines.as_ref() {
-            let (listener_name, sasl_done) = {
+            let (listener_name, sasl_done, session_expired) = {
                 let cs = conn.lock();
-                (cs.listener_name.clone(), cs.sasl_done)
+                (
+                    cs.listener_name.clone(),
+                    cs.sasl_done,
+                    cs.session_deadline
+                        .is_some_and(|d| std::time::Instant::now() >= d),
+                )
             };
             let eng = sel.for_listener(&listener_name);
             if eng.requires_pre_auth() && !sasl_done && !is_pre_auth(api_key) {
                 return error_body(spec, header.api_version, ERR_CLUSTER_AUTHORIZATION_FAILED);
+            }
+            // KIP-368: past the advertised re-auth deadline only the
+            // SASL/ApiVersions APIs are served — the client owes a
+            // fresh token before anything else goes through.
+            if session_expired && !is_pre_auth(api_key) {
+                return error_body(spec, header.api_version, ERR_SASL_AUTHENTICATION_FAILED);
             }
         }
 

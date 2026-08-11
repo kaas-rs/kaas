@@ -9,6 +9,8 @@
 //!   `SuperUserAuthorizer` wrapper.
 //! - [`scram`] — SCRAM-SHA-512 server state machine.
 //! - [`plain`] — SASL PLAIN (static-credential path; K8s SA is Phase 7).
+//! - [`oauth`] — SASL/OAUTHBEARER + OIDC JWT validation against a
+//!   hot-swapped JWKS (gh #42; the fetch loop lives in `bins/kaas`).
 //! - [`mtls`] — peer-cert principal extraction.
 //! - [`principal_mapping`] — `ssl.principal.mapping.rules` parser
 //!   (gh #43, KIP-371).
@@ -25,6 +27,7 @@ pub mod credentials;
 pub mod engine;
 pub mod errors;
 pub mod mtls;
+pub mod oauth;
 pub mod plain;
 pub mod principal_mapping;
 pub mod quota;
@@ -38,6 +41,7 @@ pub use credentials::{CredentialLoader, CredentialStore, ScramInfo};
 pub use engine::{AllowAllAuthEngine, AuthEngine, RealAuthEngine, SaslExchange};
 pub use errors::AuthError;
 pub use mtls::extract_principal as extract_mtls_principal;
+pub use oauth::{OauthConfig, OauthEngine, OauthValidator};
 pub use plain::PlainExchange;
 pub use principal_mapping::PrincipalMapper;
 pub use quota::{Clock, NoQuotaChecker, QuotaChecker, QuotaEnforcer, RealClock};

@@ -235,6 +235,7 @@ async fn produce_fetch_metadata_roundtrip() {
         advertised_host: Some("127.0.0.1".to_owned()),
         tls: None,
         authentication_type: None,
+        oauth: None,
     }];
     let broker = build_test_broker(topic, 1);
     let dispatcher = build_dispatcher(broker.clone(), &listeners);

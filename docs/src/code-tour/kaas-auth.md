@@ -1,6 +1,6 @@
 # kaas-auth
 
-SCRAM-SHA-512 and SASL PLAIN, mTLS principal mapping, ACL evaluation, and debt-carrying client quotas — loaded from operator-written files with hot-reload.
+SCRAM-SHA-512, SASL PLAIN, and SASL/OAUTHBEARER, mTLS principal mapping, ACL evaluation, and debt-carrying client quotas — loaded from operator-written files with hot-reload.
 
 The security crate, deliberately split along the axis the
 [architecture chapter](../architecture/listeners-auth.md) explains:
@@ -8,7 +8,10 @@ authentication is per-listener, authorization and quotas are cluster-wide.
 
 **Authentication**: `scram.rs` (the SCRAM-SHA-512 server state machine —
 SCRAM-SHA-256 is *not* implemented), `plain.rs` (SASL PLAIN, only offered
-over TLS), `mtls.rs` (peer-cert principal extraction) +
+over TLS), `oauth.rs` (SASL/OAUTHBEARER, KIP-255: RFC 7628 framing + JWT
+validation against a hot-swapped JWKS, `alg` allowlisted, fail-closed
+before the first key fetch — the fetch loop itself lives in `bins/kaas`),
+`mtls.rs` (peer-cert principal extraction) +
 `principal_mapping.rs` (Apache's `ssl.principal.mapping.rules` syntax,
 KIP-371 — parse errors fail at startup), `engine.rs` + `selector.rs` (the
 `AuthEngine` seam and its per-listener selection), `credentials.rs` (the

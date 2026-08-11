@@ -390,7 +390,9 @@ observability:
 #   - `authentication.type`: "none" (ANONYMOUS principal) /
 #     "scram-sha-512" (SASL/SCRAM, RealAuthEngine wired) /
 #     "mtls" (requires tls: true; broker extracts CN as principal)
-#     / "plain" (SASL/PLAIN against the ServiceAccount JWT path).
+#     / "plain" (SASL/PLAIN against the ServiceAccount JWT path)
+#     / "oauth" (SASL/OAUTHBEARER, gh #42: JWTs validated against an
+#     OIDC issuer's JWKS — see the disabled `oauth` example below).
 #
 # `mtls` requires `tls: true`; every other combination is legal.
 # Names are user-chosen strings; they appear in
@@ -471,6 +473,49 @@ listeners:
     tls: false
     authentication:
       type: scram-sha-512
+
+  - name: oauth
+    # SASL/OAUTHBEARER listener (gh #42, Strimzi-style `type: oauth`).
+    # Clients present an OAuth 2 access token (JWT) from the issuer
+    # below; the broker validates it locally against the issuer's
+    # JWKS — signature, exp/nbf, iss, optionally aud — and takes the
+    # principal from `userNameClaim`. No client secret lives on the
+    # broker.
+    #
+    # `tls: true` is effectively required: the broker refuses
+    # OAUTHBEARER over plaintext (a bearer token on the wire is a
+    # reusable credential). The chart's internal-TLS Certificate
+    # covers this listener like any other tls listener.
+    enabled: false
+    port: 9096
+    type: internal
+    tls: true
+    authentication:
+      type: oauth
+      # Exact-match `iss` claim (EntraID shape shown; any OIDC
+      # issuer works).
+      validIssuerUri: "https://login.microsoftonline.com/<tenant>/v2.0"
+      # Where the broker fetches signing keys, re-fetched every
+      # jwksRefreshSeconds (default 300) and early on unknown-kid.
+      jwksEndpointUri: "https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys"
+      # Claim that becomes the Kafka principal (`User:<value>`).
+      # EntraID service principals: `sub` = the SP object id, i.e.
+      # the same GUID a Strimzi KafkaUser for this workload names.
+      userNameClaim: sub
+      # Optional second claim tried when userNameClaim is absent.
+      # fallbackUserNameClaim: preferred_username
+      # Audience pinning: when true, the token's `aud` must contain
+      # clientId. Off by default (matches the Strimzi listener this
+      # was ported against).
+      # checkAudience: true
+      # clientId: "api://kaas"
+      # jwksRefreshSeconds: 300
+      # KIP-368 re-authentication: when set, a successful auth
+      # advertises session_lifetime_ms = min(this, token remaining
+      # lifetime) and the broker refuses requests past the deadline
+      # until the client re-authenticates. Unset = sessions outlive
+      # their token (Apache's default with connections.max.reauth.ms=0).
+      maxSecondsWithoutReauthentication: 3600
 
 # gh #97: cluster DNS suffix used to build per-broker FQDNs the
 # broker advertises in MetadataResponse for internal-type

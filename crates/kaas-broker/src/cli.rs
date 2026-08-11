@@ -62,8 +62,27 @@ pub struct ListenerEntry {
     pub tls: Option<TlsConfig>,
     /// Optional SASL mechanism / mTLS mode. `None` ↔ "none"
     /// (anonymous listener). Recognised values:
-    /// `"scram-sha-512"`, `"plain"`, `"mtls"`.
+    /// `"scram-sha-512"`, `"plain"`, `"mtls"`, `"oauth"`.
     pub authentication_type: Option<String>,
+    /// OAuth validation config; `Some` iff `authentication_type` is
+    /// `"oauth"` (gh #42). The required fields are enforced at parse
+    /// time so a broken oauth listener fails boot, not first auth.
+    pub oauth: Option<OauthListenerConfig>,
+}
+
+/// Strimzi `KafkaListenerAuthenticationOAuth` field names, carried
+/// verbatim from the chart through `KAAS_LISTENERS`.
+#[derive(Debug, Clone)]
+pub struct OauthListenerConfig {
+    pub valid_issuer_uri: String,
+    pub jwks_endpoint_uri: String,
+    pub user_name_claim: Option<String>,
+    pub fallback_user_name_claim: Option<String>,
+    pub check_audience: bool,
+    pub client_id: Option<String>,
+    /// Default 300 (Strimzi's `jwksRefreshSeconds` default).
+    pub jwks_refresh_seconds: u64,
+    pub max_seconds_without_reauthentication: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for ListenerEntry {
@@ -102,6 +121,25 @@ impl<'de> Deserialize<'de> for ListenerEntry {
         struct AuthField {
             #[serde(rename = "type")]
             ty: String,
+            #[serde(flatten)]
+            oauth: OauthRaw,
+        }
+
+        /// All-optional capture of the oauth fields so a partial
+        /// block yields a *named* missing-field error below instead
+        /// of silently deserializing to nothing.
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct OauthRaw {
+            valid_issuer_uri: Option<String>,
+            jwks_endpoint_uri: Option<String>,
+            user_name_claim: Option<String>,
+            fallback_user_name_claim: Option<String>,
+            #[serde(default)]
+            check_audience: bool,
+            client_id: Option<String>,
+            jwks_refresh_seconds: Option<u64>,
+            max_seconds_without_reauthentication: Option<u64>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -139,10 +177,45 @@ impl<'de> Deserialize<'de> for ListenerEntry {
             Some(TlsField::Config(cfg)) => Some(cfg),
         };
 
-        let authentication_type = raw
-            .authentication_type
-            .or_else(|| raw.authentication.map(|a| a.ty))
-            .filter(|s| s != "none");
+        let (authentication_type, oauth_raw) = match raw.authentication {
+            Some(a) => (raw.authentication_type.or(Some(a.ty)), Some(a.oauth)),
+            None => (raw.authentication_type, None),
+        };
+        let authentication_type = authentication_type.filter(|s| s != "none");
+
+        // gh #42: an oauth listener's required fields fail the parse
+        // (and therefore boot) rather than falling back to the
+        // anonymous engine at runtime.
+        let oauth = if authentication_type.as_deref() == Some("oauth") {
+            let o = oauth_raw.unwrap_or_default();
+            let require = |field: Option<String>, name: &str| {
+                field.filter(|s| !s.is_empty()).ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "listener {:?}: authentication.type oauth requires {name}",
+                        raw.name
+                    ))
+                })
+            };
+            let cfg = OauthListenerConfig {
+                valid_issuer_uri: require(o.valid_issuer_uri, "validIssuerUri")?,
+                jwks_endpoint_uri: require(o.jwks_endpoint_uri, "jwksEndpointUri")?,
+                user_name_claim: o.user_name_claim,
+                fallback_user_name_claim: o.fallback_user_name_claim,
+                check_audience: o.check_audience,
+                client_id: o.client_id,
+                jwks_refresh_seconds: o.jwks_refresh_seconds.unwrap_or(300),
+                max_seconds_without_reauthentication: o.max_seconds_without_reauthentication,
+            };
+            if cfg.check_audience && cfg.client_id.is_none() {
+                return Err(D::Error::custom(format!(
+                    "listener {:?}: checkAudience requires clientId",
+                    raw.name
+                )));
+            }
+            Some(cfg)
+        } else {
+            None
+        };
 
         Ok(Self {
             name: raw.name,
@@ -150,6 +223,7 @@ impl<'de> Deserialize<'de> for ListenerEntry {
             advertised_host: raw.advertised_host,
             tls,
             authentication_type,
+            oauth,
         })
     }
 }
@@ -486,6 +560,79 @@ mod tests {
         assert!(v[0].authentication_type.is_none()); // "none" folds to None
         assert_eq!(v[1].addr, "0.0.0.0:9095");
         assert_eq!(v[1].authentication_type.as_deref(), Some("scram-sha-512"));
+    }
+
+    #[test]
+    fn oauth_listener_parses_with_strimzi_field_names() {
+        std::env::set_var("KAAS_TLS_CERT_FILE", "/tls/tls.crt");
+        let v: Vec<ListenerEntry> = serde_json::from_str(
+            r#"[{
+                "name":"oauth","port":9096,"type":"internal","tls":true,
+                "authentication":{
+                    "type":"oauth",
+                    "validIssuerUri":"https://login.microsoftonline.com/tenant/v2.0",
+                    "jwksEndpointUri":"https://login.microsoftonline.com/tenant/discovery/v2.0/keys",
+                    "userNameClaim":"sub",
+                    "maxSecondsWithoutReauthentication":3600
+                }
+            }]"#,
+        )
+        .unwrap();
+        assert_eq!(v[0].authentication_type.as_deref(), Some("oauth"));
+        let o = v[0].oauth.as_ref().unwrap();
+        assert_eq!(
+            o.valid_issuer_uri,
+            "https://login.microsoftonline.com/tenant/v2.0"
+        );
+        assert_eq!(
+            o.jwks_endpoint_uri,
+            "https://login.microsoftonline.com/tenant/discovery/v2.0/keys"
+        );
+        assert_eq!(o.user_name_claim.as_deref(), Some("sub"));
+        assert_eq!(o.jwks_refresh_seconds, 300, "default applies");
+        assert_eq!(o.max_seconds_without_reauthentication, Some(3600));
+        assert!(!o.check_audience);
+    }
+
+    #[test]
+    fn oauth_listener_missing_required_field_fails_parse() {
+        // jwksEndpointUri absent → boot-time error naming the field,
+        // not a silent fall-through to the anonymous engine.
+        let err = serde_json::from_str::<Vec<ListenerEntry>>(
+            r#"[{
+                "name":"oauth","port":9096,"type":"internal","tls":true,
+                "authentication":{"type":"oauth","validIssuerUri":"https://x/v2.0"}
+            }]"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("jwksEndpointUri"), "{err}");
+    }
+
+    #[test]
+    fn oauth_check_audience_requires_client_id() {
+        let err = serde_json::from_str::<Vec<ListenerEntry>>(
+            r#"[{
+                "name":"oauth","port":9096,"type":"internal","tls":true,
+                "authentication":{
+                    "type":"oauth",
+                    "validIssuerUri":"https://x/v2.0",
+                    "jwksEndpointUri":"https://x/keys",
+                    "checkAudience":true
+                }
+            }]"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("clientId"), "{err}");
+    }
+
+    #[test]
+    fn non_oauth_listener_ignores_oauth_fields() {
+        let v: Vec<ListenerEntry> = serde_json::from_str(
+            r#"[{"name":"authed","port":9095,"type":"internal","tls":false,
+                 "authentication":{"type":"scram-sha-512"}}]"#,
+        )
+        .unwrap();
+        assert!(v[0].oauth.is_none());
     }
 
     #[test]

@@ -31,8 +31,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use kaas_auth::{
     AclEngine, AllowAllAuthEngine, AllowAllAuthorizer, AuthEngine, AuthEngineSelector, Authorizer,
-    CredentialLoader, NoQuotaChecker, PerListenerAuthEngine, PrincipalMapper, QuotaChecker,
-    QuotaEnforcer, RealAuthEngine, SuperUserAuthorizer,
+    CredentialLoader, NoQuotaChecker, OauthEngine, OauthValidator, PerListenerAuthEngine,
+    PrincipalMapper, QuotaChecker, QuotaEnforcer, RealAuthEngine, SuperUserAuthorizer,
 };
 use kaas_broker::{
     AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, AlterClientQuotasHandler,
@@ -54,7 +54,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Hot-reload interval for credentials.json + acls.json. 10 s
 /// mtime poll. Swapping in `notify` inotify is an open follow-up.
@@ -532,6 +532,10 @@ async fn main() -> Result<()> {
     // Spawn the credential / ACL reloader before the listeners go up
     // so the first served request sees the latest disk state.
     let _reload_task = spawn_reloader(auth.creds.clone(), auth.acls.clone());
+    // JWKS fetch loops for oauth listeners (gh #42) — same slot in
+    // the boot order and for the same reason: until the first fetch
+    // lands, oauth clients are rejected rather than waved through.
+    let _jwks_tasks = spawn_jwks_refreshers(&auth.oauth_validators);
 
     let dispatcher = build_dispatcher(
         broker.clone(),
@@ -742,6 +746,9 @@ struct AuthSetup {
     creds: Option<Arc<CredentialLoader>>,
     acls: Option<Arc<AclEngine>>,
     principal_mapper: Arc<PrincipalMapper>,
+    /// One validator per oauth listener (gh #42); each needs a JWKS
+    /// fetch loop spawned once the runtime is up.
+    oauth_validators: Vec<Arc<OauthValidator>>,
 }
 
 fn build_auth(cli: &Cli) -> Result<AuthSetup> {
@@ -767,6 +774,7 @@ fn build_auth(cli: &Cli) -> Result<AuthSetup> {
             creds: None,
             acls: None,
             principal_mapper: mapper,
+            oauth_validators: Vec::new(),
         });
     }
 
@@ -807,6 +815,7 @@ fn build_auth(cli: &Cli) -> Result<AuthSetup> {
     // same rule — a listener the map somehow misses must not dodge
     // the requirement.
     let mut engines_map = PerListenerAuthEngine::new(anonymous_engine.clone());
+    let mut oauth_validators: Vec<Arc<OauthValidator>> = Vec::new();
     for lc in &cli.listeners {
         let engine_for_listener: Arc<dyn AuthEngine> =
             match lc.authentication_type.as_deref().unwrap_or("none") {
@@ -820,6 +829,45 @@ fn build_auth(cli: &Cli) -> Result<AuthSetup> {
                     anonymous_engine.clone()
                 }
                 "scram-sha-512" | "plain" | "mtls" => real_engine.clone(),
+                "oauth" => {
+                    // Parse guarantees `oauth` is Some for this type.
+                    let Some(oc) = lc.oauth.clone() else {
+                        anyhow::bail!(
+                            "listener {:?}: authentication.type oauth without oauth config",
+                            lc.name
+                        );
+                    };
+                    if lc.tls.is_none() {
+                        // The authenticate handler refuses OAUTHBEARER
+                        // over plaintext, so this listener would be
+                        // un-authenticatable — say so at boot.
+                        warn!(
+                            listener = lc.name.as_str(),
+                            "oauth listener has tls: false — OAUTHBEARER is rejected over \
+                             plaintext (bearer tokens are reusable credentials); clients will \
+                             not be able to authenticate"
+                        );
+                    }
+                    let validator = Arc::new(OauthValidator::new(kaas_auth::OauthConfig {
+                        valid_issuer_uri: oc.valid_issuer_uri,
+                        jwks_endpoint_uri: oc.jwks_endpoint_uri,
+                        user_name_claim: oc.user_name_claim,
+                        fallback_user_name_claim: oc.fallback_user_name_claim,
+                        check_audience: oc.check_audience,
+                        client_id: oc.client_id,
+                        jwks_refresh_seconds: oc.jwks_refresh_seconds,
+                        max_seconds_without_reauthentication: oc
+                            .max_seconds_without_reauthentication,
+                    }));
+                    info!(
+                        listener = lc.name.as_str(),
+                        issuer = validator.config().valid_issuer_uri.as_str(),
+                        jwks = validator.config().jwks_endpoint_uri.as_str(),
+                        "oauth listener configured (gh #42)"
+                    );
+                    oauth_validators.push(validator.clone());
+                    Arc::new(OauthEngine::new(validator))
+                }
                 other => {
                     warn!(
                     listener = lc.name.as_str(),
@@ -867,6 +915,7 @@ fn build_auth(cli: &Cli) -> Result<AuthSetup> {
         creds: Some(creds),
         acls: Some(acls),
         principal_mapper: mapper,
+        oauth_validators,
     })
 }
 
@@ -891,6 +940,98 @@ fn spawn_reloader(
             }
         }
     }))
+}
+
+/// One JWKS fetch loop per oauth listener (gh #42). The validator
+/// itself is pure-sync (it sits on the SASL hot path); this loop is
+/// the only thing that does network I/O: fetch the JWKS document,
+/// push it in via `install_jwks`, repeat every `jwksRefreshSeconds`.
+/// Failures keep the previous key set — the failure mode of an
+/// unreachable issuer is stale keys, never no validation. Two extra
+/// wrinkles: until the first successful fetch we retry on a short
+/// interval (boot race against the issuer), and a kid-miss recorded
+/// by the validator (`take_refresh_hint`) pulls the next fetch
+/// forward to ride out issuer key rotation, rate-limited so a flood
+/// of bad tokens can't turn the broker into a JWKS-hammering client.
+fn spawn_jwks_refreshers(validators: &[Arc<OauthValidator>]) -> Vec<tokio::task::JoinHandle<()>> {
+    const BOOT_RETRY_SECS: u64 = 10;
+    const HINT_POLL_SECS: u64 = 2;
+    const HINT_MIN_PAUSE_SECS: u64 = 10;
+
+    validators
+        .iter()
+        .cloned()
+        .map(|v| {
+            tokio::spawn(async move {
+                let endpoint = v.config().jwks_endpoint_uri.clone();
+                let refresh = std::time::Duration::from_secs(v.config().jwks_refresh_seconds);
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(err) => {
+                        error!(%err, jwks = endpoint.as_str(), "jwks: HTTP client build failed — oauth listener will reject all tokens");
+                        return;
+                    }
+                };
+                loop {
+                    let fetched = match client.get(&endpoint).send().await {
+                        Ok(resp) => match resp.error_for_status() {
+                            Ok(resp) => match resp.text().await {
+                                Ok(body) => match v.install_jwks(&body) {
+                                    Ok(n) => {
+                                        info!(jwks = endpoint.as_str(), keys = n, "jwks: refreshed");
+                                        true
+                                    }
+                                    Err(err) => {
+                                        warn!(%err, jwks = endpoint.as_str(), "jwks: parse failed — keeping previous keys");
+                                        false
+                                    }
+                                },
+                                Err(err) => {
+                                    warn!(%err, jwks = endpoint.as_str(), "jwks: body read failed");
+                                    false
+                                }
+                            },
+                            Err(err) => {
+                                warn!(%err, jwks = endpoint.as_str(), "jwks: fetch returned error status");
+                                false
+                            }
+                        },
+                        Err(err) => {
+                            warn!(%err, jwks = endpoint.as_str(), "jwks: fetch failed");
+                            false
+                        }
+                    };
+
+                    let wait = if fetched || v.has_keys() {
+                        refresh
+                    } else {
+                        std::time::Duration::from_secs(BOOT_RETRY_SECS)
+                    };
+                    let fetch_done = tokio::time::Instant::now();
+                    let deadline = fetch_done + wait;
+                    loop {
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let poll = std::time::Duration::from_secs(HINT_POLL_SECS).min(deadline - now);
+                        tokio::time::sleep(poll).await;
+                        // kid-miss hint: refetch early, but never more
+                        // than once per HINT_MIN_PAUSE_SECS.
+                        if tokio::time::Instant::now() - fetch_done
+                            >= std::time::Duration::from_secs(HINT_MIN_PAUSE_SECS)
+                            && v.take_refresh_hint()
+                        {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
 }
 
 /// The engine plus, when it is disk-backed, the concrete handle.
@@ -1028,7 +1169,12 @@ fn build_dispatcher(
         2,
         Arc::new(DescribeClusterHandler::new(broker.clone(), listeners)),
     );
-    d.register(17, 0, 1, Arc::new(SaslHandshakeHandler::new()));
+    d.register(
+        17,
+        0,
+        1,
+        Arc::new(SaslHandshakeHandler::new(engines.clone())),
+    );
     d.register(18, 0, 4, Arc::new(ApiVersionsHandler::new()));
     d.register(
         22,

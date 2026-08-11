@@ -214,7 +214,7 @@ See `values.yaml` for the full set of tunables. Common overrides:
 | `auth.enabled` | true | Enable credentials.json/acls.json loading |
 | `auth.requireSasl` | false | Anonymous listeners require SASL too — every connection must authenticate before any non-handshake API (gh #251) |
 | `auth.sslPrincipalMappingRules` | `""` | Apache `ssl.principal.mapping.rules` (KIP-371): regex rules mapping mTLS subject DNs to principals |
-| `listeners[]` | plain/external/authed | Strimzi-shape listener array (gh #126): per-entry `name`, `port`, `type`, `tls`, `authentication.type`, `enabled` — see values.yaml comments |
+| `listeners[]` | plain/external/authed/oauth | Strimzi-shape listener array (gh #126): per-entry `name`, `port`, `type`, `tls`, `authentication.type`, `enabled` — see values.yaml comments. `authentication.type: oauth` (gh #42) adds `validIssuerUri`, `jwksEndpointUri`, `userNameClaim`, `fallbackUserNameClaim`, `checkAudience`+`clientId`, `jwksRefreshSeconds`, `maxSecondsWithoutReauthentication` (Strimzi field names, passed to the broker verbatim) |
 | `authorization.type` | `""` | Cluster-wide authorization: `""` (off) or `simple` (ACL-based) |
 | `authorization.superUsers` | `[]` | Principals that bypass ACL evaluation |
 | `broker.flushIntervalMessages` | 1 | `KAAS_FLUSH_INTERVAL_MESSAGES` durability dial |

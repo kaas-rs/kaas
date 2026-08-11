@@ -220,6 +220,7 @@ mod tests {
                 advertised_host: None,
                 tls: None,
                 authentication_type: None,
+                oauth: None,
             },
             ListenerEntry {
                 name: "authed".to_owned(),
@@ -227,6 +228,7 @@ mod tests {
                 advertised_host: Some("kaas-0.kaas-brokers".to_owned()),
                 tls: None,
                 authentication_type: None,
+                oauth: None,
             },
         ]
     }

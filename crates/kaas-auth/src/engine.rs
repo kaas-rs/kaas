@@ -33,6 +33,15 @@ pub trait SaslExchange: Send + std::fmt::Debug {
 
     /// Authenticated principal (only valid after `done = true`).
     fn principal(&self) -> Option<&Principal>;
+
+    /// KIP-368: how long the authenticated session may live before
+    /// the client must re-authenticate, in milliseconds. `0` = no
+    /// re-authentication demanded (the default for every mechanism
+    /// except OAUTHBEARER with `maxSecondsWithoutReauthentication`
+    /// set). Only meaningful once `done = true`.
+    fn session_lifetime_ms(&self) -> i64 {
+        0
+    }
 }
 
 pub trait AuthEngine: Send + Sync + std::fmt::Debug + 'static {
@@ -48,6 +57,15 @@ pub trait AuthEngine: Send + Sync + std::fmt::Debug + 'static {
     /// listener until SASL completes. `AllowAllAuthEngine` returns
     /// `false`; `RealAuthEngine` returns `true`.
     fn requires_pre_auth(&self) -> bool;
+
+    /// SASL mechanisms this engine serves, in `SaslHandshake`
+    /// advertisement order (clients pick the first match). The
+    /// default is the credential-store pair; `OauthEngine` overrides
+    /// with `["OAUTHBEARER"]` so an oauth listener never advertises a
+    /// mechanism it would reject at authenticate time.
+    fn mechanisms(&self) -> &'static [&'static str] {
+        &["SCRAM-SHA-512", "PLAIN"]
+    }
 }
 
 #[derive(Debug)]

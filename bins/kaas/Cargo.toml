@@ -23,6 +23,7 @@ kaas-auth            = { path = "../../crates/kaas-auth" }
 kaas-broker          = { path = "../../crates/kaas-broker", features = ["cr-writer"] }
 parking_lot        = { workspace = true }
 kube               = { workspace = true }
+reqwest            = { workspace = true }
 kaas-codec           = { path = "../../crates/kaas-codec" }
 kaas-controller      = { path = "../../crates/kaas-controller" }
 kaas-coordinator     = { path = "../../crates/kaas-coordinator" }
@@ -46,6 +47,9 @@ rcgen      = { workspace = true }
 sha2       = { workspace = true }
 kaas-auth    = { path = "../../crates/kaas-auth", features = ["test-helpers"] }
 tempfile   = { workspace = true }
+ring       = { workspace = true }
+serde_json = { workspace = true }
+wiremock   = { workspace = true }
 
 [lints]
 workspace = true

@@ -31,8 +31,8 @@ entry combines three independent axes:
 - **`tls`**: `false` / `true`. `mtls` authentication implies
   `tls: true`; everything else is independent.
 - **`authentication.type`**: `none` / `scram-sha-512` / `mtls` /
-  `plain`. Each listener gets its own auth engine, selected by listener
-  *name* — a free-form string the chart picks.
+  `plain` / `oauth`. Each listener gets its own auth engine, selected
+  by listener *name* — a free-form string the chart picks.
 
 Running one listener per combination is normal — e.g. keep `plain`
 anonymous for in-cluster bench/UI traffic and add an `authed` SCRAM
@@ -97,6 +97,72 @@ An mTLS listener satisfies the same gate at the TLS handshake instead:
 the server extracts the principal from the client certificate (through
 the KIP-371 principal-mapping rules below) and marks the connection
 authenticated before any Kafka API arrives.
+
+## OAuth listeners (SASL/OAUTHBEARER)
+
+If you have pointed a Strimzi listener at an OIDC provider —
+`oauth.valid.issuer.uri`, `oauth.jwks.endpoint.uri` — the kaas shape
+will look familiar. An `oauth` listener authenticates clients with the
+OAUTHBEARER mechanism (KIP-255): the client obtains an OAuth 2 access
+token (a JWT) from an external issuer — EntraID, Keycloak, Dex — and
+presents it during the SASL exchange. The broker validates the token
+**locally**: signature against the issuer's published JWKS, `exp`/`nbf`
+with 60 s clock-skew allowance, exact `iss` match, and optionally
+`aud`. No introspection round-trip per connection, no client secret on
+the broker.
+
+```yaml
+listeners:
+  - name: oauth
+    port: 9096
+    type: internal
+    tls: true                # required in practice — see below
+    authentication:
+      type: oauth
+      validIssuerUri: "https://login.microsoftonline.com/<tenant>/v2.0"
+      jwksEndpointUri: "https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys"
+      userNameClaim: sub
+      maxSecondsWithoutReauthentication: 3600
+```
+
+The Kafka principal is `User:<claim>` with the claim configurable
+(`userNameClaim`, default `sub`; a `fallbackUserNameClaim` is tried
+when the primary is absent) — for an EntraID service principal, `sub`
+is the SP object id, so ACLs written for that GUID match the same
+identity Strimzi sees. The signing keys are re-fetched every
+`jwksRefreshSeconds` (default 300), with an early re-fetch when a
+token names an unknown key id — an issuer rotating its keys costs one
+rejected connection attempt, not five minutes of failures. Until the
+first successful JWKS fetch every token is rejected: an unreachable
+issuer means clients cannot authenticate, never that validation is
+skipped.
+
+Four deliberate hard edges:
+
+- **OAUTHBEARER requires TLS.** A bearer token on the wire is a
+  reusable credential — anyone who reads it can be you until it
+  expires. kaas refuses the mechanism on plaintext connections, same
+  as it refuses SASL PLAIN (SCRAM, which sends proofs rather than
+  secrets, stays allowed on plaintext).
+- **The `alg` header is an allowlist** (`RS256`/`RS384`/`RS512`/
+  `ES256`), never trusted from the token: `none` and the HMAC family
+  are rejected outright, which closes the classic algorithm-confusion
+  attack where an HS256 token is "signed" with the public JWKS bytes.
+- **Re-authentication is bounded (KIP-368).** With
+  `maxSecondsWithoutReauthentication` set, a successful authentication
+  advertises `session_lifetime_ms = min(configured, token remaining
+  lifetime)` and the broker refuses further requests past the deadline
+  until the client re-authenticates on the same connection — a
+  connection cannot outlive its token by more than the configured
+  bound. Re-authentication may not change the principal. Unset, the
+  session is unbounded — the same default as Apache Kafka's
+  `connections.max.reauth.ms=0`.
+- **A rejected token fails in two steps**, per RFC 7628: the broker
+  answers with a JSON `{"status":"invalid_token"}` challenge, the
+  client acknowledges, and only then does the exchange fail with
+  `SASL_AUTHENTICATION_FAILED` (58). The JSON body is deliberately
+  content-free; the reason (expired, wrong issuer, unknown key) goes
+  to the broker log.
 
 Once a principal is on the connection, Produce/Fetch and the admin
 surfaces consult the single cluster-wide authorizer and quota checker —
@@ -164,3 +230,12 @@ themselves; adversarial ones are a known gap tracked in the
 - ACL evaluation: `crates/kaas-auth/src/acls.rs`.
 - Principal mapping: `crates/kaas-auth/src/principal_mapping.rs`
   (gh #43).
+- OAUTHBEARER + JWT/JWKS validation: `crates/kaas-auth/src/oauth.rs`
+  (gh #42). The validator is pure-sync (SASL hot path); the JWKS HTTP
+  fetch loop lives in `bins/kaas/src/main.rs`
+  (`spawn_jwks_refreshers`), mirroring the credentials/ACL hot-reload
+  split. Config field names mirror Strimzi's
+  `KafkaListenerAuthenticationOAuth` 1:1 and travel chart →
+  `KAAS_LISTENERS` → `crates/kaas-broker/src/cli.rs`. End-to-end
+  smoke: `bins/kaas/tests/oauth_smoke.rs` (TLS listener + wiremock
+  JWKS + ES256 tokens).

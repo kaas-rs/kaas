@@ -167,6 +167,7 @@ mod tests {
             advertised_host: advertised.map(str::to_owned),
             tls: None,
             authentication_type: None,
+            oauth: None,
         }
     }
 

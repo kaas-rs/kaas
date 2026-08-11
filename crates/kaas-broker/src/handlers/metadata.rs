@@ -322,6 +322,7 @@ mod tests {
                 advertised_host: None,
                 tls: None,
                 authentication_type: None,
+                oauth: None,
             },
             ListenerEntry {
                 name: "external".to_owned(),
@@ -329,6 +330,7 @@ mod tests {
                 advertised_host: Some("broker-0.cluster.local".to_owned()),
                 tls: None,
                 authentication_type: None,
+                oauth: None,
             },
         ]
     }

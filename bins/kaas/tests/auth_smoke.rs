@@ -188,7 +188,12 @@ fn build_dispatcher(
         10,
         Arc::new(MetadataHandler::new(broker.clone(), listeners)),
     );
-    d.register(17, 0, 1, Arc::new(SaslHandshakeHandler::new()));
+    d.register(
+        17,
+        0,
+        1,
+        Arc::new(SaslHandshakeHandler::new(engines.clone())),
+    );
     d.register(18, 0, 4, Arc::new(ApiVersionsHandler::new()));
     d.register(22, 0, 4, Arc::new(InitProducerIdHandler::new(broker)));
     d.register(
@@ -319,6 +324,7 @@ async fn scram_handshake_then_authenticate_unblocks_produce() {
         advertised_host: Some("127.0.0.1".to_owned()),
         tls: None,
         authentication_type: Some("scram-sha-512".to_owned()),
+        oauth: None,
     }];
     let dispatcher = build_dispatcher(broker, &listeners, engines);
     let (cancel, port) = spawn_server(dispatcher).await;
@@ -406,6 +412,7 @@ async fn acl_denies_unconfigured_topic() {
         advertised_host: Some("127.0.0.1".to_owned()),
         tls: None,
         authentication_type: Some("scram-sha-512".to_owned()),
+        oauth: None,
     }];
     let dispatcher = build_dispatcher(broker, &listeners, engines);
     let (cancel, port) = spawn_server(dispatcher).await;
@@ -440,6 +447,7 @@ async fn produce_exceeds_quota_returns_throttle() {
         advertised_host: Some("127.0.0.1".to_owned()),
         tls: None,
         authentication_type: Some("scram-sha-512".to_owned()),
+        oauth: None,
     }];
     let dispatcher = build_dispatcher(broker, &listeners, engines);
     let (cancel, port) = spawn_server(dispatcher).await;

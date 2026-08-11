@@ -82,6 +82,17 @@ x509-parser    = "0.16"
 rand           = "0.8"
 subtle         = "2.6"
 pbkdf2         = { version = "0.12", default-features = false, features = ["hmac"] }
+ring           = "0.17"
+
+# HTTP client (JWKS fetch, gh #42). Already in the tree transitively
+# via opentelemetry-otlp; webpki roots because the broker image is
+# distroless and may carry no system CA bundle. The `-no-provider`
+# variant matters: the plain feature pulls rustls's aws-lc-rs default
+# provider, and with two providers enabled every rustls builder in
+# the process (including the broker's own TLS listeners) panics with
+# "could not automatically determine the process-level CryptoProvider"
+# — ring must stay the single enabled provider.
+reqwest        = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider"] }
 
 # axum (healthz, metrics endpoints)
 axum           = "0.7"

@@ -120,9 +120,19 @@ var without escape gymnastics.
 {{- $out := list -}}
 {{- range .Values.listeners -}}
 {{- if or (not (hasKey . "enabled")) .enabled -}}
-{{- $auth := "none" -}}
+{{- $authDict := dict "type" "none" -}}
 {{- if .authentication -}}
-{{- $auth = .authentication.type | default "none" -}}
+{{- /* gh #42: pass the whole authentication block through (minus
+       chart-only keys, of which there are none today) so oauth's
+       validIssuerUri / jwksEndpointUri / userNameClaim /
+       checkAudience / clientId / jwksRefreshSeconds /
+       maxSecondsWithoutReauthentication reach the broker verbatim.
+       The broker's parser owns validation and fails boot on a
+       partial oauth block. */ -}}
+{{- $authDict = deepCopy .authentication -}}
+{{- if not (hasKey $authDict "type") -}}
+{{- $_ := set $authDict "type" "none" -}}
+{{- end -}}
 {{- end -}}
 {{- $tls := false -}}
 {{- if hasKey . "tls" -}}
@@ -133,7 +143,7 @@ var without escape gymnastics.
   "port" (.port | int)
   "type" .type
   "tls" $tls
-  "authentication" (dict "type" $auth)) -}}
+  "authentication" $authDict) -}}
 {{- end -}}
 {{- end -}}
 {{- $out | toJson -}}

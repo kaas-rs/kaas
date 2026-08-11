@@ -18,6 +18,13 @@ pub enum AuthError {
     #[error("auth: bad certificate")]
     BadCertificate,
 
+    /// OAUTHBEARER token rejection. The reason is deliberately coarse
+    /// — it is client-visible via `SaslAuthenticate.error_message`,
+    /// so it names the check that failed, never key material or
+    /// issuer internals.
+    #[error("auth: invalid token: {0}")]
+    InvalidToken(String),
+
     #[error("auth: io: {0}")]
     Io(#[from] io::Error),
 

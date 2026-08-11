@@ -416,6 +416,7 @@ impl Harness {
             advertised_host: Some("127.0.0.1".to_owned()),
             tls: None,
             authentication_type: None,
+            oauth: None,
         }];
         // One tempdir holds both the disk engine's segments and the
         // cluster dir (txn_state, offsets, etc.). Lives for the

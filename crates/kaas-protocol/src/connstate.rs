@@ -41,6 +41,12 @@ pub struct ConnState {
     /// `SaslAuthenticate` calls. Lives here so a multi-step
     /// mechanism (SCRAM) doesn't need a side-channel state map.
     pub sasl_state: Option<Box<dyn SaslExchange>>,
+    /// KIP-368 session deadline. `Some` when the completed SASL
+    /// exchange advertised a bounded `session_lifetime_ms`
+    /// (OAUTHBEARER with `maxSecondsWithoutReauthentication`); past
+    /// it the dispatcher serves only the SASL APIs until the client
+    /// re-authenticates. `None` = unbounded session.
+    pub session_deadline: Option<std::time::Instant>,
 }
 
 impl ConnState {
@@ -53,6 +59,7 @@ impl ConnState {
             sasl_done: false,
             sasl_mechanism: None,
             sasl_state: None,
+            session_deadline: None,
         }
     }
 
