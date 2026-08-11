@@ -31,6 +31,7 @@ History so far:
 | `v0.1.3-preview`   | Coordinator caps initial rebalance delay for new groups.         |
 | …                  | (patch line through `v0.2.47-preview`)                           |
 | `v0.3.0-preview`   | SASL/OAUTHBEARER listener auth (gh #42, KIP-255). Minor bump for the new authentication surface; CRDs unchanged, so it rolls in place from `v0.2.47-preview`. |
+| `v0.3.1-preview`   | Authorization-only `KafkaUser`s (gh #42): `spec.authentication` optional, for OAuth principals. CRD change is a required→optional relaxation (existing CRs still validate), so it still rolls in place — but the chart does not upgrade CRDs, so apply `deploy/crds/kaas.rs_kafkausers.yaml` before the CR. |
 
 > **Note on the `v0.3.0` minor bump.** The default rule is patch-only.
 > This release takes a minor bump deliberately — it adds a new
