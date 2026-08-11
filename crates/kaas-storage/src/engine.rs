@@ -333,6 +333,15 @@ pub trait StorageEngine: Send + Sync + 'static {
         None
     }
 
+    /// gh #168: how many open partitions are currently poisoned by a
+    /// fsync failure (`flush_err` set, appends answering `Stalled`).
+    /// Feeds `/healthz`'s `storage_stalled` so a stalled substrate is
+    /// visible to ops instead of only to producers as retriable
+    /// errors. Default 0 — the memory/dev engine never fsyncs.
+    fn stalled_partitions(&self) -> usize {
+        0
+    }
+
     /// SIGTERM-time drain: close every open partition so the next
     /// leader doesn't hit NFS silly-rename pain on takeover
     /// (gh #61 + gh #139). Default impl is a no-op — `MemoryStorage`

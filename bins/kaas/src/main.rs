@@ -1504,9 +1504,11 @@ impl kaas_observability::health::RuntimeState for BrokerRuntimeState {
         (self.partitions_assigned() - self.partitions_led()).max(0)
     }
     fn storage_stalled(&self) -> bool {
-        // The engine exposes stall only via per-append errors today;
-        // the gh #95 healthz surface is still a follow-up.
-        false
+        // gh #168: any open partition whose committer is poisoned by a
+        // fsync failure. Report-only — a stalled log dir doesn't gate
+        // readiness (Apache serves the healthy dirs too), and the
+        // gh #168 re-arm probe clears it when the substrate recovers.
+        self.0.engine.stalled_partitions() > 0
     }
     fn serving(&self) -> bool {
         // gh #208: takeover of every assigned partition is complete.

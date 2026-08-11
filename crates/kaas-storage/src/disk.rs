@@ -586,6 +586,13 @@ impl StorageEngine for DiskStorageEngine {
         self.iter_partition_keys()
     }
 
+    fn stalled_partitions(&self) -> usize {
+        self.partitions
+            .iter()
+            .filter(|kv| kv.value().is_stalled())
+            .count()
+    }
+
     async fn drain(&self) -> Result<(), StorageError> {
         self.relinquish_all().await
     }

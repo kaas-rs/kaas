@@ -31,7 +31,12 @@ const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 const ERR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
 const ERR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
 const ERR_INVALID_PRODUCER_EPOCH: i16 = 47;
-const ERR_GENERIC: i16 = -1; // KAFKA_STORAGE_ERROR equivalent
+const ERR_GENERIC: i16 = -1; // UNKNOWN_SERVER_ERROR
+/// gh #168: what Apache answers when the log dir behind a partition
+/// fails (ENOSPC, EIO). Retriable on the client (triggers a metadata
+/// refresh) but named — a full disk no longer reads as "unknown
+/// server error".
+const ERR_KAFKA_STORAGE_ERROR: i16 = 56;
 
 #[derive(Debug)]
 pub struct ProduceHandler {
@@ -271,6 +276,9 @@ fn map_error(topic: &str, index: i32, err: &StorageError) -> produce::PartitionR
         // far better than accepting the write into a directory that is
         // about to be renamed out from under us.
         StorageError::StaleTopicDir => ERR_LEADER_NOT_AVAILABLE,
+        // gh #168: a raw filesystem failure on the append path (ENOSPC,
+        // EIO) is Apache's KAFKA_STORAGE_ERROR, not an anonymous -1.
+        StorageError::Io(_) => ERR_KAFKA_STORAGE_ERROR,
         _ => ERR_GENERIC,
     };
     error_partition_bumped(topic, index, code)

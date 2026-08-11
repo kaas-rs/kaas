@@ -1043,6 +1043,18 @@ impl Partition {
         Ok(new_log_start)
     }
 
+    /// gh #168: is this partition's committer poisoned by a fsync
+    /// failure right now? `try_lock` on purpose — a mutex held by a
+    /// hung fsync must not turn the health probe into a hostage; the
+    /// window where the poison is being set reads as "not stalled"
+    /// for one probe tick, which is fine for an observability signal.
+    pub fn is_stalled(&self) -> bool {
+        self.inner
+            .try_lock()
+            .map(|g| g.flush_err.is_some())
+            .unwrap_or(false)
+    }
+
     /// Lock-free HWM read via the published snapshot.
     pub fn high_watermark(&self) -> i64 {
         self.snapshot.load().high_water
@@ -1415,6 +1427,82 @@ fn persist_state_locked(
 // Committer task
 // ---------------------------------------------------------------------------
 
+/// gh #168: how often the committer probes a stalled substrate for
+/// recovery. Chosen well above typical fsync latency so probes never
+/// compete with real traffic, and low enough that a freed-up disk
+/// (ENOSPC cleared, NFS back) re-arms within seconds.
+const REARM_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// gh #168: recover a partition from a sticky `flush_err` instead of
+/// leaving it poisoned until leadership moves or the broker restarts
+/// (the pre-fix contract — "operator must restart the broker").
+///
+/// Two phases per attempt, because the failure modes differ:
+///
+/// 1. **Substrate probe, off the partition lock**: write + fsync +
+///    unlink a tiny sidecar file in the partition dir. While the
+///    substrate is still bad (ENOSPC, EIO, unresponsive NFS) this
+///    fails or hangs *without* holding the partition mutex, so
+///    appenders keep failing fast with `Stalled` rather than parking
+///    behind a probe.
+/// 2. **Real re-arm, under the lock**: one `sync_log` of the active
+///    segment. Only on its success is `flush_err` cleared — the probe
+///    file proving the filesystem answers says nothing about the
+///    log's own dirty pages. The completed seq adopts the value
+///    sampled under the same lock as the sync (never one sampled
+///    after — the gh #232 invariant), so nothing is ever reported
+///    durable that the sync didn't cover.
+///
+/// Known residual, deliberately out of scope: a *hung* fsync holds
+/// the partition mutex from inside its `spawn_blocking`, so until the
+/// kernel returns, phase 2 (and appenders) would block behind it —
+/// the probe's `try_lock` dir read just keeps sleeping in that case
+/// and recovery begins once the kernel call drains.
+async fn probe_and_rearm(inner: &Arc<Mutex<PartitionInner>>, cond: &Arc<Notify>, fs: &Arc<dyn Fs>) {
+    loop {
+        tokio::time::sleep(REARM_PROBE_INTERVAL).await;
+
+        // Phase 1 — substrate probe, no partition lock held.
+        let Some(dir) = inner.try_lock().map(|g| g.dir.clone()) else {
+            continue;
+        };
+        let fs_probe = fs.clone();
+        let probe = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let path = dir.join(".fsync-probe");
+            let mut f = fs_probe.create(&path)?;
+            f.write_all(b"kaas fsync probe")?;
+            f.sync_all()?;
+            drop(f);
+            let _ = fs_probe.remove(&path);
+            Ok(())
+        })
+        .await;
+        if !matches!(probe, Ok(Ok(()))) {
+            continue;
+        }
+
+        // Phase 2 — the substrate answers; re-sync the log for real.
+        let inner_sync = inner.clone();
+        let synced = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+            let mut guard = inner_sync.lock();
+            guard.active.sync_log()?;
+            Ok(guard.requested_flush_seq)
+        })
+        .await;
+        if let Ok(Ok(covered_seq)) = synced {
+            {
+                let mut guard = inner.lock();
+                guard.flush_err = None;
+                if covered_seq > guard.completed_flush_seq {
+                    guard.completed_flush_seq = covered_seq;
+                }
+            }
+            cond.notify_waiters();
+            return;
+        }
+    }
+}
+
 fn spawn_committer(
     inner: Arc<Mutex<PartitionInner>>,
     cond: Arc<Notify>,
@@ -1486,33 +1574,43 @@ fn spawn_committer(
                     cond.notify_waiters();
                 }
                 Ok(Ok(Err(io_err))) => {
-                    let mut guard = inner.lock();
-                    if guard.flush_err.is_none() {
-                        guard.flush_err = Some(StorageError::Io(io_err));
+                    {
+                        let mut guard = inner.lock();
+                        if guard.flush_err.is_none() {
+                            guard.flush_err = Some(StorageError::Io(io_err));
+                        }
                     }
-                    drop(guard);
                     cond.notify_waiters();
+                    probe_and_rearm(&inner, &cond, &fs).await;
                 }
                 Ok(Err(_join_err)) => {
                     // spawn_blocking panicked — treat as Stalled.
-                    let mut guard = inner.lock();
-                    if guard.flush_err.is_none() {
-                        guard.flush_err = Some(StorageError::Stalled);
+                    {
+                        let mut guard = inner.lock();
+                        if guard.flush_err.is_none() {
+                            guard.flush_err = Some(StorageError::Stalled);
+                        }
                     }
-                    drop(guard);
                     cond.notify_waiters();
+                    probe_and_rearm(&inner, &cond, &fs).await;
                 }
                 Err(_elapsed) => {
                     // Timeout (gh #95). The orphaned spawn_blocking
                     // task is still running; that's fine — it drains
                     // when the kernel eventually returns. We set
                     // sticky Stalled and move on.
-                    let mut guard = inner.lock();
-                    if guard.flush_err.is_none() {
-                        guard.flush_err = Some(StorageError::Stalled);
+                    {
+                        let mut guard = inner.lock();
+                        if guard.flush_err.is_none() {
+                            guard.flush_err = Some(StorageError::Stalled);
+                        }
                     }
-                    drop(guard);
                     cond.notify_waiters();
+                    // gh #168: park in the probe loop until the
+                    // substrate recovers, then clear the poison. New
+                    // flush requests queue on the capacity-1 channel
+                    // meanwhile; appends fail fast on `flush_err`.
+                    probe_and_rearm(&inner, &cond, &fs).await;
                 }
             }
         }
@@ -2109,6 +2207,47 @@ mod tests {
             assert_eq!(aborted[0].producer_id, 42);
             assert_eq!(aborted[0].first_offset, 0);
             assert_eq!(p.last_stable_offset(), p.high_watermark());
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #168: a sticky `flush_err` heals once the substrate answers
+    /// again — the probe loop clears the poison and appends resume,
+    /// instead of the partition staying dead until a restart. Takes
+    /// ~5 s (one real probe interval); the slow path is the point.
+    #[test]
+    fn a_transient_stall_rearms_and_appends_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
+
+            // Poison the committer the way a transient fsync failure
+            // does.
+            p.inner.lock().flush_err = Some(StorageError::Stalled);
+            assert!(p.is_stalled());
+            assert!(matches!(
+                p.append(0, -1, build_batch(1, 1_000)).await,
+                Err(StorageError::Stalled)
+            ));
+
+            // Drive the probe directly (in production the committer
+            // parks in it right after setting the poison). The tempdir
+            // substrate is healthy, so the first attempt heals.
+            probe_and_rearm(&p.inner, &p.flush.cond, &p.fs).await;
+            assert!(!p.is_stalled(), "probe did not clear the poison");
+            p.append(0, -1, build_batch(1, 1_000))
+                .await
+                .expect("appends must flow again after re-arm");
             p.close().await.unwrap();
         });
     }
