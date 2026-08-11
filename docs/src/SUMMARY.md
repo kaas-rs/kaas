@@ -82,6 +82,11 @@
 # Part IV — Operations
 
 - [Helm chart & listener configuration](operations/helm.md)
+- [CRD reference](operations/crds.md)
+  - [KafkaCluster](operations/crds/kafkacluster.md)
+  - [KafkaTopic](operations/crds/kafkatopic.md)
+  - [KafkaUser](operations/crds/kafkauser.md)
+  - [KafkaClusterAssignments](operations/crds/kafkaclusterassignments.md)
 - [Storage substrate requirements](operations/storage.md)
 - [Releasing](operations/releasing.md)
 - [Performance vs Strimzi](operations/performance.md)

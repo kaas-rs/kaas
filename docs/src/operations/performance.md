@@ -15,38 +15,45 @@ absolute environment.
 The `bench-compare-v2` harness runs both systems through the same client
 matrix: plain and idempotent produce (5 producer pods, 1 KB records,
 `acks=all`), group and no-group consume, a consumer-group scale-up, and
-a Kafka Streams wordcount. The 2026-07-21 → 2026-07-23 series (kaas
-`v0.2.18-preview`, 3 brokers, **default honest fsync** — the equivalent
-of `log.flush.interval.messages=1`; Strimzi/Kafka 4.2.0, 3 brokers)
-gives, as ranges across runs:
+a Kafka Streams wordcount. The 2026-08-01 → 2026-08-11 series (kaas
+`v0.2.27-preview` → `v0.3.1-preview`, 3 brokers, **default honest
+fsync** — the equivalent of `log.flush.interval.messages=1`;
+Strimzi/Kafka 4.2.0, 3 brokers) gives, as ranges across runs:
 
 | Scenario | kaas / Strimzi throughput | Read |
 |---|---|---|
-| produce, `acks=all` | **1.66× – 2.70×** (typically ~1.7–1.8×) | kaas leads, with p99 latency 2–3× lower |
-| produce, idempotent | **1.71× – 4.48×** (typically ~1.9×) | kaas leads |
-| consume (group) | **0.95× – 1.02×** | reproducibly at parity |
-| consume (no group) | 0.19× – 2.01× | noise-dominated; kaas typically trails on raw fan-out reads |
+| produce, `acks=all` | **1.73× – 2.02×** (typically ~1.85–1.9×) | kaas leads, with p99 latency 3–4× lower |
+| produce, idempotent | **1.88× – 2.11×** (typically ~1.95×) | kaas leads; idempotence costs kaas nothing measurable |
+| consume (group) | **0.90× – 1.06×** | reproducibly at parity |
+| consume (no group) | 0.23× – 5.51× | noise-dominated in both directions; no verdict |
+
+One 4.94× produce run and one 0.54× group-consume run in the series
+are excluded as outliers per the methodology below; the ranges quote
+the reproducible band. The tightening versus the July series (which
+ranged up to 2.70×/4.48×) is better measurement, not regression — the
+July highs were single-run artifacts.
 
 From the most recent report
-(`docs/perf-results/bench-compare-v2-20260723-063513Z.md`): produce
-20.2 MB/s vs 12.2 MB/s summed across producers, with p50 7.7 s vs
-11.9 s and p99 9.8 s vs 24.2 s under saturation; group consume
-127.6 vs 126.0 MB/s.
+(`docs/perf-results/bench-compare-v2-20260811-164056Z.md`, kaas
+`v0.3.1-preview`): produce 23.5 MB/s vs 11.6 MB/s summed across
+producers, with p50 6.5 s vs 12.4 s and p99 8.2 s vs 30.8 s under
+saturation; idempotent produce 23.6 vs 11.2 MB/s; group consume 86.7
+vs 95.9 MB/s; the Kafka Streams wordcount passes on both systems with
+identical settle times.
 
 Two scenarios are deliberately not summarized into a verdict: the
 **no-group consume** spread is too wide to call anything but noisy on
-this rig, and the **rebalance scale-up** comparison is currently
-polluted by harness artifacts (runs where one side's pod logs are
-missed produce nonsense ratios) — a green number you can't trust is
-worse than no number, so it stays unquoted until the harness reports
-both sides cleanly.
+this rig (0.23× and 5.51× appear in the same week), and the
+**rebalance scale-up** comparison remains polluted by harness
+artifacts — runs where one side's pod logs are missed, or where the
+consumers drain the input inside a single reporting interval, produce
+nonsense ratios. A green number you can't trust is worse than no
+number, so both stay unquoted until the harness reports cleanly.
 
 Earlier results that showed kaas *behind* on produce predate two fixes
 that invalidated them: a broker bug where the flush-interval setting
 was parsed but dropped, and a NAS cabling fault that capped the storage
-link at ~10 MB/s until 2026-07-12. An earlier headline of 3.7× came
-from a single run with a relaxed flush interval; the series above
-supersedes it.
+link at ~10 MB/s until 2026-07-12.
 
 ## Why the shapes differ
 
@@ -61,6 +68,40 @@ how an honest-fsync broker ends up ahead of a page-cache-ack broker on
 a substrate where COMMIT latency dominates. The flush-interval dial
 ([storage](./storage.md)) trades durability back toward Apache's
 posture where page-cache-equivalent semantics are acceptable.
+
+## What sets the produce ceiling
+
+On a slow-fsync substrate the produce ceiling obeys Little's law:
+
+> throughput = concurrent durable writes × bytes per write ÷ write round-trip
+
+and the model is exact here, not approximate. Measured on this NAS at
+a single broker: 4.8 concurrent writes × ~49.6 KB per write ÷ 16.6 ms
+COMMIT round-trip predicts 14.4 MB/s; the bench observed 14.42 MB/s.
+The practical consequence is that almost nothing you would
+instinctively tune moves the number, because none of it moves any of
+the three terms. Tested and flat: broker CPU 2 → 6 cores (+0.5%),
+partition count 16 → 64 (flat throughput, worse tail latency), client
+`max.in.flight.requests.per.connection` 5 → 20 (nothing), and internal
+lock restructuring around the fsync (nothing — see the dead-ends
+below). The NFS transport itself idles at ~14% link utilisation, so
+the bottleneck is latency, not bandwidth.
+
+What does move it:
+
+- **The flush interval** (skipping the durability wait entirely):
+  3.2× — but that is a durability trade, not an optimisation.
+- **Faster storage** (lower COMMIT latency): directly proportional.
+- **Broker count**: 3 brokers reproducibly deliver ~1.58× one broker
+  (~23 vs ~14.4–15.1 MB/s) — which is why the head-to-head series
+  above runs 3 brokers as the representative configuration.
+  Honesty note: the *mechanism* is an open question. All three broker
+  pods share one node — one kernel NFS client, one transport — so
+  none of the per-broker explanations tested so far accounts for it.
+
+Before optimising this path, compute the Little's-law budget from the
+NFS mount's own counters (write ops, bytes sent, round-trip time in
+`mountstats`) and check which term the change would actually move.
 
 ## Methodology
 
@@ -86,3 +127,14 @@ new evidence: PGO builds, `FADV_SEQUENTIAL` on segment reads, and
 flush-interval `0` (pure throughput mode) all failed to move
 steady-state numbers meaningfully on this substrate — the NFS COMMIT
 round-trip, not CPU or readahead, is the dominant cost.
+
+One dead-end deserves its own warning label: **moving the fsync off
+the partition lock** (syncing a cloned file descriptor so appends
+proceed during the COMMIT). It was built and measured — writes grew
+2.9% larger, throughput did not move (Little's law again: it changes
+no term) — and then deliberately reverted, because it made an
+easy-to-break invariant load-bearing for durability: the flush
+sequence published to waiting producers had to be the one sampled
+*before* the sync, and nothing structural prevented a tidy-minded
+refactor from silently acking unsynced data. Don't rebuild it without
+new evidence that the budget above has changed.
