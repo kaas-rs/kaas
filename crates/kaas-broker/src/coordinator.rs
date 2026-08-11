@@ -354,6 +354,19 @@ impl GroupAssignmentSource for Coordinator {
         let (brokers, alive) = a.broker_sets();
         pick_group_coordinator(group_id, &brokers, &alive)
     }
+
+    /// gh #167: the offset-file fence is the assignment the ownership
+    /// answers above were derived from. Zero before the first apply —
+    /// but `owns_group` answers `false` then too, so nothing commits.
+    fn assignment_fence(&self) -> kaas_coordinator::offset_store::FenceStamp {
+        match self.current.load_full() {
+            Some(a) => kaas_coordinator::offset_store::FenceStamp {
+                controller_epoch: a.controller_epoch,
+                assignment_version: a.assignment_version,
+            },
+            None => kaas_coordinator::offset_store::FenceStamp::default(),
+        }
+    }
 }
 
 // --- TxnAssignmentSource impl (gh #91) -------------------------------

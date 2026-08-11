@@ -69,16 +69,52 @@ fn key_has_topic(key: &str, topic: &str) -> bool {
     }
 }
 
+/// gh #167 handoff fence: the assignment under which the writer
+/// believed itself coordinator, compared lexicographically —
+/// `controller_epoch` orders across controller reigns,
+/// `assignment_version` within one. Both are monotonic, so "newer
+/// assignment" is a total order. Derived `Ord` uses field order;
+/// keep `controller_epoch` first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FenceStamp {
+    #[serde(default)]
+    pub controller_epoch: i64,
+    #[serde(default)]
+    pub assignment_version: i64,
+}
+
+impl FenceStamp {
+    fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// gh #167: an offset write refused because the on-disk file was
+/// stamped by a newer assignment — this broker's view of "I am the
+/// coordinator" is stale, and a whole-map rewrite from its cache
+/// would erase every commit the real coordinator has taken since.
+/// Surfaced to clients as `NOT_COORDINATOR`.
+#[derive(Debug, thiserror::Error)]
+#[error("offset write fenced: on-disk assignment {on_disk:?} newer than local {local:?}")]
+pub struct FencedOffsetWrite {
+    pub on_disk: FenceStamp,
+    pub local: FenceStamp,
+}
+
 /// gh #21 v2 envelope — the only shape written or read. Note the
 /// serde default: an unrecognised payload (e.g. the old v1 plain map)
 /// decodes as an empty envelope rather than erroring, which is why
-/// nothing may write any other shape.
+/// nothing may write any other shape. The gh #167 `fence` field is
+/// additive: files written before it decode as the zero stamp, which
+/// any writer may overwrite.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct OffsetFileV2 {
     #[serde(default)]
     offsets: HashMap<String, i64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     metadata: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "FenceStamp::is_zero")]
+    fence: FenceStamp,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +128,11 @@ struct Inner {
     /// gh #27 in-flight transactional offset commits keyed on
     /// `(group_id, producer_id)`. Memory-only.
     pending: HashMap<PendingKey, HashMap<String, i64>>,
+    /// Groups whose cache may be ahead of disk (last write failed or
+    /// was fenced). The gh #167 skip-unchanged fast path must not
+    /// fire for these — an "unchanged" commit is only unchanged
+    /// relative to the cache, and here the cache isn't persisted.
+    dirty: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -100,10 +141,23 @@ struct PendingKey {
     producer_id: i64,
 }
 
-#[derive(Debug)]
 pub struct OffsetStore {
     root: PathBuf,
     state: RwLock<Inner>,
+    /// gh #167: where the current assignment fence comes from — the
+    /// broker `Coordinator` in production (wired by
+    /// `Manager::set_group_assignment_source`, same hot-swap seam as
+    /// group ownership), absent in dev/tests (zero stamp: fence
+    /// effectively off, matching the single-writer reality there).
+    fence_source: RwLock<Option<Box<dyn Fn() -> FenceStamp + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for OffsetStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OffsetStore")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OffsetStore {
@@ -113,7 +167,35 @@ impl OffsetStore {
         Self {
             root: root.into(),
             state: RwLock::new(Inner::default()),
+            fence_source: RwLock::new(None),
         }
+    }
+
+    /// Install the gh #167 fence source. Every subsequent disk write
+    /// is stamped with the assignment it was made under and refuses
+    /// to overwrite a file stamped by a newer one.
+    pub fn set_fence_source(&self, src: impl Fn() -> FenceStamp + Send + Sync + 'static) {
+        *self.fence_source.write() = Some(Box::new(src));
+    }
+
+    fn current_fence(&self) -> FenceStamp {
+        self.fence_source
+            .read()
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default()
+    }
+
+    /// The fence stamp on a group's on-disk file. `None` when the file
+    /// is absent or unreadable — the fence is defense-in-depth, and
+    /// refusing commits on a transient read hiccup would be a worse
+    /// failure than the race it guards.
+    fn on_disk_fence(&self, group_id: &str) -> Option<FenceStamp> {
+        let path = self.dir().join(format!("{group_id}.json"));
+        let data = std::fs::read(&path).ok()?;
+        serde_json::from_slice::<OffsetFileV2>(&data)
+            .ok()
+            .map(|f| f.fence)
     }
 
     fn dir(&self) -> PathBuf {
@@ -193,24 +275,38 @@ impl OffsetStore {
         offsets: HashMap<String, i64>,
         metadata: HashMap<String, String>,
     ) -> io::Result<()> {
-        let (merged_offsets, merged_meta) = {
+        let (merged_offsets, merged_meta, changed) = {
             let mut s = self.state.write();
+            let mut changed = false;
             let cached = s.cache.entry(group_id.to_owned()).or_default();
             for (k, v) in offsets {
-                cached.insert(k, v);
+                if cached.insert(k, v) != Some(v) {
+                    changed = true;
+                }
             }
             let cached_meta = s.metadata.entry(group_id.to_owned()).or_default();
             for (k, v) in metadata {
                 if v.is_empty() {
-                    cached_meta.remove(&k);
-                } else {
-                    cached_meta.insert(k, v);
+                    changed |= cached_meta.remove(&k).is_some();
+                } else if cached_meta.insert(k, v.clone()) != Some(v) {
+                    changed = true;
                 }
             }
             let off = s.cache.get(group_id).cloned().unwrap_or_default();
             let meta = s.metadata.get(group_id).cloned().unwrap_or_default();
-            (off, meta)
+            (off, meta, changed || s.dirty.contains(group_id))
         };
+
+        // gh #167 (write amplification): an idle consumer re-commits
+        // the same offsets every interval; when the merge moved
+        // nothing the on-disk file is already right, so skip the
+        // rewrite entirely. Correct because the cache is write-through
+        // — everything in it was persisted by a previous successful
+        // write, and the dirty set (folded into `changed` above)
+        // excludes the groups where that's not true.
+        if !changed {
+            return Ok(());
+        }
 
         self.write_group(group_id, merged_offsets, merged_meta)
     }
@@ -226,9 +322,41 @@ impl OffsetStore {
         offsets: HashMap<String, i64>,
         metadata: HashMap<String, String>,
     ) -> io::Result<()> {
-        let payload = OffsetFileV2 { offsets, metadata };
+        // gh #167 handoff fence: read-compare-write, same shape as the
+        // partition manifest's `write_unless_superseded`. A whole-map
+        // rewrite from a stale coordinator doesn't merely roll offsets
+        // back — partitions committed only at the new coordinator are
+        // *absent* from the stale cache, so the loser's write erases
+        // them and an `auto.offset.reset=latest` consumer then skips
+        // its backlog. NFS has no compare-and-swap, so a racing write
+        // landing between our read and rename remains possible — the
+        // same documented residual as the manifest — but the common
+        // failure (a laggard broker whose assignment view is a poll
+        // behind) is fenced deterministically.
+        let local = self.current_fence();
+        if let Some(on_disk) = self.on_disk_fence(group_id) {
+            if on_disk > local {
+                self.state.write().dirty.insert(group_id.to_owned());
+                return Err(io::Error::other(FencedOffsetWrite { on_disk, local }));
+            }
+        }
+        let payload = OffsetFileV2 {
+            offsets,
+            metadata,
+            fence: local,
+        };
         let name = format!("{group_id}.json");
-        atomic_write_json(&self.dir(), &name, &payload)
+        let res = atomic_write_json(&self.dir(), &name, &payload);
+        let mut s = self.state.write();
+        match &res {
+            Ok(()) => {
+                s.dirty.remove(group_id);
+            }
+            Err(_) => {
+                s.dirty.insert(group_id.to_owned());
+            }
+        }
+        res
     }
 
     /// Committed offsets for the given `(topic, partitions[])` set.
@@ -281,6 +409,7 @@ impl OffsetStore {
             let mut s = self.state.write();
             s.cache.remove(group_id);
             s.metadata.remove(group_id);
+            s.dirty.remove(group_id);
         }
         let path = self.dir().join(format!("{group_id}.json"));
         match std::fs::remove_file(&path) {
@@ -786,5 +915,127 @@ mod tests {
     fn group_ids_on_disk_is_empty_without_a_directory() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(store(tmp.path()).group_ids_on_disk().is_empty());
+    }
+
+    // --- gh #167 handoff fence + write amplification ------------------
+
+    fn stamp(epoch: i64, version: i64) -> FenceStamp {
+        FenceStamp {
+            controller_epoch: epoch,
+            assignment_version: version,
+        }
+    }
+
+    /// The gh #167 race: the old coordinator's whole-map rewrite from
+    /// its stale cache must not erase commits the new coordinator has
+    /// taken. The loser gets a distinguishable error (mapped to
+    /// NOT_COORDINATOR upstream) and the winner's file survives.
+    #[test]
+    fn a_stale_coordinators_write_is_fenced_and_the_winners_offsets_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Old coordinator at assignment (3, 5) commits — its cache
+        // holds t1/0=10.
+        let old = store(tmp.path());
+        old.set_fence_source(|| stamp(3, 5));
+        old.commit("g1", one("t1", 0, 10)).unwrap();
+
+        // Handoff: the new coordinator (same controller reign, later
+        // assignment version) loads and commits fresh work.
+        let new = store(tmp.path());
+        new.set_fence_source(|| stamp(3, 6));
+        new.load("g1").unwrap();
+        new.commit("g1", one("t1", 0, 99)).unwrap();
+
+        // The laggard, still on (3, 5), rewrites from its stale cache.
+        let err = old.commit("g1", one("t1", 1, 11)).unwrap_err();
+        assert!(
+            err.get_ref()
+                .is_some_and(|inner| inner.is::<FencedOffsetWrite>()),
+            "expected FencedOffsetWrite, got {err:?}"
+        );
+
+        // Winner's commit is intact on disk.
+        let fresh = store(tmp.path());
+        fresh.load("g1").unwrap();
+        let got = fresh.fetch(
+            "g1",
+            &[FetchSpec {
+                topic: "t1".to_owned(),
+                partitions: vec![0],
+            }],
+        );
+        assert_eq!(got.get("t1/0"), Some(&99), "stale write clobbered the file");
+    }
+
+    /// Controller failover orders across reigns: epoch outranks
+    /// version.
+    #[test]
+    fn fence_orders_controller_epoch_before_version() {
+        assert!(stamp(4, 0) > stamp(3, 999));
+        assert!(stamp(3, 6) > stamp(3, 5));
+        assert_eq!(stamp(0, 0), FenceStamp::default());
+    }
+
+    /// Pre-gh #167 files carry no stamp and decode as zero — any
+    /// current coordinator may overwrite them (the rolling-upgrade
+    /// path).
+    #[test]
+    fn an_unstamped_legacy_file_is_writable_by_any_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = store(tmp.path()); // no fence source → zero stamp
+        legacy.commit("g1", one("t1", 0, 5)).unwrap();
+
+        let s = store(tmp.path());
+        s.set_fence_source(|| stamp(7, 1));
+        s.load("g1").unwrap();
+        s.commit("g1", one("t1", 0, 6)).unwrap();
+    }
+
+    /// gh #167 write amplification: an idle consumer re-committing
+    /// identical offsets must not rewrite the file.
+    #[test]
+    fn an_unchanged_commit_skips_the_disk_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.commit("g1", one("t1", 0, 42)).unwrap();
+
+        // Remove the file behind the store's back; an unchanged commit
+        // must not bring it back (proof the write was skipped).
+        let path = tmp.path().join("__consumer_offsets/g1.json");
+        std::fs::remove_file(&path).unwrap();
+        s.commit("g1", one("t1", 0, 42)).unwrap();
+        assert!(!path.exists(), "unchanged commit still rewrote the file");
+
+        // A moved offset writes again.
+        s.commit("g1", one("t1", 0, 43)).unwrap();
+        assert!(path.exists());
+    }
+
+    /// The skip must not fire while the cache is ahead of disk — a
+    /// failed write marks the group dirty until a write succeeds.
+    #[test]
+    fn a_failed_write_disables_the_skip_until_a_write_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        // Make the directory un-writable by occupying its path with a
+        // file, so the first commit fails to create it.
+        std::fs::write(tmp.path().join("__consumer_offsets"), b"x").unwrap();
+        s.commit("g1", one("t1", 0, 42)).unwrap_err();
+
+        // Heal the path. The identical re-commit must WRITE (dirty),
+        // not skip.
+        std::fs::remove_file(tmp.path().join("__consumer_offsets")).unwrap();
+        s.commit("g1", one("t1", 0, 42)).unwrap();
+        let fresh = store(tmp.path());
+        fresh.load("g1").unwrap();
+        let got = fresh.fetch(
+            "g1",
+            &[FetchSpec {
+                topic: "t1".to_owned(),
+                partitions: vec![0],
+            }],
+        );
+        assert_eq!(got.get("t1/0"), Some(&42), "dirty group skipped its retry");
     }
 }

@@ -77,6 +77,12 @@ impl<F: Fn(&str) -> Option<BrokerEndpoint> + Send + Sync + 'static> BrokerLookup
 pub trait GroupAssignmentSource: Send + Sync + 'static {
     fn owns_group(&self, group_id: &str) -> bool;
     fn group_coordinator(&self, group_id: &str) -> Option<BrokerId>;
+    /// The assignment this source's answers are based on, as the
+    /// gh #167 offset-file fence stamp. Default zero — dev/test stubs
+    /// have a single writer and nothing to fence.
+    fn assignment_fence(&self) -> crate::offset_store::FenceStamp {
+        crate::offset_store::FenceStamp::default()
+    }
 }
 
 /// gh #91 sibling of [`GroupAssignmentSource`] used by
@@ -182,6 +188,12 @@ impl Manager {
     /// from `bins/kaas/main.rs` after `kaas-broker::Coordinator`
     /// boots (gh #92 hot-swap).
     pub fn set_group_assignment_source(&self, src: Arc<dyn GroupAssignmentSource>) {
+        // gh #167: the offset store's write fence follows the same
+        // source, so every group-file write is stamped with the
+        // assignment it was made under.
+        let fence_src = src.clone();
+        self.offsets
+            .set_fence_source(move || fence_src.assignment_fence());
         *self.group_source.write() = src;
     }
 
@@ -387,6 +399,16 @@ impl Manager {
             .commit_with_metadata(group_id, offsets, metadata)
         {
             Ok(()) => 0,
+            // gh #167: a fenced write means our assignment view is
+            // stale and another broker coordinates this group now —
+            // exactly what NOT_COORDINATOR tells the client, which
+            // then re-runs FindCoordinator instead of retrying here.
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<crate::offset_store::FencedOffsetWrite>()) =>
+            {
+                16
+            }
             // Best-effort: handler logs but reports success per
             // Apache's "offset commit eventual consistency".
             Err(_) => 0,
