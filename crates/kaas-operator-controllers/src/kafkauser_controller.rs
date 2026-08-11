@@ -70,52 +70,72 @@ impl KafkaUserReconciler {
             return Ok(Action::await_change());
         };
 
-        // Build the credential entry for this user.
-        let built = self.build_credential(&user).await;
+        // Authorization-only user (gh #42): no authentication block →
+        // no credential to materialize. The principal authenticates
+        // out-of-band (an OAUTHBEARER token), so we skip
+        // credentials.json entirely and only reconcile its ACLs. Any
+        // stale credential entry from a previous incarnation that DID
+        // carry auth is dropped so a scram→authz-only edit doesn't
+        // leave a live credential behind.
+        let authz_only = user.spec.authentication.is_none();
+        // Output Secret name for the status; empty for authorization-only
+        // users, which have none.
+        let mut secret_name = String::new();
 
-        let (cred, secret_name) = match built {
-            Ok(cb) => cb,
-            Err(ControllerError::SecretNotFound {
-                namespace,
-                name: sname,
-            }) => {
-                // gh #120: NOT an Err — surface as a condition and
-                // park until something changes.
-                let cond = Condition {
-                    type_: READY.into(),
-                    status: Condition::STATUS_FALSE.into(),
-                    observed_generation: user.metadata.generation,
-                    last_transition_time: String::new(),
-                    reason: "SecretNotFound".into(),
-                    message: format!(
-                        "spec.authentication.password references missing secret {namespace}/{sname}"
-                    ),
-                };
-                self.patch_status(&user, |st| set_condition(&mut st.conditions, cond.clone()))
-                    .await?;
-                self.observer.bump_error();
-                return Ok(Action::await_change());
+        if authz_only {
+            let mut cf: CredentialsFile = read_credentials(&self.cluster_dir)?;
+            if cf.remove_user(name) {
+                write_credentials(&self.cluster_dir, &cf)?;
             }
-            Err(other) => {
-                let cond = Condition {
-                    type_: READY.into(),
-                    status: Condition::STATUS_FALSE.into(),
-                    observed_generation: user.metadata.generation,
-                    last_transition_time: String::new(),
-                    reason: "CredentialError".into(),
-                    message: other.to_string(),
-                };
-                self.patch_status(&user, |st| set_condition(&mut st.conditions, cond.clone()))
-                    .await?;
-                self.observer.bump_error();
-                return Err(other);
-            }
-        };
+        } else {
+            // Build the credential entry for this user.
+            let built = self.build_credential(&user).await;
 
-        // Write credentials.json.
-        let mut cf: CredentialsFile = read_credentials(&self.cluster_dir)?;
-        cf.upsert_user(cred);
-        write_credentials(&self.cluster_dir, &cf)?;
+            let (cred, out_secret_name) = match built {
+                Ok(cb) => cb,
+                Err(ControllerError::SecretNotFound {
+                    namespace,
+                    name: sname,
+                }) => {
+                    // gh #120: NOT an Err — surface as a condition and
+                    // park until something changes.
+                    let cond = Condition {
+                        type_: READY.into(),
+                        status: Condition::STATUS_FALSE.into(),
+                        observed_generation: user.metadata.generation,
+                        last_transition_time: String::new(),
+                        reason: "SecretNotFound".into(),
+                        message: format!(
+                            "spec.authentication.password references missing secret {namespace}/{sname}"
+                        ),
+                    };
+                    self.patch_status(&user, |st| set_condition(&mut st.conditions, cond.clone()))
+                        .await?;
+                    self.observer.bump_error();
+                    return Ok(Action::await_change());
+                }
+                Err(other) => {
+                    let cond = Condition {
+                        type_: READY.into(),
+                        status: Condition::STATUS_FALSE.into(),
+                        observed_generation: user.metadata.generation,
+                        last_transition_time: String::new(),
+                        reason: "CredentialError".into(),
+                        message: other.to_string(),
+                    };
+                    self.patch_status(&user, |st| set_condition(&mut st.conditions, cond.clone()))
+                        .await?;
+                    self.observer.bump_error();
+                    return Err(other);
+                }
+            };
+
+            // Write credentials.json.
+            let mut cf: CredentialsFile = read_credentials(&self.cluster_dir)?;
+            cf.upsert_user(cred);
+            write_credentials(&self.cluster_dir, &cf)?;
+            secret_name = out_secret_name;
+        }
 
         // Rebuild acls.json from every KafkaUser in the namespace.
         acls::reconcile_acls(&self.client, &self.namespace, &self.cluster_dir).await?;
@@ -127,10 +147,18 @@ impl KafkaUserReconciler {
             observed_generation: user.metadata.generation,
             last_transition_time: String::new(),
             reason: "CredentialWritten".into(),
-            message: format!(
-                "credentials written for {name} ({})",
-                user.spec.authentication.kind
-            ),
+            message: if authz_only {
+                format!("authorization-only user {name} reconciled (no credential)")
+            } else {
+                format!(
+                    "credentials written for {name} ({})",
+                    user.spec
+                        .authentication
+                        .as_ref()
+                        .map(|a| a.kind.as_str())
+                        .unwrap_or("")
+                )
+            },
         };
         self.patch_status(&user, |st| {
             st.secret = secret_name.clone();
@@ -169,9 +197,16 @@ impl KafkaUserReconciler {
             .as_deref()
             .unwrap_or(&self.namespace);
 
+        // Only reached for authenticated users — the reconcile loop
+        // handles the authorization-only case (no credential) before
+        // calling here.
+        let auth = user.spec.authentication.as_ref().ok_or_else(|| {
+            ControllerError::Other("build_credential called on an authorization-only user".into())
+        })?;
+
         let mut cred = UserCredential {
             username: name.into(),
-            auth_type: user.spec.authentication.kind.clone(),
+            auth_type: auth.kind.clone(),
             scram: None,
             tls_cn: String::new(),
             sa: None,
@@ -182,11 +217,11 @@ impl KafkaUserReconciler {
             }),
         };
 
-        match user.spec.authentication.kind.as_str() {
+        match auth.kind.as_str() {
             "scram-sha-512" => {
                 // gh #104: pre-derived rotation path. When set, pass through
                 // verbatim and skip PBKDF2 + the output Secret.
-                if let Some(s) = user.spec.authentication.scram.as_ref() {
+                if let Some(s) = auth.scram.as_ref() {
                     cred.scram = Some(scram_passthrough(s));
                     return Ok((cred, String::new()));
                 }
@@ -201,9 +236,7 @@ impl KafkaUserReconciler {
                 Ok((cred, out_secret_name))
             }
             "tls" => {
-                let cn = user
-                    .spec
-                    .authentication
+                let cn = auth
                     .certificate_ref
                     .as_ref()
                     .filter(|r| !r.name.is_empty())
@@ -213,18 +246,13 @@ impl KafkaUserReconciler {
                 Ok((cred, String::new()))
             }
             "kubernetes-serviceaccount" => {
-                let sa = user
-                    .spec
-                    .authentication
-                    .service_account_ref
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ControllerError::MalformedCredential(
-                            "spec.authentication.serviceAccountRef required for \
+                let sa = auth.service_account_ref.as_ref().ok_or_else(|| {
+                    ControllerError::MalformedCredential(
+                        "spec.authentication.serviceAccountRef required for \
                              kubernetes-serviceaccount"
-                                .into(),
-                        )
-                    })?;
+                            .into(),
+                    )
+                })?;
                 cred.sa = Some(SaCredential {
                     name: sa.name.clone(),
                     namespace: sa.namespace.clone(),
@@ -249,7 +277,12 @@ impl KafkaUserReconciler {
         user_ns: &str,
         out_secret_name: &str,
     ) -> Result<String, ControllerError> {
-        if let Some(pw_ref) = user.spec.authentication.password.as_ref() {
+        if let Some(pw_ref) = user
+            .spec
+            .authentication
+            .as_ref()
+            .and_then(|a| a.password.as_ref())
+        {
             let api: Api<Secret> = Api::namespaced(self.client.clone(), user_ns);
             return match api.get(&pw_ref.name).await {
                 Ok(s) => {
@@ -473,13 +506,13 @@ mod tests {
                 ..ObjectMeta::default()
             },
             spec: kaas_operator_api::KafkaUserSpec {
-                authentication: KafkaUserAuthentication {
+                authentication: Some(KafkaUserAuthentication {
                     kind: "tls".into(),
                     password: None,
                     scram: None,
                     certificate_ref: None,
                     service_account_ref: None,
-                },
+                }),
                 authorization: None,
                 quotas: None,
             },

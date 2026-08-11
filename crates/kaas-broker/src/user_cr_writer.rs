@@ -126,12 +126,23 @@ mod kube_impl {
                 }
                 Err(e) => return Err(map_kube_err(e)),
             };
-            let auth_type = user.spec.authentication.kind.as_str();
-            if !auth_type.is_empty() && auth_type != "scram-sha-512" {
-                return Err(UserWriteError::InvalidTarget(format!(
-                    "KafkaUser {username} has authentication.type {auth_type:?}; \
-                     SCRAM credential rotation applies to scram-sha-512 users only"
-                )));
+            // An authorization-only user (no authentication block, gh #42)
+            // has no SCRAM mechanism to rotate — reject rather than
+            // stamp one on and silently convert it.
+            match user.spec.authentication.as_ref().map(|a| a.kind.as_str()) {
+                Some("scram-sha-512") | Some("") => {}
+                Some(other) => {
+                    return Err(UserWriteError::InvalidTarget(format!(
+                        "KafkaUser {username} has authentication.type {other:?}; \
+                         SCRAM credential rotation applies to scram-sha-512 users only"
+                    )));
+                }
+                None => {
+                    return Err(UserWriteError::InvalidTarget(format!(
+                        "KafkaUser {username} is authorization-only (no authentication); \
+                         SCRAM credential rotation applies to scram-sha-512 users only"
+                    )));
+                }
             }
 
             let patch = json!({

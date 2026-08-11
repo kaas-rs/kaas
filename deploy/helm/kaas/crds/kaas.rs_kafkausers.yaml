@@ -26,6 +26,8 @@ spec:
           spec:
             properties:
               authentication:
+                description: 'Optional (gh #42): an **authorization-only** user omits it. A principal that authenticates out-of-band — an OAUTHBEARER token validated against the issuer''s JWKS — has no credential for the operator to materialize, so its `KafkaUser` carries only `authorization`/`quotas` and names the principal via `metadata.name` (e.g. the token''s `sub`). This mirrors Strimzi, whose oauth users are authorization-only too. When present, the credential is written to `credentials.json` as before; when absent, only ACLs/quotas are reconciled.'
+                nullable: true
                 properties:
                   certificateRef:
                     description: Used when `type = tls`. The operator stamps the CN into `credentials.json` as the mTLS principal.
@@ -154,8 +156,6 @@ spec:
                     nullable: true
                     type: integer
                 type: object
-            required:
-            - authentication
             type: object
           status:
             nullable: true

@@ -33,7 +33,17 @@ use crate::condition::Condition;
 )]
 #[serde(rename_all = "camelCase")]
 pub struct KafkaUserSpec {
-    pub authentication: KafkaUserAuthentication,
+    /// Optional (gh #42): an **authorization-only** user omits it. A
+    /// principal that authenticates out-of-band — an OAUTHBEARER
+    /// token validated against the issuer's JWKS — has no credential
+    /// for the operator to materialize, so its `KafkaUser` carries
+    /// only `authorization`/`quotas` and names the principal via
+    /// `metadata.name` (e.g. the token's `sub`). This mirrors
+    /// Strimzi, whose oauth users are authorization-only too. When
+    /// present, the credential is written to `credentials.json` as
+    /// before; when absent, only ACLs/quotas are reconciled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<KafkaUserAuthentication>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<KafkaUserAuthorization>,
@@ -185,4 +195,37 @@ pub struct KafkaUserStatus {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_only_user_parses_without_authentication() {
+        // gh #42: an OAUTHBEARER principal has no credential for the
+        // operator to materialize, so its KafkaUser omits
+        // `authentication` and carries only `authorization`.
+        let spec: KafkaUserSpec = serde_json::from_str(
+            r#"{
+                "authorization": {
+                    "type": "simple",
+                    "acls": [
+                        {"resource": {"type": "topic", "name": "kaas-canary-v1"},
+                         "operations": ["Read", "Write", "Describe"]}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(spec.authentication.is_none());
+        assert!(spec.authorization.is_some());
+    }
+
+    #[test]
+    fn authenticated_user_still_parses() {
+        let spec: KafkaUserSpec =
+            serde_json::from_str(r#"{"authentication": {"type": "scram-sha-512"}}"#).unwrap();
+        assert_eq!(spec.authentication.unwrap().kind, "scram-sha-512");
+    }
 }

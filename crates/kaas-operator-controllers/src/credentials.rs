@@ -106,9 +106,12 @@ impl CredentialsFile {
         self.users.push(cred);
     }
 
-    /// Drop the named user (no-op if absent).
-    pub fn remove_user(&mut self, username: &str) {
+    /// Drop the named user. Returns `true` if an entry was actually
+    /// removed, so callers can skip an unchanged rewrite.
+    pub fn remove_user(&mut self, username: &str) -> bool {
+        let before = self.users.len();
         self.users.retain(|u| u.username != username);
+        self.users.len() != before
     }
 
     /// `true` if any entry has the named user.
@@ -296,8 +299,23 @@ mod tests {
     #[test]
     fn remove_user_is_noop_when_absent() {
         let mut cf = CredentialsFile::default();
-        cf.remove_user("nobody");
+        assert!(!cf.remove_user("nobody"), "nothing to remove → false");
         assert!(cf.users.is_empty());
+    }
+
+    #[test]
+    fn remove_user_reports_removal() {
+        let mut cf = CredentialsFile::default();
+        cf.upsert_user(UserCredential {
+            username: "gone".into(),
+            auth_type: "scram-sha-512".into(),
+            scram: None,
+            tls_cn: String::new(),
+            sa: None,
+            quotas: None,
+        });
+        assert!(cf.remove_user("gone"), "removed an entry → true");
+        assert!(!cf.remove_user("gone"), "already gone → false");
     }
 
     #[test]

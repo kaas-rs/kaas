@@ -182,6 +182,18 @@ become entries in `credentials.json` + `acls.json`, which brokers
 hot-reload. `KAAS_AUTH_DISABLED=true` switches the whole subsystem off
 for dev setups.
 
+**Authorization-only users (OAuth principals).** A `KafkaUser`'s
+`spec.authentication` is optional (gh #42). An OAUTHBEARER principal
+authenticates against the issuer, not against a stored credential, so
+there is nothing for the operator to materialize — its `KafkaUser`
+omits `authentication` entirely and carries only `authorization` (and
+optional `quotas`), naming the principal through `metadata.name` (the
+token's `sub` claim). The reconciler writes no `credentials.json`
+entry for it and only contributes its rules to `acls.json`. This
+mirrors Strimzi, whose OAuth users are authorization-only too, and is
+what lets you author ACLs and quotas for a token-authenticated
+identity.
+
 ### mTLS principal mapping (KIP-371)
 
 kaas parses Apache's `ssl.principal.mapping.rules` syntax — regex over
