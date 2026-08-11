@@ -61,7 +61,7 @@ spec:
 | `listeners.external.bootstrapHostname` | Optional convenience hostname added to the certificate SANs (so a single bootstrap address presents a valid certificate). Not required for operation. |
 | `listeners.external.tls.certManager` | When `enabled`, the operator creates one cert-manager `Certificate` covering the per-broker hostnames, issued by `issuerRef` (`kind`: `ClusterIssuer` or `Issuer`; empty defaults to `ClusterIssuer` at reconcile time). |
 | `listeners.external.gateway` | When `enabled`, the operator creates one Gateway-API `TLSRoute` per broker attached to `gatewayRef`, SNI-routing each hostname to that broker's Service. |
-| `listeners.external.service.annotations` | Extra annotations stamped onto the per-broker Services (cloud load-balancer knobs and the like). |
+| `listeners.external.service.annotations` | Declared for extra annotations on the per-broker Services (cloud load-balancer knobs) — **not yet applied**: the reconciler currently ignores this field. |
 
 Everything the operator creates from this CR carries an
 `OwnerReference` back to it, so deleting the `KafkaCluster` lets

@@ -10,7 +10,9 @@ volume, an optional dedicated control-plane volume
 (`storage.controlPlane.enabled`), and one per `storage.pool[]` entry.
 Installation, image derivation, and
 the smoke test live in the chart's own `deploy/helm/kaas/README.md`; this
-chapter covers the concepts that need more than a values table.
+chapter covers the concepts that need more than a values table, and the
+[chart values reference](./helm-values.md) documents every key
+exhaustively.
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \

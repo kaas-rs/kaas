@@ -82,6 +82,7 @@
 # Part IV — Operations
 
 - [Helm chart & listener configuration](operations/helm.md)
+  - [Chart values reference](operations/helm-values.md)
 - [CRD reference](operations/crds.md)
   - [KafkaCluster](operations/crds/kafkacluster.md)
   - [KafkaTopic](operations/crds/kafkatopic.md)
