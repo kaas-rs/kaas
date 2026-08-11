@@ -29,6 +29,15 @@ History so far:
 | `v0.1.1-preview`   | Helm chart honours `auth.enabled=false` via env.                 |
 | `v0.1.2-preview`   | Broker shares one `FlockLock` between engine and produce path.   |
 | `v0.1.3-preview`   | Coordinator caps initial rebalance delay for new groups.         |
+| …                  | (patch line through `v0.2.47-preview`)                           |
+| `v0.3.0-preview`   | SASL/OAUTHBEARER listener auth (gh #42, KIP-255). Minor bump for the new authentication surface; CRDs unchanged, so it rolls in place from `v0.2.47-preview`. |
+
+> **Note on the `v0.3.0` minor bump.** The default rule is patch-only.
+> This release takes a minor bump deliberately — it adds a new
+> authentication mechanism (a user-visible capability), which is what a
+> minor version signals. It changes no CRD schemas, so the
+> CRD-unchanged compatibility promise below still holds: it is an
+> in-place rolling upgrade from the immediately preceding preview.
 
 ## Compatibility policy (pre-v1)
 
