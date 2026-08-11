@@ -1,7 +1,9 @@
 # kaas Helm chart
 
-Deploys the kaas broker StatefulSet and operator Deployment backed by a single
-shared ReadWriteMany PersistentVolumeClaim.
+Deploys the kaas broker StatefulSet and operator Deployment backed by shared
+ReadWriteMany PersistentVolumeClaims — a data volume, plus optionally a
+dedicated control-plane volume (`storage.controlPlane.enabled`) and one PVC
+per `storage.pool[]` entry.
 
 ## Images
 
@@ -42,7 +44,7 @@ repository override is needed:
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
-  --version 0.2.0-preview \
+  --version 0.3.1-preview \
   --namespace kafka --create-namespace \
   --set storage.className=ceph-filesystem \
   --set broker.replicaCount=3
@@ -51,7 +53,7 @@ helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
 See available versions:
 
 ```bash
-helm show all oci://ghcr.io/kaas-rs/charts/kaas --version 0.2.0-preview
+helm show all oci://ghcr.io/kaas-rs/charts/kaas --version 0.3.1-preview
 ```
 
 ### CRDs on upgrade
@@ -62,11 +64,11 @@ CRDs, apply them explicitly before `helm upgrade`:
 
 ```bash
 # Pull the new chart version locally, then apply the CRDs it ships:
-helm pull oci://ghcr.io/kaas-rs/charts/kaas --version 0.2.0-preview --untar
+helm pull oci://ghcr.io/kaas-rs/charts/kaas --version 0.3.1-preview --untar
 kubectl apply -f kaas/crds/
 
 # Or apply them straight from the repo at a specific ref:
-REF=v0.2.0-preview
+REF=v0.3.1-preview
 BASE=https://raw.githubusercontent.com/kaas-rs/kaas/${REF}/deploy/crds
 for f in kaas.rs_kafkaclusters.yaml \
          kaas.rs_kafkatopics.yaml \
@@ -78,7 +80,9 @@ done
 
 ## StorageClass guidance
 
-kaas stores all partition data on a single shared PVC. The StorageClass must
+kaas stores partition data on shared PVCs — the default data volume, plus any
+`storage.pool[]` volumes (mounted at `/vols/<name>`) that topics are placed
+on. The StorageClass must
 support `ReadWriteMany` and provide NFSv4-class semantics: atomic same-directory
 rename, fsync durability, and close-to-open consistency.
 
@@ -210,7 +214,7 @@ See `values.yaml` for the full set of tunables. Common overrides:
 | `storage.controlPlane.enabled` | false | Dedicated control-plane volume (gh #221 phase 1): cluster-wide coordination state (`assignment.json`, txn slots, consumer offsets, credentials/ACLs) moves to its own PVC, mounted at `storage.controlPlane.mountPath` and exported as `KAAS_CLUSTER_DIR`. Enabling on an existing cluster is a breaking change (pre-v1 policy: fresh deploy, or manually copy `/data/__cluster/*` while scaled down). |
 | `storage.controlPlane.size` | 1Gi | Control-plane PVC capacity |
 | `storage.controlPlane.className` | "" | "" → same as `storage.className` |
-| `storage.pool` | [] | Named pool log dirs (gh #221 phase 2): each entry `{name, size, className, accessMode, defaultEligible}` becomes its own RWX PVC mounted at `/vols/<name>` on brokers + operator and advertised via `KAAS_LOG_DIRS`. Topics bind with `KafkaTopic.spec.storage.volumes`; `defaultEligible: false` members only receive topics that name them explicitly. Placement is creation-sticky. |
+| `storage.pool` | [] | Named pool log dirs (gh #221 phase 2): each entry `{name, size, className, accessMode, defaultEligible, cordoned, labels}` becomes its own RWX PVC mounted at `/vols/<name>` on brokers + operator and advertised via `KAAS_LOG_DIRS`. Topics bind with `KafkaTopic.spec.storage.volumes` or by label match with `spec.storage.volumeSelector` (against the entry's `labels`, gh #224); `defaultEligible: false` members only receive topics that name them explicitly; `cordoned: true` refuses new placements (drain primitive). Placement is creation-sticky — the `kaas.rs/migrate-to-volume` annotation drives an explicit data move. |
 | `auth.enabled` | true | Enable credentials.json/acls.json loading |
 | `auth.requireSasl` | false | Anonymous listeners require SASL too — every connection must authenticate before any non-handshake API (gh #251) |
 | `auth.sslPrincipalMappingRules` | `""` | Apache `ssl.principal.mapping.rules` (KIP-371): regex rules mapping mTLS subject DNs to principals |
@@ -218,6 +222,8 @@ See `values.yaml` for the full set of tunables. Common overrides:
 | `authorization.type` | `""` | Cluster-wide authorization: `""` (off) or `simple` (ACL-based) |
 | `authorization.superUsers` | `[]` | Principals that bypass ACL evaluation |
 | `broker.flushIntervalMessages` | 1 | `KAAS_FLUSH_INTERVAL_MESSAGES` durability dial |
+| `broker.minReadySeconds` | 60 | StatefulSet `minReadySeconds`: how long a freshly Ready broker must stay Ready before the rollout proceeds |
+| `broker.retentionCheckIntervalSeconds` | 300 | Retention sweep interval (Apache `log.retention.check.interval.ms`); `0` disables the sweep |
 | `broker.maxMessageBytes` | 1048588 | Apache `message.max.bytes` — broker-wide cap on one Produce batch (gh #253) |
 | `broker.fsyncMaxLatencyMs` | 30000 | fsync watchdog deadline; `0` disables (gh #256) |
 | `broker.controllerLease.durationSeconds` | 15 | Cluster-controller Lease lifetime; lower = faster failover, more etcd writes |
@@ -251,11 +257,13 @@ kcat -b localhost:9092 -t test -C -o beginning -e
 helm uninstall my-kaas -n kafka
 ```
 
-**Note:** the PVC is NOT deleted on uninstall (`helm.sh/resource-policy: keep`
-annotation). Delete it manually if you want to reclaim the storage:
+**Note:** the PVCs are NOT deleted on uninstall (`helm.sh/resource-policy: keep`
+annotation). Delete them manually if you want to reclaim the storage — the data
+PVC, plus the control-plane PVC and any pool PVCs if those were enabled:
 
 ```bash
 kubectl -n kafka delete pvc my-kaas-kaas-data
+kubectl -n kafka get pvc   # any remaining control-plane / pool PVCs
 ```
 
 **Note:** the operator uses **no cleanup finalizers** — deleting CRs never

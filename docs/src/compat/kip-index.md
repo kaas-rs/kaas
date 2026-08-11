@@ -10,15 +10,18 @@ behaviour ships and is exercised by tests or the
 [shell-tool suite](verification.md); **partial** pages lead with what's
 *missing*; non-goals get a rationale in [Non-goals](non-goals.md), not
 silence. Wire-facing KIPs also appear per key in the
-[generated API matrix](api-matrix.md)'s KIPs column.
+[generated API matrix](api-matrix.md)'s KIPs column. The scope is
+Apache Kafka 3.7, with one deliberate post-3.7 exception: DescribeCluster
+v2 (KIP-1073) is served, because kaas has a real fenced broker state and
+no other way to report it — see [KIP-700](kip/kip-700.md).
 
 > Three corrections relative to earlier planning documents, all found by
 > source-verifying during the book build: **KIP-516, KIP-32, KIP-58, and
 > KIP-354 are partial, not implemented.** Topic IDs are minted but not
 > propagated to the wire (KIP-516); LogAppendTime and timestamp lookup
 > don't exist (KIP-32); and the two compaction knobs (KIP-58, KIP-354)
-> are config plumbing without an enforcing compactor — no background
-> cleaner runs at all.
+> remain config plumbing without an enforcing compactor — though the
+> delete-policy retention cleaner now runs (gh #250).
 
 ## Implemented (14)
 
@@ -47,7 +50,7 @@ credibility test.
 | KIP | Landed | Missing | kaas page |
 |---|---|---|---|
 | KIP-32 | CreateTime timestamps round-trip byte-identically; batch `MaxTimestamp` tracked per segment | LogAppendTime entirely; timestamp→offset ListOffsets lookup (`(-1,-1)` sentinel) | [KIP-32](kip/kip-32.md) |
-| KIP-58 | `min.compaction.lag.ms` config plumbing (CR → `.config.json` → DescribeConfigs) | the compactor that would enforce it — no background cleaner runs | [KIP-58](kip/kip-58.md) |
+| KIP-58 | `min.compaction.lag.ms` config plumbing (CR → `.config.json` → DescribeConfigs) | the compactor that would enforce it; the delete-policy retention cleaner does run | [KIP-58](kip/kip-58.md) |
 | KIP-101 | segment filenames carry the leader epoch | leader-epoch cache + lookup (`offset_for_leader_epoch` returns the `(-1,-1)` sentinel); wire key 23 unregistered | [KIP-101](kip/kip-101.md) |
 | KIP-219 | `throttle_time_ms` computed (debt-carry) and returned | the broker never mutes the channel after responding — throttling relies on client cooperation | [KIP-219](kip/kip-219.md) |
 | KIP-345 | `group.instance.id` plumbed through join/sync; static members survive the eviction sweep | `FENCED_INSTANCE_ID` fencing of duplicate static members | [KIP-345](kip/kip-345.md) |
@@ -74,7 +77,8 @@ Rationale for each in [Non-goals](non-goals.md).
 
 ## Implementation notes (for contributors)
 
-The missing compactor/cleaner behind the KIP-58 and KIP-354 rows is
-tracked as gh #158 — no background cleaner is wired at all, including
-the size-based retention cleaner. The corrections in the note above come
+The missing compactor behind the KIP-58 and KIP-354 rows is tracked as
+gh #158 — which now covers only the compactor: size- and time-based
+retention are wired and enforced by the `RetentionCleaner`
+(gh #250). The corrections in the note above come
 from the 2026-07-19 source sweep, recorded on the affected KIP pages.

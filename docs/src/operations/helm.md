@@ -5,13 +5,16 @@ Deploying with the chart: the Strimzi-shape listeners array, cluster-wide author
 The chart at `deploy/helm/kaas/` is the source of truth for production
 configuration — replicas, controller-Lease tuning, storage class, image
 repositories. It deploys the broker `StatefulSet`, the operator
-`Deployment`, and one shared RWX PVC. Installation, image derivation, and
+`Deployment`, and up to three classes of shared RWX PVC: the data
+volume, an optional dedicated control-plane volume
+(`storage.controlPlane.enabled`), and one per `storage.pool[]` entry.
+Installation, image derivation, and
 the smoke test live in the chart's own `deploy/helm/kaas/README.md`; this
 chapter covers the concepts that need more than a values table.
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
-  --version 0.2.4-preview \
+  --version 0.3.1-preview \
   --namespace kafka --create-namespace \
   --set storage.className=<your-rwx-class> \
   --set broker.replicaCount=3
@@ -21,17 +24,21 @@ helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
 
 `.Values.listeners` is a Strimzi-shape array: each entry declares
 `name` (free-form), `port`, `type` (`internal` / `external`), `tls`, an
-`authentication.type` (`none` / `scram-sha-512` / `mtls` / `plain`), and an
-optional `enabled` flag (absence = enabled). The default values ship three
+`authentication.type` (`none` / `scram-sha-512` / `mtls` / `plain` /
+`oauth`), and an
+optional `enabled` flag (absence = enabled). The default values ship four
 entries — `plain` (9092, anonymous), `external` (9093, TLS, disabled by
-default), and `authed` (9095, SCRAM, disabled by default).
+default), `authed` (9095, SCRAM, disabled by default), and `oauth`
+(9096, internal, TLS, SASL/OAUTHBEARER, disabled by default).
 
 The templates iterate the array to emit the StatefulSet container ports,
 the `KAAS_LISTENERS` JSON env the broker parses, the Service ports, and
 the NOTES.txt bootstrap output. The three axes are orthogonal — see
 [Listeners, authentication, authorization](../architecture/listeners-auth.md)
-for how the broker treats them; `mtls` authentication is the only
-combination constraint (it requires `tls: true`).
+for how the broker treats them. Combination constraints: `mtls`
+authentication requires `tls: true`, and the broker refuses `plain` and
+`oauth` (SASL PLAIN / OAUTHBEARER) over non-TLS connections at runtime —
+both send reusable credentials on the wire.
 
 Two behaviours to know before enabling an external listener:
 
@@ -66,10 +73,29 @@ section).
 
 - `broker.controllerLease.durationSeconds` (default 15) — controller
   failover latency vs API-server write rate.
+- `broker.minReadySeconds` (default 60) — how long a freshly Ready broker
+  must stay Ready before the rollout proceeds to the next pod.
+- `broker.retentionCheckIntervalSeconds` (default 300) — the retention
+  sweep interval; `0` disables the sweep.
+- `broker.maxMessageBytes` (default 1048588) — Apache's
+  `message.max.bytes`, the cap on one Produce batch.
+- `broker.fsyncMaxLatencyMs` (default 30000) — fsync watchdog deadline;
+  `0` disables.
+- `auth.requireSasl` (default false) — arms the SASL gate on anonymous
+  listeners too, so every connection must authenticate.
+- `auth.sslPrincipalMappingRules` — Apache's
+  `ssl.principal.mapping.rules` for mapping mTLS subject DNs to
+  principals.
 - `podDisruptionBudget.maxUnavailable` (default 1) — keeps voluntary
   disruptions from taking multiple single-writer brokers down at once.
+- `storage.controlPlane.enabled` (default false) — moves cluster-wide
+  coordination state onto its own PVC, so a full data volume cannot take
+  the control plane down.
+- `storage.pool[]` (default empty) — additional named volumes for
+  per-topic placement; see the
+  [volume pool](../architecture/volume-pool.md) page.
 - `storage.*` — see [Storage substrate requirements](./storage.md); the
-  PVC carries `helm.sh/resource-policy: keep`, so uninstall never deletes
+  PVCs carry `helm.sh/resource-policy: keep`, so uninstall never deletes
   data.
 
 ## Implementation notes (for contributors)

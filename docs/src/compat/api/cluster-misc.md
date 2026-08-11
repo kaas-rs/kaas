@@ -13,8 +13,8 @@ guessed.
 **Handling**: the response is built directly from the codec's `ApiSpec`
 registry — the same table that generates the
 [API support matrix](../api-matrix.md) — so the advertised surface is the wire
-truth by construction: 38 keys, sorted, deduplicated (a registry test asserts
-both). The API is on the pre-auth allowlist, so it works before SASL
+truth by construction: 40 keys, sorted, deduplicated (unit tests
+assert the count and both invariants). The API is on the pre-auth allowlist, so it works before SASL
 completes. Two protocol subtleties are implemented faithfully:
 
 - **The v0-response-header quirk**: the ApiVersions *response* header is

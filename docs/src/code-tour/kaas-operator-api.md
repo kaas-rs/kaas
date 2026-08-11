@@ -3,11 +3,14 @@
 The kube-derive CRD types — the source `cargo xtask gen-crds` renders into `deploy/crds/` and the Helm chart.
 
 Four CRD types, one module each: `kafkacluster.rs` (external-listener
-plumbing), `kafkatopic.rs` (partitions + `spec.config` + `Status.TopicID`),
-`kafkauser.rs` (Strimzi-shape authentication, inline
+plumbing, plus the storage / internal-listener / gateway / service config
+shapes), `kafkatopic.rs` (partitions + `spec.config` + `Status.TopicID`,
+plus `status.volumeAssignments` and the `kaas.rs/migrate-to-volume`
+annotation contract), `kafkauser.rs` (Strimzi-shape authentication, inline
 `spec.authorization.acls`, and the honestly-named
 `producerMaxByteRatePerBroker` / `consumerMaxByteRatePerBroker` quota
-fields), `kafkaclusterassignments.rs` (the read-only debug mirror). The
+fields), `kafkaclusterassignments.rs` (the read-only debug mirror) — plus
+the `condition.rs` / `scheme.rs` helper modules. The
 semantics — who reconciles what, why the quota names diverge from Strimzi,
 the no-finalizers model — live in
 [Kubernetes integration](../architecture/kubernetes.md).

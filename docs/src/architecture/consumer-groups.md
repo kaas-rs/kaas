@@ -149,9 +149,11 @@ non-coordinator broker is never visible to clients.
   chicken-and-egg where strict coordinator checks blocked fresh-group
   bootstrap, and was reverted in v0.1.53 (gh #92).
 - Takeover: `GroupTakeoverDriver`
-  (`crates/kaas-broker/src/group_takeover.rs`) runs the prev→next diff
-  and the orphan sweep; the sweep fixed the gh #89 stale-`--list`
-  symptom. Lazy group creation is `Manager::get_or_create`.
+  (`crates/kaas-broker/src/group_takeover.rs`) runs a single sweep over
+  `Manager::resident_groups()` on every assignment change — the old
+  prev→next diff is subsumed (only gain-side logging still compares
+  `prev`); the sweep fixed the gh #89 stale-`--list` symptom. Lazy
+  group creation is `Manager::get_or_create`.
 - Read-side ownership filtering: `Manager::list_groups()` /
   `describe_groups()` in `crates/kaas-coordinator/src/manager.rs`.
 - State: membership/generation in `crates/kaas-coordinator/src/group.rs`;

@@ -16,12 +16,16 @@ live view of its peers, feeding FindCoordinator and Metadata),
 readiness patching).
 
 **An honesty note mirrored from Part II**: the production topic pump is
-`kube_watchers::run_topic_watch`, whose callbacks carry only
-`(name, partitions)` — the richer `TopicWatcher` cache (with
-`deletionTimestamp`-immediate delete events and `Status.TopicID`
-stashing) is **not wired in**. Two consequences documented elsewhere:
-topic-delete FD-closing rides the assignment recompute instead of the
-immediate event, and Metadata serves all-zero topic IDs
+`kube_watchers::run_topic_watch`. Its `TopicApply` callbacks carry name,
+partitions, volume assignments (gh #221), the migrate-to annotation
+(gh #224), and `Status.TopicID` (gh #241 — fed into the `TopicRegistry`'s
+incarnation side-map for the stale-dir gate), and the pump takes an
+`on_synced` callback fired on the first completed relist. The delete
+callback closes FDs and purges state immediately (`engine.abandon_topic`,
+gh #219; `purge_topic_offsets`, gh #240) rather than waiting for the
+assignment recompute. What remains **not wired in** is the standalone
+`topic_watcher::TopicWatcher` cache with its `deletionTimestamp`-immediate
+delete events — and Metadata still serves all-zero topic IDs
 ([KIP-516](../compat/kip/kip-516.md)).
 
 **The pump is self-healing, and has to be** (gh #202). Two properties, both

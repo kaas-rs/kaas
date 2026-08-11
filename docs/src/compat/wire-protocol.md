@@ -55,8 +55,8 @@ Consequences worth internalizing:
 - Per-record features (timestamps, headers, per-record validation) are
   honoured **byte-opaquely**: kaas preserves what producers wrote
   without interpreting it. Where Apache applies per-record semantics —
-  e.g. tombstone expiry during compaction — kaas applies the batch-level
-  equivalent.
+  e.g. tombstone expiry during compaction — kaas will apply the
+  batch-level equivalent (the compactor itself is not yet implemented).
 - The contract is enforced, not aspirational: tripwire counters
   (surfaced as metrics — see
   [Observability](../architecture/observability.md)) must read zero

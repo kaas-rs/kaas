@@ -28,9 +28,11 @@ Four facts are shared by everything below:
   (`crates/kaas-coordinator/src/txn_state.rs`). Every mutation re-reads
   the slot file and writes back atomically (tmp + fsync + rename), so
   coordinator failover is just the new owner reading the same file — no
-  log replay. The `Prepare*` states exist in the enum but are never
-  visited; `EndTxn` collapses prepare-then-complete into one atomic
-  transition.
+  log replay. `EndTxn` is two-phase, as in Apache: `prepare_end_txn`
+  moves `Ongoing → Prepare{Commit,Abort}` **retaining** the partition
+  and group lists (the durable record of which markers still owe a
+  write), and `complete_end_txn` clears them only once every marker is
+  durable.
 - **Errors.** The store's failures map identically in every
   coordinator-side handler: unknown id or PID mismatch →
   `INVALID_PRODUCER_ID_MAPPING` (49); epoch mismatch → `PRODUCER_FENCED`
@@ -46,11 +48,15 @@ Four facts are shared by everything below:
 - **Reaper.** A per-broker task fires every 10 s (Apache's
   `transaction.abort.timed.out.transaction.cleanup.interval.ms` default)
   and transitions `Ongoing` entries past
-  `ongoingSinceMs + transactionTimeoutMs` to `CompleteAbort` with an
-  epoch bump, discarding their staged offsets (`run_txn_reaper`,
-  `bins/kaas/src/cluster.rs`). The production sweep is currently
-  **ungated by slot ownership** — every broker walks every slot — a
-  known multi-broker sharp edge; see the architecture page.
+  `ongoingSinceMs + transactionTimeoutMs` to **`PrepareAbort`** with an
+  epoch bump, keeping the dispatch set — a timed-out transaction owes
+  ABORT markers like any other. A marker-reconcile pass on the same
+  tick places the outstanding markers and completes the transaction,
+  which is when staged offsets are discarded
+  (`bins/kaas/src/cluster.rs`,
+  `crates/kaas-broker/src/txn_markers.rs`). Both sweeps are
+  **ownership-gated** on the txn-coordinator hash — each broker walks
+  only its own slots; dev mode (no coordinator) owns everything.
 
 One cross-cutting note up front: this surface is ACL-gated the way
 Apache 3.7 gates it. Every transactional handler checks `WRITE` on the
@@ -74,8 +80,8 @@ startup.
 **Versions**: v0–v4 (flexible from v2).
 
 **Handling** — a null or empty `transactional.id` is the idempotent
-path: any broker answers locally with a fresh PID from its in-memory
-counter and epoch 0, no coordinator gate. A non-empty `transactional.id`
+path: any broker answers locally with a fresh PID from its persisted
+block allocator (below) and epoch 0, no coordinator gate. A non-empty `transactional.id`
 hits the coordinator gate, then the state store: the first call for an
 id allocates a fresh PID at epoch 0; **every reconnect returns the same
 PID with `epoch + 1`** — fencing is the monotonic epoch, the KIP-98
@@ -108,13 +114,14 @@ epoch 0, and a one-shot warning that the rejoin fence is disabled.
 - `transaction_timeout_ms` is not validated against a
   `transaction.max.timeout.ms` ceiling (Apache rejects oversized values
   with `INVALID_TRANSACTION_TIMEOUT`); kaas records whatever is sent.
-- Idempotent (non-transactional) PIDs come from a per-broker counter
-  that starts at 1 and resets on restart — not the cluster-unique,
-  persisted block allocation Apache uses. PID collisions across brokers
-  or restarts are possible; PID-keyed state (dedupe windows, the fence
-  broadcast) can cross-talk in that case. Transactional PIDs survive via
-  the slot file, but two `transactional.id`s coordinated by different
-  brokers can still be handed the same PID.
+- PID allocation is cluster-unique but by a different mechanism than
+  Apache's. Apache allocates PID blocks through the quorum; kaas has no
+  quorum, so it **partitions the PID space per broker**
+  (`pid = (broker_id + 1) × 2⁴⁰ + local`) and persists each broker's
+  block high-water to the shared volume **before** any PID in the
+  block is handed out — a crash skips forward to a fresh block, never
+  rewinds. No two brokers, and no two incarnations of one broker, can
+  issue the same PID.
 
 **Source**: `crates/kaas-broker/src/handlers/init_producer_id.rs`
 (handler), `crates/kaas-codec/src/api/init_producer_id.rs` (codec),
@@ -193,8 +200,8 @@ invalid-transition mapping (wire 50 — see the preamble wart).
 
 **Deviations from Apache 3.7**:
 
-- None known beyond the shared warts in the preamble (no
-  `TransactionalId` ACL gate; wire 50 where Apache uses 48).
+- None known beyond the shared warts in the preamble (wire 50 where
+  Apache uses 48).
 
 **Source**: `crates/kaas-broker/src/handlers/add_offsets_to_txn.rs`
 (handler), `crates/kaas-codec/src/api/add_offsets_to_txn.rs` (codec),
@@ -214,42 +221,43 @@ keeping the client-visible contract.
 
 **Versions**: v0–v3 (flexible from v3).
 
-**Handling** — after the shared gates, the store performs
-`Ongoing → CompleteCommit` / `CompleteAbort` as **one atomic slot-file
-transition** — the `Prepare*` states are never visited. The partition
-and group lists are snapshotted before being cleared, `ongoingSinceMs`
-is zeroed, and the offset hook fires per recorded group: commit
-materialises the pending offsets `TxnOffsetCommit` staged, abort
-discards them. A retried `EndTxn` in the matching `Complete*` state is
-answered idempotently (error 0, no second marker); a direction mismatch
-or `EndTxn` against `Empty` returns wire 50 (intended
-`INVALID_TXN_STATE`); an epoch mismatch returns `PRODUCER_FENCED`.
+**Handling** — after the shared gates, the flow is **prepare →
+dispatch → complete**, Apache's own shape. `prepare_end_txn` moves
+`Ongoing → Prepare{Commit,Abort}`, deliberately retaining the
+partition and group lists — the durable record of which markers still
+owe a write. Marker dispatch then splits by partition leader (from
+`assignment.json` via the broker `Coordinator`): **self-led
+partitions** get the COMMIT/ABORT control batch built and appended
+directly with `acks = -1`, *before* any queue writes, so a coordinator
+crash mid-dispatch never loses the local marker; **peer-led
+partitions** get one queue file per target broker under
+`/data/__cluster/marker_queue/to-<broker>/<pid>-<epoch>.json` — a
+durably written queue entry is the durability boundary for a peer
+partition, since the peer's `MarkerWatcher` (2 s poll) retries until
+the marker applies. Only once every marker is durable does
+`complete_end_txn` run: `Prepare* → Complete*`, lists cleared,
+`ongoingSinceMs` zeroed, and the offset hook fired per recorded group
+(commit materialises the offsets `TxnOffsetCommit` staged, abort
+discards them). Any dispatch failure answers the retriable
+`COORDINATOR_NOT_AVAILABLE` (15) and leaves the entry prepared — a
+producer retry or the 10 s marker reconcile re-derives the identical
+dispatch set and finishes the job.
 
-Marker dispatch then splits by partition leader (from
-`assignment.json` via the broker `Coordinator`): **self-led partitions**
-get the COMMIT/ABORT control batch built and appended directly with
-`acks = -1`, *before* any queue writes, so a coordinator crash
-mid-dispatch never loses the local marker; **peer-led partitions** get
-one queue file per target broker under
-`/data/__cluster/marker_queue/to-<broker>/<pid>-<epoch>.json`. The
-response returns success **as soon as the queue entries are durably
-written** — each peer's `MarkerWatcher` polls its own inbox every 2 s,
-appends the marker to the partitions it leads, and deletes the file.
-The file name makes producer retries overwrite rather than pile up.
+A retried `EndTxn` in the matching `Complete*` state is answered
+idempotently (error 0, no second marker); a direction mismatch or
+`EndTxn` against `Empty` returns wire 50 (intended
+`INVALID_TXN_STATE`); an epoch mismatch returns `PRODUCER_FENCED`.
+The queue file name makes producer retries overwrite rather than pile
+up.
 
 **Deviations from Apache 3.7**:
 
 - **Peer markers are applied asynchronously.** Apache's coordinator
   drives `WriteTxnMarkers` RPCs and completes the transaction when every
-  marker is written; kaas acks once the queue entries land, so
-  `read_committed` visibility (LSO advance) on peer-led partitions
-  trails the `commitTransaction()` return by up to the 2 s poll.
-- **Failed marker appends are not re-driven.** A local append failure is
-  logged and `EndTxn` still answers 0; because retries are idempotent
-  no-ops once the state is `Complete*`, nothing rewrites the missing
-  marker and that partition's LSO stays pinned. Apache holds
-  `PrepareCommit` and retries markers until they succeed. Known sharp
-  edge.
+  marker is *written to the partition log*; kaas completes once the
+  queue entries land, so `read_committed` visibility (LSO advance) on
+  peer-led partitions trails the `commitTransaction()` return by up to
+  the 2 s poll.
 - `CoordinatorEpoch` in emitted markers is always 0 (kaas tracks no txn
   coordinator epoch distinct from the assignment epoch); consumers do
   not act on the field.
@@ -258,7 +266,9 @@ The file name makes producer retries overwrite rather than pile up.
 **Source**: `crates/kaas-broker/src/handlers/end_txn.rs` (handler),
 `crates/kaas-codec/src/api/end_txn.rs` (codec),
 `crates/kaas-broker/src/control_batch.rs` (marker batch),
-`crates/kaas-coordinator/src/txn_state.rs` (`end_txn`),
+`crates/kaas-broker/src/txn_markers.rs` (shared dispatch + reconcile),
+`crates/kaas-coordinator/src/txn_state.rs` (`prepare_end_txn` /
+`complete_end_txn`),
 `crates/kaas-coordinator/src/marker_queue.rs` +
 `crates/kaas-broker/src/marker_watcher.rs` (cross-broker dispatch).
 

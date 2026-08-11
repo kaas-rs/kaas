@@ -1,10 +1,10 @@
 # kaas-test-harness
 
-Shared test helpers — the only place in the workspace where a decoded-record representation is allowed to live.
+Shared test helpers — reserved as the only place in the workspace where a decoded-record representation would be allowed to live.
 
-Still essentially a stub, populated as integration tests need it. Its
-charter is narrow and deliberate: test fixtures (including the
-byte-opacity fixtures) and the `recordbatch` helper for *constructing*
-RecordBatches in tests. Production crates must never grow a decoded-record
-type — when a test needs one, it lives here, where the tripwire counters
-can't be quietly bypassed ([wire protocol](../compat/wire-protocol.md)).
+Still an empty placeholder crate (a doc comment, no code, no dependents),
+to be populated as integration tests need it. Its charter is narrow and
+deliberate: shared fixtures and record-construction helpers for tests.
+Production crates must never grow a decoded-record type — when a test needs
+one, it belongs here, where the tripwire counters can't be quietly bypassed
+([wire protocol](../compat/wire-protocol.md)).

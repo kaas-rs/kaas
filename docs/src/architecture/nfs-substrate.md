@@ -12,7 +12,7 @@ shared filesystem (plus whatever redundancy the storage itself
 provides), and failover means a surviving broker opens the *same files*
 the dead one was writing. There is no second copy to fall back on,
 because the shared volume *is* the copy. (Why give up replication? See
-the [non-goals](./overview.md) — in short, it trades a replication
+the [non-goals](../compat/non-goals.md) — in short, it trades a replication
 protocol and a consensus log for a much smaller system that leans on
 Kubernetes and the filesystem instead.)
 
@@ -227,6 +227,9 @@ bug, and each is one rule ignored:
 | Deleting a file a broker still had open left a `.nfsXXXX` tombstone that kept the parent directory busy and blocked cleanup (gh #76). | 3 — single-writer FD discipline | Only the leader holds a partition's file handles, and it closes them before any delete; combined with the rename-aside above, a stray tombstone lands in a throwaway path instead of the live one. |
 | Reclaiming a recreated topic's directory renamed it aside and then ran the recursive delete *before* re-creating the live path — leaving that path absent for the whole unlink walk (554 ms measured), so a broker opening a partition in that window failed (gh #220). | 2 — a two-step treated as atomic | Re-create the live path immediately after the rename and delete the staged copy afterwards, so the gap is a few `mkdir`s instead of a full delete; and make the opener retry, since after its own `mkdir_all` a "file not found" can only mean someone is re-creating the path. |
 | A topic deleted and recreated under the same name inherited the dead incarnation's segments, high watermark, and dedupe window (gh #219). | 4 — name reuse | The `.topic-id.json` incarnation stamp and reconcile-time reclaim described above. |
+| The per-partition manifest was read-modify-written by several paths, so a takeover completing inside another writer's read-work-write gap got replayed over — silently lowering the durable epoch and unarming the zombie fence (gh #235). | 3 — two writers | Every manifest write re-reads the on-disk file just before writing and skips itself if the epoch there is higher — no writer may lower the epoch, and identical writes are skipped outright. |
+| A broker that already had a topic's directory open when the operator renamed it aside kept appending into the staged `.deleting-*` copy — FDs follow the inode — while the live path served an empty log, with no error anywhere (gh #241). | 3 — two writers | Partition open consults the topic's incarnation identity and refuses (retriably) to open a directory stamped with a previous incarnation's ID, until the operator's reclaim lands. |
+| A tail torn by a crash mid-write was accepted as valid data on recovery: appends resumed after the garbage, and the *next* recovery stopped at the tear — losing every acked record written past it (gh #226/#228). | 2 — not driven to a verified end-state | The recovery scan verifies each batch's CRC and truncates the log to the last byte it *proved* valid before any write handle is used — a clean log is never touched, and the scan is bounded by the recovery checkpoint. |
 
 Note the fifth entry was found by *this document's own checklist*,
 applied to a fix for the first: rename-aside solved a rule-3 race and

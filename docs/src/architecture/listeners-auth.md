@@ -98,6 +98,13 @@ the server extracts the principal from the client certificate (through
 the KIP-371 principal-mapping rules below) and marks the connection
 authenticated before any Kafka API arrives.
 
+Anonymous listeners are not necessarily allow-all forever: setting the
+chart's `auth.requireSasl` (the `KAAS_REQUIRE_SASL` env) hands
+listeners declared `authentication.type: none` the real SASL engine
+too, arming the pre-auth gate cluster-wide — every listener then
+demands a completed SASL exchange before dispatching. Only
+`KAAS_AUTH_DISABLED=true` outranks it.
+
 ## OAuth listeners (SASL/OAUTHBEARER)
 
 If you have pointed a Strimzi listener at an OIDC provider —
@@ -179,8 +186,14 @@ picked in a super-user early-allow layer.
 
 ACLs and credentials are **operator-materialized**: `KafkaUser` CRs
 become entries in `credentials.json` + `acls.json`, which brokers
-hot-reload. `KAAS_AUTH_DISABLED=true` switches the whole subsystem off
-for dev setups.
+hot-reload. SCRAM credentials can also be rotated over the wire with
+Kafka's SCRAM admin API (KIP-554, `kafka-configs.sh --alter
+--add-config SCRAM-SHA-512=…`): describe answers from the hot-reloaded
+credential store, and alter patches the `KafkaUser` CR — the CR stays
+the source of truth, and the operator materializes the new credential
+as usual (see the [ACL & quota admin
+APIs](../compat/api/acls-quotas.md)). `KAAS_AUTH_DISABLED=true`
+switches the whole subsystem off for dev setups.
 
 **Authorization-only users (OAuth principals).** A `KafkaUser`'s
 `spec.authentication` is optional (gh #42). An OAUTHBEARER principal

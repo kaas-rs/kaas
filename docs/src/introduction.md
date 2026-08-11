@@ -64,7 +64,7 @@ Where the things you manage in Kafka live in kaas:
 Two binaries and a Helm chart: the broker, an operator that reconciles
 the custom resources into on-disk state and Kubernetes plumbing (and
 stays entirely off the produce/fetch hot path), and the chart that
-deploys both. The release line is `v0.2.x-preview` — pre-v1, kaas makes
+deploys both. The release line is `v0.3.x-preview` — pre-v1, kaas makes
 no backwards-compatibility promises between releases; see
 [Releasing](operations/releasing.md) for the exact upgrade contract.
 

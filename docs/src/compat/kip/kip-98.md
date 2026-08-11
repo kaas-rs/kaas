@@ -23,17 +23,21 @@ page maps the KIP's pieces to source and names the substitutions.
 
 **Idempotent producer.** `InitProducerId` (key 22, v0–v4,
 `crates/kaas-broker/src/handlers/init_producer_id.rs`) hands
-non-transactional producers a fresh PID with epoch 0 from a monotonic
-counter (`transactional_id` of `""` counts as non-transactional, the
-KIP-98 client convention). Per-partition dedupe lives in
+non-transactional producers a fresh PID with epoch 0 from a per-broker
+partitioned block allocator (`crates/kaas-broker/src/producer_id.rs`):
+`pid = (broker_id + 1) · 2^40 + local`, with `local` advancing in
+1000-PID blocks whose end is persisted before any PID in the block is
+handed out — so a restart skips forward instead of reissuing, and
+brokers can never collide (`transactional_id` of `""` counts as
+non-transactional, the KIP-98 client convention). Per-partition dedupe lives in
 `crates/kaas-storage/src/idempotence.rs`: a five-batch ring per PID —
 sized to Java's `max.in.flight.requests.per.connection=5` — classified
 under the partition mutex as duplicate (echo the cached `baseOffset`, no
 log write), out-of-order (wire error 45), invalid epoch (wire 47), or
 accept. Only the 57-byte v2 batch header is parsed; record payloads stay
 opaque. The window survives restart via `producer-state.snapshot`
-(`crates/kaas-storage/src/producer_snapshot.rs`), written on segment
-roll and relinquish beside `manifest.json`.
+(`crates/kaas-storage/src/producer_snapshot.rs`), written on take-over
+and close/relinquish beside `manifest.json`.
 
 **Transactions — with three honest substitutions:**
 
@@ -60,8 +64,14 @@ roll and relinquish beside `manifest.json`.
 The remaining txn handlers (`add_partitions_to_txn.rs`,
 `add_offsets_to_txn.rs`, `txn_offset_commit.rs`,
 `write_txn_markers.rs` under `crates/kaas-broker/src/handlers/`) drive
-the `Empty → Ongoing → CompleteCommit/CompleteAbort` transitions, and a
-10 s timeout reaper aborts overdue transactions with an epoch bump. Epoch
+the `Empty → Ongoing → PrepareCommit/PrepareAbort →
+CompleteCommit/CompleteAbort` transitions. `EndTxn` is two-phase: the
+prepare transition retains the partition and group lists as the durable
+dispatch set, and the complete transition runs only once every marker is
+durable — a dispatch failure leaves the entry prepared and retriable. A
+10 s timeout reaper lands overdue transactions in `PrepareAbort` with an
+epoch bump, and a marker-reconcile pass on the same tick dispatches
+their ABORT markers and completes them. Epoch
 fencing on producer rejoin is [KIP-360](kip-360.md); transactional
 consume-process-produce offsets are [KIP-447](kip-447.md).
 

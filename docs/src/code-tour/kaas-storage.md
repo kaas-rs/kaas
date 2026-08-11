@@ -11,12 +11,17 @@ The disk storage engine: segments, manifest, cleaner, idempotent-producer state,
 `disk.rs` (engine-level orchestration), `partition.rs` (the partition core:
 mutex-guarded write path, ArcSwap read snapshot, per-partition committer
 task), `segment.rs` (epoch-prefixed segment files + sparse index),
-`manifest.rs` (tmp+fsync+rename state file), `cleaner.rs` + `topicconfig.rs`
-(retention and compaction knobs from `.config.json`), `idempotence.rs` +
-`producer_snapshot.rs` (per-PID dedupe rings and their persistence),
-`txn_index.rs` (aborted-transaction ranges for read-committed Fetch),
-`memory.rs` (dev-mode in-memory engine), `atomic_write.rs`, `fs.rs` (the
-filesystem seam that lets tests fault-inject).
+`manifest.rs` (tmp+fsync+rename state file), `cleaner.rs` (delete-policy
+retention only — compaction is still unimplemented, gh #158) +
+`topicconfig.rs` (retention/segment/compaction knobs from `.config.json`),
+`recovery_checkpoint.rs` (the bounded-recovery-scan checkpoint, gh #230),
+`topic_identity.rs` (the `.topic-id.json` incarnation stamp, gh #219),
+`idempotence.rs` + `producer_snapshot.rs` (per-PID dedupe rings and their
+persistence), `txn_index.rs` (aborted-transaction ranges for read-committed
+Fetch), `memory.rs` (dev-mode in-memory engine), `atomic_write.rs`,
+`errors.rs`, `fs.rs` (the filesystem seam that lets tests fault-inject).
+The crate also carries the multi-log-dir/volume-pool plumbing
+(`parse_log_dirs_json`, the `PlacementResolver` seam — gh #221/#224).
 
 **Invariants callers must hold**:
 
@@ -32,9 +37,6 @@ filesystem seam that lets tests fault-inject).
 - **FDs belong to the leader**: `take_over` opens handles, `relinquish`
   closes them; holding handles elsewhere reintroduces the NFS silly-rename
   problem (gh #76).
-
-The one `unsafe`-adjacent carve-out in the workspace lives here: index
-mmap, behind the `mmap` feature.
 
 **Start reading at** `partition.rs::append`, following one batch from
 classification to the committer's `sync_all`.

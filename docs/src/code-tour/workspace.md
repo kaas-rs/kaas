@@ -70,6 +70,7 @@ flowchart LR
     op_bin --> opctl
     op_bin --> opapi
     op_bin --> controller
+    op_bin --> storage
 
     broker --> protocol
     broker --> codec
@@ -84,6 +85,7 @@ flowchart LR
 
     controller --> broker
     controller --> coordinator
+    controller --> storage
 
     k8s --> broker
     k8s --> coordinator
@@ -98,10 +100,9 @@ Two crates are left off the diagram to keep it readable:
 - **`kaas-observability`** is depended on by every crate above except
   `kaas-codec` and `kaas-operator-api` (and by both bins); its own single
   dependency is `kaas-codec`, for the byte-opacity tripwire counters.
-- **`kaas-test-harness`** depends on nothing in the workspace — it carries the
-  byte-opacity test fixtures and the `recordbatch` helper, the only place a
-  decoded-record representation is allowed to live.
+- **`kaas-test-harness`** depends on nothing in the workspace and nothing
+  depends on it — it is still an empty placeholder crate.
 
-> This graph is hand-maintained (checked against `Cargo.toml` on 2026-07-19).
+> This graph is hand-maintained (checked against `Cargo.toml` on 2026-08-11).
 > Auto-generating it from `cargo metadata` is a possible future
 > `gen-api-matrix`-style xtask.

@@ -13,7 +13,7 @@ cluster can run on a plain `ReadWriteOnce` local-path class.
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
-  --version 0.2.18-preview \
+  --version 0.3.1-preview \
   --namespace kafka --create-namespace \
   --set storage.className=<your-rwx-class> \
   --set broker.replicaCount=3
@@ -21,8 +21,10 @@ helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas \
 
 That deploys a broker `StatefulSet`, the operator, and the shared
 volume(s). The chart's defaults give you an anonymous in-cluster
-listener on 9092; TLS, SCRAM, and external access are chart values —
-see [Helm chart & listener configuration](operations/helm.md).
+listener on 9092; TLS, SCRAM, OAuth (SASL/OAUTHBEARER against an OIDC
+issuer, disabled by default on 9096), and external access are chart
+values — see
+[Helm chart & listener configuration](operations/helm.md).
 
 ### Create a topic
 
@@ -42,6 +44,10 @@ If you'd rather stay in Kafka's own tooling, that works too —
 `kafka-topics.sh --create` (or any Admin-API client) creates the same
 `KafkaTopic` resource for you, so both routes end in one place and
 `kubectl get kafkatopics` always shows the truth.
+
+Retention is enforced: a topic without an explicit retention config
+ages out after 7 days (Kafka's own default) — set `retentionMs: -1` to
+keep data forever.
 
 ### Talk to it
 

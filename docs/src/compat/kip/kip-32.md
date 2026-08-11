@@ -25,10 +25,15 @@ wrote are stored and served back byte-identical. Concretely:
   from bytes `[35..43]` of the v2 batch header — the records payload is
   never touched. Each segment tracks the highest value seen
   (`ActiveSegment::max_timestamp`).
-- **LogAppendTime is not implemented.** kaas never rewrites timestamps,
-  there is no `message.timestamp.type` in the per-topic config surface
-  (`crates/kaas-storage/src/topicconfig.rs` carries retention, segment,
-  and compaction knobs only), and the Produce response always returns
+- **LogAppendTime is not implemented.** kaas never rewrites timestamps.
+  `message.timestamp.type` is advertised by `DescribeConfigs` as
+  `CreateTime` and the config-admin path accepts that value as an
+  accept-and-drop key — validated, never persisted
+  (`crates/kaas-broker/src/topic_cr_writer.rs`) — while `LogAppendTime`
+  is rejected with `INVALID_CONFIG`; the per-topic config file itself
+  (`crates/kaas-storage/src/topicconfig.rs`, which carries retention,
+  segment, flush, and compaction knobs) has no timestamp-type field.
+  The Produce response always returns
   `log_append_time_ms: -1` — the CreateTime sentinel
   (`crates/kaas-broker/src/handlers/produce.rs`). A topic cannot ask the
   broker to stamp append time; every topic behaves as CreateTime.

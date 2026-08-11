@@ -15,14 +15,24 @@ load/evict — including the gh #89 orphan sweep), `group_hash.rs`
 (deterministic coordinator routing), `topic_registry.rs`, `self_fence.rs`
 (stops acking writes when heartbeats stall), `heartbeat_client.rs`,
 `fence_watcher.rs` + `marker_watcher.rs` (shared-volume pollers applying
-peer fences and txn markers), `cli.rs` (env/listener parsing),
+peer fences and txn markers), `producer_id.rs` (persisted per-broker PID
+blocks, gh #219), `txn_markers.rs` (shared COMMIT/ABORT marker dispatch +
+the prepared-txn reconcile, gh #225), `assignment.rs` (the
+`assignment.json` schema), `control_batch.rs` (COMMIT/ABORT control-batch
+encoder), `listener_advert.rs` (the advertised-endpoint rule + broker
+catalog shared by Metadata and DescribeCluster), `argocd.rs` (ArgoCD
+coexistence annotations on broker-minted CRs), `topic_config_defaults.rs`
+(the DescribeConfigs defaults table), `cli.rs` (env/listener parsing),
 `local_lease.rs` (dev mode).
 
-**Write-back side**: `topic_cr_writer.rs` and `acl_cr_writer.rs` — the only
-paths where serving a Kafka request writes to Kubernetes
-(CreateTopics/CreatePartitions/IncrementalAlterConfigs → `KafkaTopic`,
-Create/DeleteAcls → `KafkaUser`). In dev mode these are no-op writers that
-refuse politely.
+**Write-back side**: `topic_cr_writer.rs`, `acl_cr_writer.rs`, and
+`user_cr_writer.rs` — the only paths where serving a Kafka request writes
+to Kubernetes (CreateTopics/CreatePartitions/IncrementalAlterConfigs and
+Metadata auto-topic-creation → `KafkaTopic`, Create/DeleteAcls →
+`KafkaUser`, AlterUserScramCredentials → `KafkaUser.spec.authentication.scram`
+— KIP-554, gh #252). In dev mode the topic writer is a no-op impl that
+refuses politely; the ACL and user writers are simply not installed without
+a kube client.
 
 **Handlers**: one module per API key under `handlers/`. The per-key
 behaviour — versions, semantics, deviations — is documented exhaustively in

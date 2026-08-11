@@ -4,13 +4,15 @@ The operator entrypoint driving the reconcilers in `kaas-operator-controllers`.
 
 A small binary by design: it boots the three reconcilers (KafkaTopic,
 KafkaUser, KafkaCluster) against a namespace-scoped `kube::Client`, runs
-the leader-elected startup sweep, serves `/healthz` + `/readyz` over axum,
-and shuts down cleanly on SIGTERM.
+the leader-elected orphan sweep (an initial pass at election, then every
+5 minutes), serves `/healthz` + `/readyz` over axum, and shuts down
+cleanly on SIGTERM.
 
 Configuration is all environment (chart-templated by
 `deploy/helm/kaas/templates/operator-deployment.yaml`): `KAAS_DATA_DIR`
-(shared PVC mount, default `/data`), `KAAS_NAMESPACE`, `KAAS_LOG_LEVEL` /
-`KAAS_LOG_FORMAT`, the metrics/health bind addresses, and the standard
+(shared PVC mount, default `/data`), `KAAS_CLUSTER_DIR` and `KAAS_LOG_DIRS`
+(gh #221), `KAAS_NAMESPACE`, `KAAS_LOG_LEVEL` / `KAAS_LOG_FORMAT`, the
+metrics bind address and `HEALTH_PROBE_BIND_ADDRESS`, and the standard
 `OTEL_EXPORTER_OTLP_*` variables consumed by
 [kaas-observability](kaas-observability.md)'s bootstrap.
 

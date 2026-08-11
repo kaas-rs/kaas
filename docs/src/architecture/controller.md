@@ -28,7 +28,7 @@ sequenceDiagram
     L-->>C: epoch = leaseTransitions
     Note over C: recompute triggers:<br/>first Lease win · KafkaTopic change ·<br/>broker join/leave (2 s alive-set poll)
     C->>C: balancer: partition +<br/>consumer-group assignments
-    C->>A: write tmp + fsync + rename<br/>{controller_epoch, assignment_version,<br/>partitions, consumerGroups}
+    C->>A: write tmp + fsync + rename<br/>{controller_epoch, assignment_version,<br/>brokers (alive/draining/dead),<br/>partitions, consumerGroups}
     C-->>B: heartbeat push: ASSIGNMENT_CHANGED
     B->>A: re-read (1 s mtime poll,<br/>push is the fast path)
     B->>B: reject if controller_epoch<br/>< Lease epoch<br/>(stale-controller fence)
@@ -36,9 +36,10 @@ sequenceDiagram
     B->>B: consumer-group takeover diff<br/>+ orphan sweep
 ```
 
-The controller also mirrors each written assignment into the
-`KafkaClusterAssignments` CR — a fire-and-forget debug surface for
-`kubectl`; brokers never read it. There is no per-partition Lease: the
+A `KafkaClusterAssignments` CR exists as the intended `kubectl`-visible
+debug mirror of this file, but the status writer is not wired up yet —
+the CR's status is empty today, and the file on the volume is the only
+place to read the assignment. There is no per-partition Lease: the
 singleton controller Lease is the only Kubernetes coordination
 primitive, and everything downstream of it travels through
 `assignment.json` on the shared volume.
@@ -49,16 +50,21 @@ The Lease holder takes on four extra responsibilities:
 
 - **Observes peer brokers** via the heartbeat gRPC stream every broker
   dials into it. A broker that stops heartbeating ages out of the alive
-  set — there is no controlled-shutdown RPC; the controller learns of a
-  departure by timeout and rebalances reactively.
-- **Computes assignments** — partition leadership and consumer-group
-  placement — over the alive set.
+  set, and a broker shutting down cleanly announces itself first: the
+  drain flag set at SIGTERM rides its next heartbeat, so the controller
+  moves its partitions while it is still healthy enough to hand them
+  over, rather than waiting for a timeout.
+- **Computes assignments** — partition leadership over the alive set,
+  and consumer-group placement over the **full registered broker set**
+  (alive, draining, and dead rows alike): the group-coordinator hash
+  divides by that set, so dead rows are retained deliberately — see
+  [Broker fencing](./broker-fencing.md).
 - **Writes `assignment.json`**, epoch-prefixed, tmp + fsync + rename.
   Every broker rejects an assignment whose epoch is stale, so a deposed
   controller coming back from a GC pause can't roll the cluster
-  backwards.
-- **Mirrors to Kubernetes**, for
-  `kubectl get kafkaclusterassignments` diagnostics only.
+  backwards. Since the fencing work the file also carries every
+  registered broker's health tri-state (alive / draining / dead), which
+  is what DescribeCluster v2 reports as fenced brokers.
 
 ## When it recomputes
 
@@ -69,8 +75,11 @@ The Lease holder takes on four extra responsibilities:
 | Broker joins or leaves the alive set | the broker-set watcher's 2 s alive-set poll |
 
 The alive set the balancer feeds on is the set of heartbeat-connected
-brokers that report themselves healthy — a broker's own 1 s liveness
-tick, trusted unconditionally. Kubernetes endpoint readiness is only
+brokers that report themselves healthy **and not draining** — a
+broker's own 1 s liveness tick, trusted unconditionally, minus anyone
+who has announced shutdown. The one exception is self-preservation:
+the controller always pins itself into the set, so a cluster can never
+compute an empty assignment out from under itself. Kubernetes endpoint readiness is only
 the bootstrap fallback for a freshly elected controller that no broker
 has dialed into yet, so a controller elected mid-rollout doesn't
 compute an empty assignment. How a broker earns — and loses — its

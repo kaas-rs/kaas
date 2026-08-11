@@ -84,8 +84,8 @@ snapshots as a NAS-liveness probe, and recorded reports under
   `scripts/_common.sh`, sourced by every `kafka-*.sh` script.
 - The integration tests above, in list order:
   `bins/kaas/tests/smoke.rs`, `bins/kaas/tests/auth_smoke.rs`,
-  `bins/kaas/tests/byte_opacity.rs`,
+  `bins/kaas/tests/oauth_smoke.rs`, `bins/kaas/tests/byte_opacity.rs`,
   `bins/kaas/tests/cluster_bringup.rs` + `cluster_smoke.rs`,
-  `bins/kaas/tests/eos_v2.rs`, and
+  `bins/kaas/tests/eos_v2.rs`, `bins/kaas/tests/retention.rs`, and
   `crates/kaas-controller/tests/controller_failover.rs` +
   `stale_controller_race.rs`.

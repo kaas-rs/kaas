@@ -57,9 +57,25 @@ controller failover by up to a minute. `nconnect` raises throughput when
 multiple brokers fsync concurrently.
 
 One reclaim-policy caution: keep the data PV on `reclaimPolicy: Retain`
-(or the chart's kept PVC) — with `Delete` and a templated NFS subdirectory,
-a PVC recreate can race the old PV's deletion into removing the *new*
-volume's directory.
+(or the chart's kept PVCs — all three PVC classes carry
+`helm.sh/resource-policy: keep`) — with `Delete` and a templated NFS
+subdirectory, a PVC recreate can race the old PV's deletion into removing
+the *new* volume's directory.
+
+## More than one volume
+
+The chart can split storage beyond the single data volume, and both
+options follow the same substrate contract above:
+
+- **A dedicated control-plane volume** (`storage.controlPlane.enabled`)
+  moves the cluster-state directory — assignment, transaction slots,
+  consumer offsets, credentials — onto its own PVC, so a full data
+  volume cannot take the control plane down with it.
+- **The volume pool** (`storage.pool[]`) declares additional named RWX
+  volumes that topics can be placed on per-topic — Kafka's "log dirs",
+  spread across volumes instead of local disks. See the
+  [volume pool](../architecture/volume-pool.md) page for placement,
+  selectors, and migration.
 
 ## The durability dial
 
@@ -68,7 +84,7 @@ defaults to **1**: every batch waits for its group-commit fsync — honest
 `acks=all` against the substrate. Raising it (e.g. 10000) approximates
 Apache's default posture, where `acks=all` acknowledges replicated
 page-cache writes and `log.flush.interval.messages` is effectively
-unbounded — comparable durability semantics to a single Apache broker, and
-the setting used in the recorded benchmarks
-([performance](./performance.md)). NFS COMMIT latency dominates either
+unbounded — comparable durability semantics to a single Apache broker.
+The recorded benchmarks ([performance](./performance.md)) run the
+default honest fsync (interval 1). NFS COMMIT latency dominates either
 way; this dial decides how often you pay it.

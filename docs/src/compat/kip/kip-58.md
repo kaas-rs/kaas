@@ -28,16 +28,20 @@ What exists today is the **configuration plumbing**, end to end:
   `crates/kaas-broker/src/topic_config_defaults.rs`.
 
 What does **not** exist yet is the compactor that would honour the gate.
-`crates/kaas-storage/src/cleaner.rs` implements size-based retention
-only, and its module doc says so plainly: time-based retention and the
-compactor honouring these knobs (`min.compaction.lag.ms`,
-`delete.retention.ms`) are follow-up work (tracked as gh #158). The
-compaction
+`crates/kaas-storage/src/cleaner.rs` implements size- and time-based
+delete-policy retention (whichever target reaps more), and its module doc
+says so plainly: the compactor honouring these knobs
+(`min.compaction.lag.ms`, `delete.retention.ms`) is follow-up work
+(tracked as gh #158). The compaction
 metrics in `crates/kaas-observability/src/metrics.rs`
 (`kaas.compaction.*`) are declared ahead of that work and nothing records
 them today. So the knob round-trips through every admin surface but gates
-nothing: topics with `cleanup.policy=compact` are simply never compacted,
-which is the degenerate-but-safe reading of an infinite lag.
+nothing — and "never compacted" is no longer the safe reading of an
+infinite lag: the retention cleaner does not consult `cleanup.policy`,
+and the enforced `retention.ms` default of 7 days means a
+`cleanup.policy=compact` topic's closed segments age out like any
+other's unless `retention.ms` is set to `-1`. Until the compactor lands,
+data on compacted topics is subject to delete-style retention.
 
 The intended enforcement semantics (per-segment `maxTimestamp` inside the
 lag window ⇒ segment skipped) are described with the storage engine in

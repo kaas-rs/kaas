@@ -31,6 +31,13 @@ Kubernetes API server behind it play that role. The operator is a
   reconciling. What does not degrade: every already-created topic,
   credential, and ACL.
 
+One honest caveat, and it is not a Kubernetes dependency: an
+OAUTHBEARER listener validates tokens against signing keys fetched from
+the OAuth *issuer* — an external service — and is fail-closed before
+the first successful fetch. An unreachable issuer blocks new
+authentications on that listener; every other listener, and every
+already-authenticated connection, is unaffected.
+
 ## The one Kubernetes dependency on the control path
 
 Brokers do keep a few long-lived Kubernetes watches: the
@@ -58,18 +65,26 @@ partitions to brokers that then fail to open them.
 
 ## Admin writes go through CRs — deliberately
 
-The broker isn't strictly read-only against Kubernetes: two admin
-handlers **write** `KafkaTopic` CRs, so that the operator remains the
-single materializer of topic state:
+The broker isn't strictly read-only against Kubernetes: the Kafka
+admin APIs are served by **writing** CRs, so that the operator remains
+the single materializer of topic and user state:
 
-- `CreatePartitions` (key 37) patches `spec.partitions`.
-- `IncrementalAlterConfigs` (key 44) patches `spec.config` per key.
+- **Topic admin APIs** work the `KafkaTopic` CR: `CreateTopics` (and
+  Metadata-driven auto-creation) mints one, `CreatePartitions` patches
+  `spec.partitions`, `IncrementalAlterConfigs` patches `spec.config`
+  per key, `DeleteTopics` deletes it, and `AlterReplicaLogDirs` records
+  a partition move in the CR's status.
+- **User admin APIs** edit an *existing* `KafkaUser` CR:
+  `CreateAcls`/`DeleteAcls` mutate `spec.authorization.acls`, and the
+  SCRAM admin API (KIP-554) patches `spec.authentication.scram`.
 
-The operator then creates partition directories and rewrites
-`.config.json` exactly as if you had edited the CR yourself. This keeps
-one writer for on-disk topic layout while still serving the Kafka admin
-surface. (It's also why broker RBAC carries `update,patch` on
-`kafkatopics` — see [Kubernetes integration](./kubernetes.md).)
+The operator then materializes the change — partition directories,
+`.config.json`, `credentials.json`, `acls.json` — exactly as if you had
+edited the CR yourself. This keeps one writer for on-disk state while
+still serving the Kafka admin surface. (It's also why broker RBAC
+carries the full verb set on `kafkatopics` — including `create` and
+`delete` — plus `kafkatopics/status` and read/`update,patch` on
+`kafkausers`; see [Kubernetes integration](./kubernetes.md).)
 
 ## The line not to cross
 
@@ -82,7 +97,10 @@ Produce/Fetch with the Kubernetes API server unreachable.**
 ## Implementation notes (for contributors)
 
 - Admin CR writes route through
-  `crates/kaas-broker/src/topic_cr_writer.rs`.
+  `crates/kaas-broker/src/topic_cr_writer.rs` (topics),
+  `crates/kaas-broker/src/acl_cr_writer.rs` (ACLs), and
+  `crates/kaas-broker/src/user_cr_writer.rs` (KIP-554 SCRAM rotation,
+  gh #252).
 - The self-restarting, relist-reconciling topic watch is
   `run_topic_watch` (gh #202): backoff 1 s → 30 s, reset on any event;
   the relist diff keys off the `Event::InitApply` topic set and only

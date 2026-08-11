@@ -8,16 +8,20 @@ that decides which broker answers for which key.
 
 **Consumer-group side**: `group.rs` (the join/sync/heartbeat/leave state
 machine, generation tracking, static-membership handling), `manager.rs`
-(group lookup/creation, ownership-filtered list/describe, offset deletion),
-`offset_store.rs` (per-group JSON files under `__consumer_offsets/`, plus
-the **pending** layer that stages transactional offsets keyed by
-`(groupID, PID)` until EndTxn commits them).
+(group lookup/creation, ownership-filtered list/describe, offset deletion —
+including `Manager::purge_topic_offsets`, which drops a deleted topic's
+committed offsets from every owned group, gh #240),
+`offset_store.rs` (per-group JSON files under
+`<KAAS_CLUSTER_DIR>/__consumer_offsets/<group>.json` — moved under the
+cluster dir by gh #223 — plus the **pending** layer that stages
+transactional offsets keyed by `(groupID, PID)` until EndTxn commits them).
 
 **Transaction side**: `txn_state.rs` (per-`transactional.id` entries,
 slot-sharded across `txn_state/slot-N.json`; all transitions are atomic
 slot-file rewrites), `marker_queue.rs` (cross-broker COMMIT/ABORT marker
 dispatch as files under `marker_queue/to-<broker>/`), `fence_log.rs`
-(cross-broker producer-epoch fence broadcast). The architecture chapters on
+(cross-broker producer-epoch fence broadcast), plus the `atomic_write.rs`
+and `errors.rs` helpers. The architecture chapters on
 [transactions](../architecture/transactions.md) and
 [consumer groups](../architecture/consumer-groups.md) explain why these are
 files and not RPCs.

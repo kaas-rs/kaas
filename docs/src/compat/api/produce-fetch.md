@@ -31,7 +31,8 @@ wire-correct) and the client's bytes land on disk verbatim — the broker never
 parses records, only fixed-size header peeks. For `acks = -1`, the append that
 crosses the flush threshold parks on the per-partition committer's group-commit
 fsync — one `sync_all()` cycle serves every concurrent appender —
-with `KAAS_FLUSH_INTERVAL_MESSAGES` (default 1) as the durability dial.
+with `KAAS_FLUSH_INTERVAL_MESSAGES` (default 1) as the durability dial,
+overridable per topic via the `flush.messages` topic config.
 
 The produce quota is checked once per request over the summed record bytes,
 after the appends, and feeds `throttle_time_ms` in the response.

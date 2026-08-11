@@ -20,7 +20,7 @@ fixed v2 header is CRC verification and the batch-header walker
 `tripwires.rs`, which tests assert are zero. The full rationale is in
 [Wire protocol & framing](../compat/wire-protocol.md).
 
-**The registry is load-bearing**: `src/api/registry.rs::ALL` (36 entries,
+**The registry is load-bearing**: `src/api/registry.rs::ALL` (40 entries,
 count-asserted by a unit test) drives the ApiVersions response, the
 header-version lookup, *and* the book's
 [generated API matrix](../compat/api-matrix.md) — adding an API without a

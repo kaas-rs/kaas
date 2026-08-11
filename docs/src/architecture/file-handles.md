@@ -33,9 +33,9 @@ When `assignment.json` moves a partition (the
 
 - **New leader**: takeover opens the log + index handles, restores the
   idempotent-producer snapshot, and runs segment recovery — scanning
-  the active segment forward to the first malformed batch boundary and
-  reconciling the manifest's possibly-stale high watermark against
-  what's actually on disk. Recovery runs at takeover time precisely
+  the active segment forward, verifying each batch's CRC, truncating
+  any torn tail to the last valid byte, and reconciling the manifest's
+  possibly-stale high watermark against what's actually on disk. Recovery runs at takeover time precisely
   *because* the manifest is allowed to lag (see
   [Storage engine hot path](./storage-hot-path.md)). It then raises the
   partition's epoch to the one the assignment carries, **rolls to a
@@ -111,16 +111,18 @@ is the topic-identity stamp — see
 
 ## Graceful SIGTERM drain
 
-The broker's shutdown path relinquishes every open partition *before*
-flushing manifests — persisting each manifest one final time **and**
+The broker's shutdown path relinquishes every open partition —
+persisting each manifest and producer snapshot one final time **and**
 closing the active segment's handles, so the next leader doesn't
-inherit a silly-rename fight on takeover. Manifest flushing stays as
-defence-in-depth after the relinquish pass.
+inherit a silly-rename fight on takeover.
 
-There is no controlled-shutdown RPC: after the drain, the controller
-notices the broker's heartbeats stopping and rebalances reactively. A
-proactive "I'm draining, move my partitions first" hint is an open
-follow-up.
+There is no controlled-shutdown RPC, but the drain is announced:
+before teardown the broker sets its drain flag, which rides the next
+heartbeat, and the controller moves its partitions off while the
+broker is still healthy enough to hand them over — the proactive
+"I'm draining" hint, rather than a heartbeat-timeout discovery. See
+[Broker fencing](./broker-fencing.md) for the draining state's other
+half.
 
 This whole chapter is one discipline in service of a larger contract —
 the rules any code touching the shared volume must obey. That contract

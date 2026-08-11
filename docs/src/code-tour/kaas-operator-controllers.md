@@ -1,6 +1,6 @@
 # kaas-operator-controllers
 
-One reconciler per CRD, materializing state to files on the shared PVC, plus leader-elected startup sweeps for orphans.
+One reconciler per CRD, materializing state to files on the shared PVC, plus leader-elected orphan sweeps (at election, then every 5 minutes).
 
 Two layers:
 
@@ -11,16 +11,19 @@ Two layers:
   owns the `<user>-kafka-credentials` Secret; the gh #104 pre-derived
   passthrough enables zero-downtime rotation), `kafkacluster_controller.rs`
   (cert-manager Certificates, per-broker Services, Gateway TLSRoutes — all
-  with OwnerReferences).
+  with OwnerReferences; also idempotently creates the per-cluster
+  `KafkaClusterAssignments` CR, create-only).
 - **Helpers** — `credentials.rs` + `acls.rs` (the file materializers),
-  `sweep.rs` (the leader-elected startup sweep that drops topic dirs and
-  credential entries with no matching CR), `conditions.rs` (status
-  conditions), `observer.rs` (reconcile counters).
+  `sweep.rs` (the leader-elected orphan sweep — an initial pass at leader
+  election plus a periodic re-run every 5 minutes, resumable across
+  interrupted passes, gh #205 — dropping topic dirs and credential entries
+  with no matching CR), `conditions.rs` (status conditions), `errors.rs`,
+  `observer.rs` (reconcile counters).
 
 **The cleanup model is the crate's defining decision — no finalizers.**
 Deleting CRs never blocks on the operator being alive; Kubernetes GC
-handles owned resources, and the startup sweep reclaims on-disk leftovers
-on the next operator start. The ArgoCD cascade-delete deadlock that forced
+handles owned resources, and the sweep reclaims on-disk leftovers on the
+next pass. The ArgoCD cascade-delete deadlock that forced
 this design is told in
 [Kubernetes integration](../architecture/kubernetes.md).
 

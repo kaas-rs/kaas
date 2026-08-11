@@ -18,7 +18,8 @@ brokers, but **files on the shared volume** that brokers read directly.
 
 Four CRDs — `KafkaCluster`, `KafkaTopic`, `KafkaUser`, and the
 read-only `KafkaClusterAssignments` debug mirror; the
-[overview](./overview.md) table shows what each materializes into. The
+[overview](./overview.md) table shows what each materializes into, and
+the [CRD reference](../operations/crds.md) documents every field. The
 CRD YAML ships bundled with the Helm chart. `KafkaUser` mirrors Strimzi
 1:1 for `spec.authentication` / `spec.authorization`, with two
 deliberate divergences:
@@ -34,16 +35,23 @@ deliberate divergences:
   `spec.authorization.acls`; granting the same rule to N principals
   means repeating it on N CRs — the standard Strimzi-pattern trade.
 
+`KafkaUser.spec.authentication` is optional: an authorization-only user
+— an OAuth principal, named by `metadata.name` — carries only
+`authorization` and optional `quotas`, and materializes no credential
+entry (see [Listeners, authentication,
+authorization](./listeners-auth.md)).
+
 ### TopicID (KIP-516) — where it stands
 
 The `KafkaTopic` reconciler mints a v4 UUID into `Status.TopicID` on
 first reconcile and never rotates it, so a re-created topic gets a
 distinct ID — Apache's contract. Honesty note about the other half: the
-broker-side plumbing that would carry that UUID to the wire exists but
-**is not wired into the production topic watch** — every topic-registry
-entry currently carries the all-zero sentinel, so Metadata v10+ serves
-nil topic IDs for all topics. Clients treat that as "broker doesn't
-expose topic IDs" and fall back to names. See the [KIP
+broker's topic watch *does* deliver that UUID into the topic registry,
+where it backs the stale-directory identity gate (a broker refuses to
+open a directory stamped with a previous incarnation's ID) — but it is
+deliberately kept out of the wire-facing metadata, so Metadata v10+
+still serves nil topic IDs for all topics. Clients treat that as
+"broker doesn't expose topic IDs" and fall back to names. See the [KIP
 index](../compat/kip-index.md) for the tracked gap.
 
 ## Operator reconcile loops
@@ -52,7 +60,8 @@ One reconciler per CRD. None of them use cleanup finalizers — deleting
 a CR never blocks on the operator being alive; owned Kubernetes
 resources carry `OwnerReferences` so garbage collection is
 Kubernetes-native, and on-disk leftovers are reclaimed by a
-leader-elected sweep at operator startup.
+leader-elected sweep that runs at leader election and every five
+minutes thereafter.
 
 ```mermaid
 flowchart LR
@@ -62,7 +71,7 @@ flowchart LR
         rt["KafkaTopic reconciler<br/>requeue 300 s"]
         ru["KafkaUser reconciler<br/>await_change"]
         rc["KafkaCluster reconciler<br/>requeue 300 s"]
-        sweep["startup sweep — once, on leadership:<br/>drop topic dirs + credential entries<br/>with no matching CR"]
+        sweep["orphan sweep — on leadership,<br/>then every 5 min: drop topic dirs +<br/>credential entries with no matching CR"]
     end
 
     api --> rt
@@ -74,7 +83,7 @@ flowchart LR
     ru --> creds["__cluster/credentials.json (upsert user)<br/>__cluster/acls.json (rebuilt from all users)"]
     ru --> secret["&lt;user&gt;-kafka-credentials Secret<br/>OwnerReference → K8s GC"]
     rc --> plumbing["cert-manager Certificates ·<br/>per-broker Services · TLSRoutes<br/>OwnerReferences → K8s GC"]
-    rc --> kca["KafkaClusterAssignments CR<br/>create-only; the controller broker<br/>mirrors assignments into it"]
+    rc --> kca["KafkaClusterAssignments CR<br/>create-only; reserved as the assignment<br/>debug mirror (status writer not wired yet)"]
     sweep --> dirs
     sweep --> creds
 ```
@@ -87,22 +96,29 @@ Reconciler guard rails worth knowing:
 - **KafkaUser** with a missing referenced Secret parks on
   `await_change` instead of hot-looping.
 - **KafkaClusterAssignments** has no reconciler at all: the operator
-  only creates it (with an OwnerReference); its status is written
-  fire-and-forget by the controller broker, and brokers never read it
-  back.
+  only creates it (with an OwnerReference). It is reserved as the
+  controller broker's assignment debug mirror, but the status writer
+  is not wired yet, so its status is empty today; brokers never read
+  it either way.
 - A CR with `deletionTimestamp` set is left untouched by the
   reconcilers; cleanup happens via K8s GC (owned resources) and the
-  startup sweep (on-disk state).
+  orphan sweep (on-disk state).
 
 ## What brokers do with the CRDs
 
 On the broker side, the CRD surface is read-mostly — but not read-only:
 the Kafka admin APIs `CreatePartitions` and `IncrementalAlterConfigs`
 are served by patching the `KafkaTopic` CR (`spec.partitions` /
-`spec.config`), and `CreateTopics` mints a fresh one. The operator then
-materializes the change as usual. That is why broker RBAC carries
-`update,patch` on `kafkatopics` in addition to the read verbs. Why
-admin writes route through CRs at all is covered in
+`spec.config`), `CreateTopics` mints a fresh one, `DeleteTopics`
+deletes it, and `AlterReplicaLogDirs` records partition moves in the
+CR's status. The user side works the same way against existing
+`KafkaUser` CRs: the ACL admin APIs edit `spec.authorization.acls`, the
+SCRAM admin API (KIP-554) patches `spec.authentication.scram`, and the
+quota admin API patches `spec.quotas`. The operator then materializes
+the change as usual. That is why broker RBAC carries the full verb set
+on `kafkatopics` (including `create` and `delete`), `get,update,patch`
+on `kafkatopics/status`, and read plus `update,patch` on `kafkausers`.
+Why admin writes route through CRs at all is covered in
 [Broker/operator runtime independence](./runtime-independence.md).
 
 ### ArgoCD and runtime-created topics
@@ -132,8 +148,10 @@ git" as drift in the ArgoCD UI. Off by default: non-ArgoCD installs
 get plain CRs.
 
 This applies only to CRs the broker **creates** — today, topics.
-`KafkaUser` CRs are never created at runtime: the ACL admin APIs edit
-the `spec.authorization.acls` of a user that must already exist, and
+`KafkaUser` CRs are never created at runtime: the ACL, SCRAM, and
+quota admin APIs edit the `spec.authorization.acls` /
+`spec.authentication.scram` / `spec.quotas` of a user that must
+already exist, and
 stamping ArgoCD metadata onto a git-managed resource would *cause* the
 drift the annotations exist to avoid. Runtime ACL edits to git-managed
 users therefore still show as drift until the next sync — the
@@ -151,12 +169,13 @@ design:
   Secrets) carry `OwnerReferences` — Kubernetes GC handles them with no
   operator involvement.
 - **On-disk state** (topic dirs, credential entries) is reclaimed by
-  the leader-elected **startup sweep**, which drops anything on the
-  volume with no matching CR.
+  the leader-elected **orphan sweep** — run at leader election and
+  every five minutes thereafter — which drops anything on the volume
+  with no matching CR.
 
 Deleting the operator, the CRs, or both in any order can no longer
-wedge — the cost is that on-disk cleanup happens at the *next operator
-start* rather than synchronously with the delete.
+wedge — the cost is that on-disk cleanup lands at the next sweep pass,
+within minutes, rather than synchronously with the delete.
 
 ## Readiness gate
 

@@ -140,10 +140,15 @@ Three properties that make this work:
    sticky `Stalled` error, and the partition fails fast instead of
    hanging appenders forever.
 
-Note the current committer holds the partition mutex for the fsync
-window (readers are unaffected via the ArcSwap; concurrent appenders
-queue on the lock). Fsyncing a cloned FD outside the mutex is a known
-follow-up, not what ships today.
+Note the committer holds the partition mutex for the fsync window
+(readers are unaffected via the ArcSwap; concurrent appenders queue on
+the lock). Fsyncing a cloned FD outside the mutex was built, measured,
+and deliberately **reverted**: it moved no throughput (the produce
+ceiling is set by write round-trips, not the lock — see
+[Performance](../operations/performance.md)) and it made a subtle
+invariant durability-critical — the flush sequence published to
+waiting producers had to be the one sampled *before* the sync. Don't
+rebuild it without new evidence.
 
 ## On-disk layout
 
@@ -153,7 +158,7 @@ follow-up, not what ships today.
     credentials.json
     acls.json
     txn_state/
-        slot-00.json              ── 50 slots, hash(transactional_id) % 50
+        slot-0.json               ── 50 slots, hash(transactional_id) % 50
         ...
     producer_fences/
         from-kaas-0.json          ── one per broker; cross-broker producer
@@ -182,6 +187,11 @@ follow-up, not what ships today.
     ...
 ```
 
+(With a [volume pool](./volume-pool.md), a topic bound to a pool
+volume keeps this exact layout under `/vols/<name>/` instead of
+`/data/`; the topic-level `.config.json` / `.topic-id.json` are
+written per involved root.)
+
 `__cluster/` is the cluster-state directory — kaas's file-shaped
 replacement for Kafka's internal topics. It can live on its own volume,
 separate from topic data; see
@@ -199,8 +209,14 @@ never physically collide with a new leader's segment:
 The manifest is written on partition open (takeover routes through
 open) and on close/relinquish — **not** on segment roll and not per
 append — so its `highWatermark` can lag in-memory state; recovery
-treats the log as authoritative and reconciles on open by scanning the
-active segment to the first malformed batch boundary. Who runs that
+treats the log as authoritative and reconciles on open. The recovery
+scan validates each batch against its own CRC32C and stops at the
+first batch that is short, structurally impossible, or fails its
+checksum; the log is then **truncated to the last valid byte** before
+any write handle is used, so a torn tail from a crash can never be
+appended past (which would strand acknowledged records behind
+unparseable garbage). Truncation only ever removes bytes the scan
+proved unparseable — a clean log is never touched. Who runs that
 recovery, and when, is the next chapter —
 [file-handle ownership & takeover](./file-handles.md).
 
@@ -223,9 +239,13 @@ size.
 The clean-shutdown fast path falls out for free and on **one** code
 path: a graceful close leaves the checkpoint at EOF, so "scan from
 checkpoint to EOF" reads zero bytes — the same path a crash takes,
-which scans only the gap. The checkpoint is a pure optimization hint:
-because a missing or wrong one just triggers a full scan, it never has
-to be correct, only usually-present.
+which scans only the gap. A *missing* checkpoint is harmless (full
+scan), but the checkpoint is not purely advisory: it seeds the
+recovered high watermark, and the scan trusts everything before its
+`byte_pos` without re-verifying it. That is why a fenced leader's
+close deliberately skips writing the checkpoint — a stale one from a
+superseded leader could seed the wrong watermark — and why corruption
+*before* the checkpointed position is trusted, not detected.
 
 The index is **sparse**: one `(rel_offset: i32, file_pos: i32)` entry
 every `index.interval.bytes` of log data (4 KiB default). Lookup
@@ -369,5 +389,6 @@ ownership](./file-handles.md).
 - The producer-fence files and marker queue in the layout above belong
   to the transaction machinery (gh #108 phase 2, gh #175) — see
   [Transactions & idempotence](./transactions.md).
-- Index mmap is feature-gated behind `mmap`, the one unsafe-code
-  carve-out in the workspace.
+- The index is read into memory on open; an mmap-backed index is
+  future work noted in `segment.rs` (the workspace forbids unsafe
+  code, so it would need a vetted dependency).

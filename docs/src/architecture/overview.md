@@ -74,9 +74,9 @@ into on-disk config files and Kubernetes plumbing:
 | CRD | Materialized as |
 |---|---|
 | `KafkaCluster` | external-listener plumbing: cert-manager Certificates, per-broker Services, Gateway TLSRoutes |
-| `KafkaTopic` | `/data/<topic>/<partition>/` directories + `.config.json`; `Status.TopicID` UUID (KIP-516) |
-| `KafkaUser` | entries in `/data/__cluster/credentials.json` + `acls.json` |
-| `KafkaClusterAssignments` | nothing — read-only debug mirror, written by the controller broker |
+| `KafkaTopic` | `/data/<topic>/<partition>/` directories + `.config.json` (partitions bound to a [volume pool](./volume-pool.md) live under `/vols/<name>/…` instead); `Status.TopicID` UUID (KIP-516) |
+| `KafkaUser` | entries in `/data/__cluster/credentials.json` + `acls.json` (an authorization-only user — e.g. an OAuth principal — has no credential to materialize and contributes ACLs only) |
+| `KafkaClusterAssignments` | nothing — reserved as a read-only assignment debug mirror (status writer not wired yet) |
 
 The operator does **not** sit on the data path: brokers serve traffic
 even if the operator is crash-looping. Why that holds is the subject of
@@ -90,11 +90,15 @@ each in a specific place:
 
 1. **Same-directory rename atomicity** — the manifest and every cluster
    file are written tmp + fsync + rename.
-2. **Fsync durability** — the group-commit cycle's `sync_all()` is the
-   `acks=all` promise.
+2. **Exclusive-create atomicity** (`open` with `O_CREAT|O_EXCL`) —
+   exactly one racer wins where a file is the lock.
 3. **Close-to-open consistency** — a transaction-state file written and
    closed by one broker reads back complete on the next broker that
    opens it.
+
+On top of the three, fsync must be honest: the group-commit cycle's
+`sync_all()` is the `acks=all` promise, so a substrate that lies about
+durability breaks everything.
 
 The full contract — what those three guarantees do and don't buy, and
 the rules for code that touches the volume — is [The RWX substrate

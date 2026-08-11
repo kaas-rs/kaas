@@ -108,7 +108,9 @@ correctness gap.
 
 - **KIP-48 (delegation tokens)** — token auth targets large multi-tenant
   clusters brokering their own trust; kaas deployments authenticate via
-  SCRAM or mTLS backed by Kubernetes-managed secrets.
+  SCRAM or mTLS backed by Kubernetes-managed secrets, or — for
+  token-shaped needs — OAuth bearer tokens on an
+  [OAUTHBEARER listener](../architecture/listeners-auth.md).
 - **KIP-664 (Describe/ListTransactions)** — admin tooling over
   coordinator state; a follow-up. Until then the slot files on the
   volume are directly inspectable, which covers the debugging use case

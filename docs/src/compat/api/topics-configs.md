@@ -81,10 +81,13 @@ Deletes topics by name — `kafka-topics.sh --delete`,
 
 **Handling**: per topic, the handler deletes the `KafkaTopic` CR, then drops
 the topic from the in-memory registry. The operator's reconcile tears down the
-partition directories; before that lands, the topic watcher fires the
-topic-deleted event on every broker the moment `deletionTimestamp` appears, so
-the leader closes its open log/index file handles first — otherwise NFS
-silly-renames the open files and the operator's directory delete wedges (see
+partition directories; before that lands, every broker's topic watch sees the
+Kubernetes delete event, drops the topic from its registry, abandons the open
+partitions (closing log/index file handles without persisting state — the
+topic is gone, not handed over), and purges the topic's committed
+consumer-group offsets, as Apache tombstones them out of
+`__consumer_offsets`. Closing the handles first matters because NFS
+silly-renames open files and the operator's directory delete wedges (see
 [File-handle ownership](../../architecture/file-handles.md)). A missing CR
 answers `UNKNOWN_TOPIC_OR_PARTITION` (3); other writer errors are reported as
 `INVALID_REQUEST` (42) with a message. In dev mode only the registry removal

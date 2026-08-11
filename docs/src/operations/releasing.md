@@ -1,6 +1,6 @@
 # Releasing
 
-Tag-driven releases: broker + operator images and the Helm chart, published to GHCR on every `v0.2.N-preview` tag.
+Tag-driven releases: broker + operator images and the Helm chart, published to GHCR on every release tag.
 
 The canonical, step-by-step procedure lives in `docs/RELEASING.md` in the
 repository — this chapter is the orientation summary.
@@ -15,7 +15,7 @@ artifacts to GHCR:
 - the operator image — `ghcr.io/kaas-rs/kaas-operator[-preview]`
 - the Helm chart — `oci://ghcr.io/kaas-rs/charts/kaas`
 
-Pre-release tags (anything containing `-`, like `v0.2.4-preview`) get the
+Pre-release tags (anything containing `-`, like `v0.3.1-preview`) get the
 `-preview` image-name suffix automatically; the chart's image helpers
 derive the same suffix from the tag, so the chart default always points at
 images that exist.
@@ -24,9 +24,11 @@ images that exist.
 
 1. **Tags are immutable.** Never re-cut or force-move a tag. A bad release
    is fixed by the next patch number, not by rewriting the old one.
-2. **Always bump the patch**: `v0.2.N-preview` → `v0.2.N+1-preview`. (The
-   one historical exception: the `v0.1.190-preview` → `v0.2.0-preview`
-   jump at the Go→Rust cutover.)
+2. **Bump the patch by default**: `v0.3.N-preview` → `v0.3.N+1-preview`.
+   Minor bumps are deliberate markers for new surfaces, not routine —
+   two so far: `v0.1.190-preview` → `v0.2.0-preview` at the Go→Rust
+   cutover, and `v0.2.47-preview` → `v0.3.0-preview` for the new
+   SASL/OAUTHBEARER authentication surface (see `docs/RELEASING.md`).
 
 ## Upgrades before v1
 
