@@ -2211,6 +2211,57 @@ mod tests {
         });
     }
 
+    /// gh #267: the takeover roll of a segment adopted at open must not
+    /// date it at epoch 1970. Pre-fix, `open_meta_only` initialized the
+    /// in-process largest-timestamp tracker to 0, the roll stamped that
+    /// into the closed meta, and `cleanup_target_for_time` — which
+    /// treats any value >= 0 as known — reaped the whole segment as
+    /// "expired" on the next time-retention sweep: every rolling
+    /// restart deleted up to retention.ms of fresh data within 5 min.
+    #[test]
+    fn a_rolled_adopted_segment_is_dated_by_mtime_not_epoch_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let open = |fs: Arc<dyn Fs>| {
+                Partition::open(
+                    fs,
+                    "t".into(),
+                    0,
+                    tmp.path().to_path_buf(),
+                    PartitionConfig::default(),
+                )
+            };
+            // Produce, then a clean close: the restart-shaped handoff.
+            let p = open(fs.clone()).await.unwrap();
+            p.append(0, -1, build_batch(3, 1_000)).await.unwrap();
+            p.close().await.unwrap();
+
+            // Reopen (adopts the segment) and take over (rolls it
+            // closed) — the sequence every restart runs.
+            let p2 = open(fs.clone()).await.unwrap();
+            p2.take_over(2).await.unwrap();
+            let stamps = p2.closed_segment_max_timestamps();
+            assert_eq!(stamps.len(), 1);
+            assert_eq!(
+                stamps[0],
+                crate::segment::UNKNOWN_MAX_TIMESTAMP,
+                "adopted segment rolled closed must not claim a known timestamp"
+            );
+
+            // The retention question itself: with a 7-day cutoff in the
+            // past of "now", a freshly-written file must NOT be reaped.
+            // Pre-fix this returned a target covering the whole segment.
+            let cutoff = crate::segment::now_epoch_ms() - 7 * 24 * 3600 * 1000;
+            assert_eq!(
+                p2.cleanup_target_for_time(fs.as_ref(), cutoff),
+                None,
+                "time retention reaped a minutes-old segment (dated 1970)"
+            );
+            p2.close().await.unwrap();
+        });
+    }
+
     /// gh #168: a sticky `flush_err` heals once the substrate answers
     /// again — the probe loop clears the poison and appends resume,
     /// instead of the partition staying dead until a restart. Takes

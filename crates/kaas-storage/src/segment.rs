@@ -515,7 +515,13 @@ impl ActiveSegment {
             log_size: 0,
             last_offset: base_offset - 1,
             last_indexed_log_pos: 0,
-            max_timestamp: 0,
+            // gh #267: UNKNOWN, not 0 — this value gets stamped into
+            // the closed SegmentMeta on roll, and the cleaner treats
+            // any value >= 0 as a real timestamp. A 0 dates the
+            // segment at epoch 1970, which time retention reaps on
+            // its next sweep. `append_batch` only ever raises it, so
+            // a segment with observed appends stamps a real value.
+            max_timestamp: UNKNOWN_MAX_TIMESTAMP,
             created_at_ms: Some(now_epoch_ms()),
         })
     }
@@ -533,7 +539,14 @@ impl ActiveSegment {
             log_size,
             last_offset: 0,
             last_indexed_log_pos: 0,
-            max_timestamp: 0,
+            // gh #267: UNKNOWN, not 0. This is the arm that ate data:
+            // the takeover roll on every restart closed the adopted
+            // active segment with this value stamped as its largest
+            // timestamp, and a 0 reads as epoch 1970 — time retention
+            // reaped the whole segment on its next sweep. UNKNOWN
+            // routes the cleaner to its mtime fallback, which is the
+            // documented dating for inherited segments.
+            max_timestamp: UNKNOWN_MAX_TIMESTAMP,
             // Adopted from disk — this process didn't create it, so
             // `age_ms` dates it by the file instead.
             created_at_ms: None,
