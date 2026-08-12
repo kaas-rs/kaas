@@ -159,10 +159,61 @@ impl DiskStorageEngine {
         }
     }
 
+    /// Directory hosting `(topic, partition)`'s data — **where the data
+    /// actually is**, not merely where the current placement record says
+    /// it should be (gh #234).
+    ///
+    /// Placement is eventually-consistent: a topic's partitions are
+    /// routinely opened *before* the operator writes
+    /// `status.volumeAssignments` (the CR-create event triggers the
+    /// takeover; the status lands moments later), and pre-fix the data
+    /// landed on the default root while the next restart re-derived the
+    /// assigned pool root, found it empty, and created fresh 0-byte
+    /// segments there — half of `kperf-bench` went invisible exactly
+    /// this way. The cure is precedence, mirroring the gh #219 rule
+    /// that on-disk reality outranks derived state:
+    ///
+    /// 1. The assigned root's dir has a `manifest.json` → assigned root
+    ///    (the normal case, and the post-migration case — a log-dir
+    ///    move copies the manifest to the target before the placement
+    ///    record flips).
+    /// 2. Otherwise, a *different* known root already holds a manifest
+    ///    for this partition → that root wins, loudly. Data never moves
+    ///    because a status record showed up late; only the explicit
+    ///    migration path (`move_partition_to_log_dir`) relocates bytes.
+    /// 3. No manifest anywhere → assigned root (fresh create).
+    ///
+    /// When several foreign roots hold manifests (shouldn't happen —
+    /// a crashed migration leaves the record pointing at the source),
+    /// the default root wins if present, else the first pool root by
+    /// declaration order: deterministic beats clever here.
     fn partition_dir(&self, topic: &str, partition: i32) -> PathBuf {
-        self.log_dir_root(topic, partition)
-            .join(topic)
-            .join(partition.to_string())
+        let assigned_root = self.log_dir_root(topic, partition);
+        let sub = |root: &Path| root.join(topic).join(partition.to_string());
+        let has_manifest = |root: &Path| self.fs.stat(&sub(root).join("manifest.json")).is_ok();
+
+        if has_manifest(&assigned_root) {
+            return sub(&assigned_root);
+        }
+        let adopted = std::iter::once(self.data_dir.clone())
+            .chain(self.extra_log_dirs.iter().map(|d| d.path.clone()))
+            .filter(|root| *root != assigned_root)
+            .find(|root| has_manifest(root));
+        match adopted {
+            Some(root) => {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    assigned = %assigned_root.display(),
+                    actual = %root.display(),
+                    "partition data lives outside its assigned log dir; \
+                     serving from where the data is (gh #234) — use the \
+                     migration path to relocate it"
+                );
+                sub(&root)
+            }
+            None => sub(&assigned_root),
+        }
     }
 
     /// Directory holding `topic`'s topic-level files (`.config.json`,
@@ -980,6 +1031,74 @@ mod tests {
             assert_eq!(dirs.len(), 2);
             assert_eq!(dirs[0].name, "default");
             assert_eq!(dirs[1].name, "fast");
+        });
+    }
+
+    /// gh #234: a topic opened before `status.volumeAssignments` lands
+    /// writes to the default root; when the assignment shows up and the
+    /// broker restarts, the partition must keep serving the data where
+    /// it actually is — not resolve to the (empty) assigned pool root
+    /// and quietly come up as a fresh 0-byte log.
+    #[test]
+    fn late_placement_does_not_orphan_data_on_the_default_root() {
+        use crate::engine::{LogDirInfo, PlacementResolver};
+        struct AssignBulk;
+        impl PlacementResolver for AssignBulk {
+            fn log_dir_of(&self, _topic: &str, _partition: i32) -> Option<String> {
+                Some("bulk".to_owned())
+            }
+        }
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let default_root = tmp.path().join("data");
+            let bulk_root = tmp.path().join("bulk");
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let e = DiskStorageEngine::new(
+                fs.clone(),
+                default_root.clone(),
+                PartitionConfig::default(),
+            )
+            .with_extra_log_dirs(vec![LogDirInfo {
+                name: "bulk".to_owned(),
+                path: bulk_root.clone(),
+                default_eligible: true,
+                cordoned: false,
+                labels: Default::default(),
+            }]);
+
+            // Phase 1: no placement yet (the status write hasn't
+            // landed). Data goes to the default root.
+            e.create_partition("t", 0).await.unwrap();
+            e.append("t", 0, 0, -1, build_batch(3, 1_000))
+                .await
+                .unwrap();
+            let hwm = e.high_watermark("t", 0).unwrap();
+            assert_eq!(hwm, 3);
+            assert!(default_root.join("t/0/manifest.json").is_file());
+
+            // Phase 2: the assignment lands; a restart relinquishes and
+            // reopens every partition.
+            e.relinquish_all().await.unwrap();
+            e.set_placement_resolver(Arc::new(AssignBulk));
+            let recovered = e.take_over("t", 0, 2).await.unwrap();
+            assert_eq!(
+                recovered, hwm,
+                "reopen must serve the data where it is, not an empty \
+                 log on the assigned pool root"
+            );
+            assert!(
+                !bulk_root.join("t/0").exists(),
+                "no empty shell may be created on the assigned root"
+            );
+            // Reported log dir keeps naming the assignment (that is the
+            // record's job); the data path is what must not move.
+            assert_eq!(e.partition_log_dir("t", 0), "bulk");
+
+            // Phase 3: a genuinely fresh partition under the same
+            // placement is created at its assigned root.
+            e.create_partition("t", 1).await.unwrap();
+            assert!(bulk_root.join("t/1/manifest.json").is_file());
+            e.relinquish_all().await.unwrap();
         });
     }
 
