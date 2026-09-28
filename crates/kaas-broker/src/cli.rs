@@ -673,4 +673,32 @@ mod tests {
         assert!(tls.client_ca_path.is_some());
         assert_eq!(v[0].authentication_type.as_deref(), Some("mtls"));
     }
+
+    /// The exact shape the chart renders for a per-listener `clientCA`
+    /// (`kaas.listenersJSON`): the mtls listener carries the object form
+    /// of `tls` with its own clientCaPath, next to a SCRAM listener that
+    /// keeps the boolean form. Client-cert verification is armed from
+    /// clientCaPath per listener, so this is what keeps SCRAM/OAuth
+    /// clients from being asked for a certificate.
+    #[test]
+    fn chart_per_listener_client_ca_shape_parses() {
+        let v: Vec<ListenerEntry> = serde_json::from_str(
+            r#"[
+              {"authentication":{"type":"scram-sha-512"},"name":"scram","port":9095,"tls":true,"type":"internal"},
+              {"authentication":{"type":"mtls"},"name":"mtls","port":9093,
+               "tls":{"certPath":"/tls/tls.crt","clientCaPath":"/tls-client-ca/mtls/ca.crt","keyPath":"/tls/tls.key"},
+               "type":"internal"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(v[0].authentication_type.as_deref(), Some("scram-sha-512"));
+        assert!(v[0].tls.is_some());
+        let mtls = v[1].tls.as_ref().unwrap();
+        assert_eq!(v[1].authentication_type.as_deref(), Some("mtls"));
+        assert_eq!(mtls.cert_path, PathBuf::from("/tls/tls.crt"));
+        assert_eq!(
+            mtls.client_ca_path.as_deref(),
+            Some(std::path::Path::new("/tls-client-ca/mtls/ca.crt"))
+        );
+    }
 }

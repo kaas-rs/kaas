@@ -191,6 +191,7 @@ the model; this is the field reference. Defaults ship four entries:
 | `type` | `internal` (headless-Service DNS) or `external` (per-broker plumbing below). |
 | `tls` | Independent of authentication; `tls: true` + `type: none` is opportunistic TLS. |
 | `authentication.type` | `none` / `scram-sha-512` / `plain` / `mtls` / `oauth`. `mtls` requires `tls: true`; SASL PLAIN and OAUTHBEARER are *refused* over non-TLS connections at runtime (they carry reusable credentials). Anonymous listeners skip ACL evaluation entirely unless `auth.requireSasl` arms them. |
+| `clientCA.existingSecret` / `key` | Internal TLS listeners only (default key `ca.crt`): the Secret holding the CA that signs client certificates. Only *this* listener then requires a client certificate — SCRAM or OAuth listeners on the same broker keep accepting certificate-less clients, the way Apache Kafka's per-listener `listener.name.<name>.ssl.client.auth` works. Required for an internal `mtls` listener (the template fails without it); the external listener uses its own `clientCA.enabled` block below. |
 
 ### `external`-type extras
 

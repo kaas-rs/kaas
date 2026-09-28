@@ -138,6 +138,22 @@ var without escape gymnastics.
 {{- if hasKey . "tls" -}}
 {{- $tls = .tls -}}
 {{- end -}}
+{{- /* Per-listener client-certificate trust: a non-external TLS
+       listener with `clientCA.existingSecret` gets the broker's object
+       form of `tls`, whose clientCaPath arms client-cert verification
+       on that listener alone (KAAS_TLS_CLIENT_CA_FILE would arm it on
+       every TLS listener). The CA is mounted by broker-statefulset.yaml
+       at the path built by kaas.listenerClientCAPath. */ -}}
+{{- $clientCA := include "kaas.listenerClientCASecret" . -}}
+{{- if and $clientCA (not $tls) -}}
+{{- fail (printf "listener %q: clientCA needs tls: true" .name) -}}
+{{- end -}}
+{{- if and (eq $authDict.type "mtls") (ne .type "external") (not $clientCA) -}}
+{{- fail (printf "listener %q: authentication.type mtls needs clientCA.existingSecret (the CA that signs client certificates)" .name) -}}
+{{- end -}}
+{{- if $clientCA -}}
+{{- $tls = dict "certPath" "/tls/tls.crt" "keyPath" "/tls/tls.key" "clientCaPath" (include "kaas.listenerClientCAPath" .) -}}
+{{- end -}}
 {{- $out = append $out (dict
   "name" .name
   "port" (.port | int)
@@ -147,6 +163,25 @@ var without escape gymnastics.
 {{- end -}}
 {{- end -}}
 {{- $out | toJson -}}
+{{- end -}}
+
+{{/*
+kaas.listenerClientCASecret — the per-listener client-CA Secret name for
+one `.Values.listeners` entry, or "" when it has none. External
+listeners are excluded: they keep their own `clientCA.enabled` block
+wired through KAAS_TLS_CLIENT_CA_FILE.
+
+kaas.listenerClientCAPath — where broker-statefulset.yaml mounts that
+Secret's CA key for the listener, as the broker reads it.
+*/}}
+{{- define "kaas.listenerClientCASecret" -}}
+{{- if and (ne .type "external") .clientCA .clientCA.existingSecret -}}
+{{- .clientCA.existingSecret -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "kaas.listenerClientCAPath" -}}
+{{- printf "/tls-client-ca/%s/%s" .name (.clientCA.key | default "ca.crt") -}}
 {{- end -}}
 
 {{/*

@@ -377,6 +377,13 @@ spec:
               mountPath: /tls-client-ca
               readOnly: true
             {{- end }}
+            {{- range .Values.listeners }}
+            {{- if and (or (not (hasKey . "enabled")) .enabled) (include "kaas.listenerClientCASecret" .) }}
+            - name: tls-client-ca-{{ .name }}
+              mountPath: /tls-client-ca/{{ .name }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
           resources: {{- toYaml .Values.broker.resources | nindent 12 }}
       volumes:
         - name: data
@@ -407,4 +414,13 @@ spec:
         - name: tls-client-ca
           secret:
             secretName: {{ $external.clientCA.existingSecret }}
+        {{- end }}
+        {{- range .Values.listeners }}
+        {{- $secret := include "kaas.listenerClientCASecret" . }}
+        {{- if and (or (not (hasKey . "enabled")) .enabled) $secret }}
+        # Per-listener client CA (see kaas.listenerClientCASecret).
+        - name: tls-client-ca-{{ .name }}
+          secret:
+            secretName: {{ $secret }}
+        {{- end }}
         {{- end }}

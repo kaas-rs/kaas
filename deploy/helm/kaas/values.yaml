@@ -395,6 +395,19 @@ observability:
 #     OIDC issuer's JWKS — see the disabled `oauth` example below).
 #
 # `mtls` requires `tls: true`; every other combination is legal.
+#
+# Client-certificate trust is per listener. A non-external TLS listener
+# takes an optional
+#
+#   clientCA:
+#     existingSecret: my-clients-ca   # Secret holding the CA bundle
+#     key: ca.crt                     # default
+#
+# and only that listener then demands a client cert signed by it — SCRAM
+# or OAuth listeners on the same broker keep serving certificate-less
+# clients. An internal `mtls` listener without `clientCA` fails the
+# template (it could never authenticate anyone). The external listener
+# keeps its own `clientCA.enabled` block below.
 # Names are user-chosen strings; they appear in
 # ConnState.Listener and become keys in the per-listener auth
 # engine map. Duplicate names or duplicate ports fail at boot

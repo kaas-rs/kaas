@@ -96,7 +96,12 @@ sequenceDiagram
 An mTLS listener satisfies the same gate at the TLS handshake instead:
 the server extracts the principal from the client certificate (through
 the KIP-371 principal-mapping rules below) and marks the connection
-authenticated before any Kafka API arrives.
+authenticated before any Kafka API arrives. Which CA the certificate
+must chain to is set per listener (the chart's `clientCA` on that
+listener entry), so — as with Apache Kafka's per-listener
+`ssl.client.auth` — an mTLS listener can sit next to SCRAM and OAuth
+TLS listeners on the same broker without those clients ever being
+asked for a certificate.
 
 Anonymous listeners are not necessarily allow-all forever: setting the
 chart's `auth.requireSasl` (the `KAAS_REQUIRE_SASL` env) hands
