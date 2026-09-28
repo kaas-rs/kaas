@@ -9,8 +9,8 @@
 # Secret (gh #136 — password Secret is optional), runs the scenarios,
 # then deletes the CR + the operator-owned credentials Secret.
 #
-# Requires auth + an admin principal:
-#   ADMIN_PROPS=/path/to/admin-client.properties
+# Requires an admin principal — the kaas-scripts KafkaUser _common.sh
+# authenticates as (optionally extended via ADMIN_PROPS=/path/to/props).
 # Requires kubectl in scope of the kaas namespace (override via
 # NAMESPACE=...).
 #
@@ -26,13 +26,11 @@ ADMIN_PROPS="${ADMIN_PROPS:-}"
 EXTRA=()
 [ -n "$ADMIN_PROPS" ] && EXTRA+=(--command-config "$ADMIN_PROPS")
 
-# ADMIN_PROPS is optional: kaas's chart ships a `plain` listener
-# (authentication.type=none) on :9092, which is also the in-cluster
-# bootstrap default. AdminClient writes through unauthenticated on
-# that listener and the gh #107 ACL writer still persists to the
-# KafkaUser CR (authorization is independent of authentication, per
-# CLAUDE.md). Set ADMIN_PROPS=/path/to/admin.properties when you want
-# to exercise the same flow against a SASL/SCRAM listener.
+# ADMIN_PROPS is optional: every call already authenticates with
+# $CLIENT_PROPS (the kaas-scripts admin principal, see _common.sh), and
+# the gh #107 ACL writer persists to the KafkaUser CR regardless of which
+# principal made the call. Set ADMIN_PROPS=/path/to/admin.properties to
+# layer extra admin-client settings over it (they win on conflict).
 
 need kubectl
 

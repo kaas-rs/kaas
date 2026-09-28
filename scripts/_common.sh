@@ -5,7 +5,10 @@
 #
 # Provides:
 #   $BOOTSTRAP     bootstrap server (override with env var, default in-cluster Service DNS)
-#   $KAFKA_BIN     path to Apache Kafka shell tools (defaults to /opt/kafka/bin)
+#   $KAFKA_BIN     Kafka shell tools, wrapped so every call authenticates (see below);
+#                  the real tools default to /opt/kafka/bin
+#   $CLIENT_PROPS  client config every tool call carries (default: built from the
+#                  kaas-scripts KafkaUser's credentials via kubectl)
 #   $NAMESPACE     Kubernetes namespace holding the cluster (defaults to kaas)
 #   $STS           broker StatefulSet name (defaults to kaas)
 #   $TOPIC         per-run unique test topic name
@@ -16,7 +19,7 @@
 
 set -euo pipefail
 
-BOOTSTRAP="${BOOTSTRAP:-kaas.kaas.svc.cluster.local:9092}"
+BOOTSTRAP="${BOOTSTRAP:-kaas.kaas.svc.cluster.local:9095}"
 KAFKA_BIN="${KAFKA_BIN:-/opt/kafka/bin}"
 NAMESPACE="${NAMESPACE:-kaas}"
 STS="${STS:-kaas}"
@@ -95,5 +98,122 @@ if [ ! -x "$KAFKA_BIN/kafka-topics.sh" ]; then
   skip "Kafka CLI not found at $KAFKA_BIN; set KAFKA_BIN=/path/to/kafka/bin"
 fi
 
+# --- Authentication ---------------------------------------------------------
+#
+# The cluster has no anonymous listener, so every tool call has to carry
+# credentials. Rather than thread a config flag through each of the ~110
+# call sites, KAFKA_BIN is pointed at a directory of thin wrappers that add
+# `--command-config $CLIENT_PROPS` to any call that names a broker
+# (--bootstrap-server, or bootstrap.servers= in --producer-props) and then
+# runs the real tool. The scripts keep reading like plain Apache
+# Kafka CLI usage.
+#
+# CLIENT_PROPS defaults to SCRAM-SHA-512 over TLS as the `kaas-scripts`
+# KafkaUser (an admin principal — the suite exercises ACLs, configs,
+# delete-records and group deletes), built from the operator-generated
+# password Secret and the chart's broker CA. Set CLIENT_PROPS to run as
+# someone else, or KAAS_SCRIPTS_USER to pick another KafkaUser's Secret.
+# Missing credentials fail the script outright: a skip would let the whole
+# suite report green without having exercised anything.
+KAAS_SCRIPTS_USER="${KAAS_SCRIPTS_USER:-kaas-scripts}"
+if [ -z "${CLIENT_PROPS:-}" ]; then
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo ">> ERROR: no CLIENT_PROPS set and no kubectl to build one from the" \
+         "${KAAS_SCRIPTS_USER} KafkaUser" >&2
+    exit 1
+  fi
+  # Written with a 077 umask and removed with $TMP on exit; the password is
+  # never echoed.
+  (
+    umask 077
+    pw="$(kubectl -n "$NAMESPACE" get secret "${KAAS_SCRIPTS_USER}-kafka-credentials" \
+      -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"
+    [ -n "$pw" ] || exit 1
+    kubectl -n "$NAMESPACE" get secret "${STS}-broker-internal-tls" \
+      -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d > "$TMP/ca.crt"
+    [ -s "$TMP/ca.crt" ] || exit 1
+    cat > "$TMP/client.properties" <<EOF
+security.protocol=SASL_SSL
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAAS_SCRIPTS_USER}" password="${pw}";
+ssl.truststore.type=PEM
+ssl.truststore.location=$TMP/ca.crt
+EOF
+  ) || {
+    echo ">> ERROR: could not build client credentials from Secret" \
+         "${NAMESPACE}/${KAAS_SCRIPTS_USER}-kafka-credentials and the broker CA" \
+         "(${NAMESPACE}/${STS}-broker-internal-tls); set CLIENT_PROPS instead" >&2
+    exit 1
+  }
+  CLIENT_PROPS="$TMP/client.properties"
+fi
+export CLIENT_PROPS
+
+# The wrapper. Config flags a script already passes (--producer.config,
+# --consumer.config, --config-file, …) are folded into the one
+# --command-config file after CLIENT_PROPS, so the script's own settings
+# win on conflict and each tool still sees a single config flag.
+# kafka-e2e-latency's legacy positional form takes the properties file as
+# its optional 6th argument instead.
+REAL_KAFKA_BIN="$KAFKA_BIN"
+KAFKA_BIN="$TMP/bin"
+mkdir -p "$KAFKA_BIN"
+cat > "$KAFKA_BIN/.auth-exec" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+real="$1"; shift
+tool="$(basename "$real")"
+
+if [ "$tool" = kafka-e2e-latency.sh ] && [ $# -eq 5 ] && [ "${1#-}" = "$1" ]; then
+  exec "$real" "$@" "$CLIENT_PROPS"
+fi
+
+# A network call names its brokers either with --bootstrap-server or, for
+# the perf tools' --producer-props form, as a bootstrap.servers= property.
+has_bootstrap=0
+for a in "$@"; do
+  case "$a" in --bootstrap-server|--bootstrap-server=*|bootstrap.servers=*) has_bootstrap=1 ;; esac
+done
+[ "$has_bootstrap" = 1 ] || exec "$real" "$@"
+
+cfg_flag() {
+  case "$1" in
+    --command-config|--producer.config|--consumer.config|--config-file|--admin.config) return 0 ;;
+    --config) [ "$tool" = kafka-cluster.sh ] ;;
+    *) return 1 ;;
+  esac
+}
+
+merged="$(mktemp "${TMPDIR:-/tmp}/kaas-client.XXXXXX")"
+trap 'rm -f "$merged"' EXIT
+cat "$CLIENT_PROPS" > "$merged"
+args=()
+while [ $# -gt 0 ]; do
+  if cfg_flag "$1" && [ $# -ge 2 ]; then
+    { echo; cat "$2"; } >> "$merged"; shift 2
+  elif cfg_flag "${1%%=*}" && [ "${1#*=}" != "$1" ]; then
+    { echo; cat "${1#*=}"; } >> "$merged"; shift
+  else
+    args+=("$1"); shift
+  fi
+done
+# Placement matters only for the subcommand tools: kafka-transactions takes
+# --command-config as a global option (before the subcommand),
+# kafka-cluster as an option of its subcommand (after it). The jopt-based
+# tools accept it anywhere.
+if [ "$tool" = kafka-cluster.sh ]; then
+  "$real" "${args[@]}" --command-config "$merged"
+else
+  "$real" --command-config "$merged" "${args[@]}"
+fi
+EOF
+chmod +x "$KAFKA_BIN/.auth-exec"
+for real in "$REAL_KAFKA_BIN"/kafka-*.sh; do
+  printf '#!/usr/bin/env bash\nexec "%s" "%s" "$@"\n' \
+    "$KAFKA_BIN/.auth-exec" "$real" > "$KAFKA_BIN/$(basename "$real")"
+  chmod +x "$KAFKA_BIN/$(basename "$real")"
+done
+
 echo ">> bootstrap: $BOOTSTRAP"
-echo ">> kafka bin: $KAFKA_BIN"
+echo ">> kafka bin: $REAL_KAFKA_BIN (authenticated wrappers in $KAFKA_BIN)"
+echo ">> client:    $CLIENT_PROPS"
